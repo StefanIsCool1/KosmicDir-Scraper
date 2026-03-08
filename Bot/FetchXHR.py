@@ -29,7 +29,7 @@ def find_directory_url(page, link):
     
     return link
 
-def xhrpull(playwright: Playwright, link):
+def responsepull(playwright: Playwright, link):
     xhr_list=[]
     results = []
     done = threading.Event()
@@ -39,12 +39,12 @@ def xhrpull(playwright: Playwright, link):
     page = browser.new_page()
     # Only capture XHR + fetch
     def reset_idle_timer():
-        #purpose of this function is to save energy
+        #purpose of this function is to save energy (called evertime a json response)
         nonlocal idle_timer
         if idle_timer:
             idle_timer.cancel()
-        # Close browser after 3 seconds of no new JSON responses
-        idle_timer = threading.Timer(3.0, done.set)
+        # Close browser after 2 seconds of no new JSON responses
+        idle_timer = threading.Timer(2.0, done.set) # change this value here to change the amount of idle between json response before closure
         idle_timer.start()
     def on_response(response):
         content_type = response.headers.get("content-type", "")
@@ -94,11 +94,9 @@ def xhrpull(playwright: Playwright, link):
     if not results:
         print("No JSON responses were captured!")
     domain = urlparse(link).netloc.replace(".", "_")
-    output_path = os.path.join(os.path.dirname(__file__), f"{domain}.json")
+    output_path = os.path.join(os.path.dirname(__file__), "Data Dump", f"{domain}.json") # where the json files output 
     print(f"Attempting to save to: {output_path}")
     with open(output_path, "w") as f:
         json.dump(results, f, indent=4)
     print(f"Saved {len(results)} responses to {output_path}")
 
-with sync_playwright() as playwright:
-    xhrpull(playwright, "https://www.mbaks.com")
