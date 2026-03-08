@@ -39,6 +39,7 @@ def xhrpull(playwright: Playwright, link):
     page = browser.new_page()
     # Only capture XHR + fetch
     def reset_idle_timer():
+        #purpose of this function is to save energy
         nonlocal idle_timer
         if idle_timer:
             idle_timer.cancel()
@@ -83,9 +84,10 @@ def xhrpull(playwright: Playwright, link):
     directory_url = find_directory_url(page, link)
     page.goto(directory_url)
     page.wait_for_load_state("networkidle")
+    reset_idle_timer() #starts regardless of page load
     human_scroll(page, scroll_target='body')
     # Wait until idle timer fires or 30 second max timeout
-    done.wait(timeout=30)
+    done.wait(timeout=15)
     browser.close()
     # Save results to file
     print(f"Total results captured: {len(results)}")
