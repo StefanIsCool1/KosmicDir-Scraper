@@ -38,8 +38,9 @@ def xhrpull(playwright: Playwright, link):
     page.wait_for_timeout(2000)
     browser.close()
 
+
+
+
 with sync_playwright() as playwright:
     xhrpull(playwright, "https://my.mbaks.com/eBizUI/directory/CompanyDirectory")
-
-
 
