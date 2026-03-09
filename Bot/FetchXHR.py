@@ -90,11 +90,26 @@ def responsepull(playwright: Playwright, link):
     done.wait(timeout=15)
     browser.close()
     # Save results to file
+
     print(f"Total results captured: {len(results)}")
     if not results:
         print("No JSON responses were captured!")
+
     domain = urlparse(link).netloc.replace(".", "_")
-    output_path = os.path.join(os.path.dirname(__file__), "Data-dump") # where the json files output 
+
+    
+    current_dir = os.path.dirname(__file__)  # This is bot directory
+    parent_dir = os.path.dirname(current_dir)  # This goes up one level above make sure parentg
+
+    # Create Data-dump in the parent directory
+    data_dump_dir = os.path.join(parent_dir, "Data-dump")
+
+    # Create the directory if it doesn't exist
+    os.makedirs(data_dump_dir, exist_ok=True)
+
+    # Create the full file path
+    output_path = os.path.join(data_dump_dir, f"{domain}.json")
+
     print(f"Attempting to save to: {output_path}")
     with open(output_path, "w") as f:
         json.dump(results, f, indent=4)
