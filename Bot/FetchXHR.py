@@ -87,7 +87,7 @@ def responsepull(playwright: Playwright, link):
     reset_idle_timer() #starts regardless of page load
     human_scroll(page, scroll_target='body')
     # Wait until idle timer fires or 30 second max timeout
-    done.wait(timeout=15)
+    done.wait(timeout=10)
     browser.close()
     # Save results to file
 
