@@ -94,11 +94,8 @@ def responsepull(playwright: Playwright, link):
     if not results:
         print("No JSON responses were captured!")
     domain = urlparse(link).netloc.replace(".", "_")
-    output_path = os.path.join("/Users/oleary/UnderDeck Data Scraper /UnderDeckScraper/UnderDeckScraper/Data-dump", f"{domain}.json") # where the json files output 
+    output_path = os.path.join(os.path.dirname(__file__), "Data-dump") # where the json files output 
     print(f"Attempting to save to: {output_path}")
     with open(output_path, "w") as f:
         json.dump(results, f, indent=4)
     print(f"Saved {len(results)} responses to {output_path}")
-
-with sync_playwright() as playwright:
-    responsepull(playwright, "https://www.mbaks.com")
