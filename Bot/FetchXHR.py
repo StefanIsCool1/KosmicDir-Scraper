@@ -12,16 +12,23 @@ def find_directory_url(page, link):
     # Grab all links from the page
     links = page.eval_on_selector_all("a", "els => els.map(el => ({text: el.innerText, href: el.href}))")
     # Check for directory first, then fallback to membership
-    priority_keywords = ["directory", "find a member", "company directory", "member directory"]
-    fallback_keywords = ["membership", "contractor"]
+    priority_keywords = ["directory", "find a member", "company directory", "member directory", "member search", "find a contractor", "find contractor", "search members", "member list", "our members"]
+    fallback_keywords = ["membership", "contractor", "search", "find", "members"]
     
-    # First pass - priority keywords
+    # First pass - priority keywords in link text
     for l in links:
         if any(kw in l["text"].lower() for kw in priority_keywords):
             print("Found directory link:", l["href"])
             return l["href"]
     
-    # Second pass - fallback keywords
+    # Second pass - check href URLs for directory-like patterns
+    url_keywords = ["directory", "search", "members", "find", "member-list"]
+    for l in links:
+        if any(kw in l["href"].lower() for kw in url_keywords):
+            print("Found directory link via URL pattern:", l["href"])
+            return l["href"]
+
+    # Third pass - fallback keywords in link text
     for l in links:
         if any(kw in l["text"].lower() for kw in fallback_keywords):
             print("Found directory link:", l["href"])
