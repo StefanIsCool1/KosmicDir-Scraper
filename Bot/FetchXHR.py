@@ -11,24 +11,30 @@ def find_directory_url(page, link):
     page.goto(link)
     # Grab all links from the page
     links = page.eval_on_selector_all("a", "els => els.map(el => ({text: el.innerText, href: el.href}))")
-    # Check for directory first, then fallback to membership
-    priority_keywords = ["directory", "find a member", "company directory", "member directory", "member search", "find a contractor", "find contractor", "search members", "member list", "our members"]
-    fallback_keywords = ["membership", "contractor", "search", "find", "members"]
-    
+
+    # Zero pass - prioritize any link that goes to a search page URL
+    search_url_keywords = ["search", "find-a-member", "find_a_member", "member-search", "member_search"]
+    for l in links:
+        if any(kw in l["href"].lower() for kw in search_url_keywords):
+            print("Found search page via URL pattern:", l["href"])
+            return l["href"]
+
     # First pass - priority keywords in link text
+    priority_keywords = ["directory", "find a member", "company directory", "member directory", "member search", "find a contractor", "find contractor", "search members", "member list", "our members"]
     for l in links:
         if any(kw in l["text"].lower() for kw in priority_keywords):
             print("Found directory link:", l["href"])
             return l["href"]
     
     # Second pass - check href URLs for directory-like patterns
-    url_keywords = ["directory", "search", "members", "find", "member-list"]
+    url_keywords = ["directory", "members", "member-list"]
     for l in links:
         if any(kw in l["href"].lower() for kw in url_keywords):
             print("Found directory link via URL pattern:", l["href"])
             return l["href"]
 
     # Third pass - fallback keywords in link text
+    fallback_keywords = ["membership", "contractor", "search", "find", "members"]
     for l in links:
         if any(kw in l["text"].lower() for kw in fallback_keywords):
             print("Found directory link:", l["href"])
@@ -39,12 +45,28 @@ def find_directory_url(page, link):
 def trigger_search_if_exists(page):
     # Detect if page has a search input and trigger broad search
     try:
+        # Broad search - catches type=search, type=text with search-related id/name/placeholder
         search = page.locator(
-            "input[type='search'], input[placeholder*='search' i], input[placeholder*='name' i], input[placeholder*='find' i], input[placeholder*='filter' i]"
+            "input[type='search'], "
+            "input[placeholder*='search' i], "
+            "input[placeholder*='name' i], "
+            "input[placeholder*='find' i], "
+            "input[placeholder*='filter' i], "
+            "input[id*='search' i], "
+            "input[name*='search' i], "
+            "input[id*='find' i], "
+            "input[name*='find' i], "
+            "input[id*='query' i], "
+            "input[name*='query' i], "
+            "input[id*='keyword' i], "
+            "input[name*='keyword' i]"
         ).first
         if search.is_visible():
             print("Search input detected, triggering broad search with 'a'")
-            search.fill("a")
+            search.click()
+            search.triple_click()  # select any existing text
+            search.type("a", delay=100)  # type like a human
+            page.wait_for_timeout(500)
             search.press("Enter")
             page.wait_for_load_state("networkidle") # waits for network
             return True
@@ -52,7 +74,6 @@ def trigger_search_if_exists(page):
         pass
     print("No search input detected, using scroll-based scraping")
     return False #returns false when it doesnt detect search
-
 def responsepull(playwright: Playwright, link):
     xhr_list=[]
     results = []
