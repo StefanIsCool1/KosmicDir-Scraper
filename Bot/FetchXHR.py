@@ -29,6 +29,23 @@ def find_directory_url(page, link):
     
     return link
 
+def trigger_search_if_exists(page):
+    # Detect if page has a search input and trigger broad search
+    try:
+        search = page.locator(
+            "input[type='search'], input[placeholder*='search' i], input[placeholder*='name' i], input[placeholder*='find' i], input[placeholder*='filter' i]"
+        ).first
+        if search.is_visible():
+            print("Search input detected, triggering broad search with 'a'")
+            search.fill("a")
+            search.press("Enter")
+            page.wait_for_load_state("networkidle") # waits for network
+            return True
+    except:
+        pass
+    print("No search input detected, using scroll-based scraping")
+    return False #returns false when it doesnt detect search
+
 def responsepull(playwright: Playwright, link):
     xhr_list=[]
     results = []
@@ -85,7 +102,10 @@ def responsepull(playwright: Playwright, link):
     page.goto(directory_url)
     page.wait_for_load_state("networkidle")
     reset_idle_timer() #starts regardless of page load
-    human_scroll(page, scroll_target='body')
+    # If search exists trigger it, otherwise scroll
+    search_triggered = trigger_search_if_exists(page)
+    if not search_triggered:
+        human_scroll(page, scroll_target='body')
     # Wait until idle timer fires or 30 second max timeout
     done.wait(timeout=10)
     browser.close()
