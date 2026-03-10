@@ -18173,11 +18173,11 @@
             {
                 "Id": 275357,
                 "Name": "Environmental Construction Inc",
-                "City": "Kirkland",
+                "City": "Lake Stevens",
                 "MainPhone": "803-9881",
                 "WebSite": "envconst.com",
                 "Specialties": "Landscape Contractors",
-                "ZipCode": "98033",
+                "ZipCode": "98258",
                 "PhoneAreaCode": "425"
             },
             {
@@ -23689,6 +23689,16 @@
                 "Specialties": "Engineers - Geotechnical",
                 "ZipCode": "98052",
                 "PhoneAreaCode": "425"
+            },
+            {
+                "Id": 278902,
+                "Name": "Re-Nu Remodeling LLC",
+                "City": "Auburn",
+                "MainPhone": "486-5722",
+                "WebSite": "re-nuremodel.com",
+                "Specialties": "Remodeler",
+                "ZipCode": "98001",
+                "PhoneAreaCode": "206"
             }
         ]
     }
