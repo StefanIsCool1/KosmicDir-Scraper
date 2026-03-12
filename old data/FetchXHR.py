@@ -9,6 +9,7 @@ import os
 import threading
 import anthropic
 from bs4 import BeautifulSoup
+from collections import Counter
 
 #APIS KEYS FOR AI
 os.environ["ANTHROPIC_API_KEY"] = "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"
@@ -108,44 +109,75 @@ def trigger_search_if_exists(page):
     print("No search input detected, using scroll-based scraping")
     return False
 
+LAYOUT_CLASS_FRAGMENTS = [
+    "fl-row", "fl-col", "fl-module",         # Beaver Builder
+    "elementor-section", "elementor-column",  # Elementor
+    "wp-block",                               # Gutenberg
+    "vc_row", "vc_column",                    # WPBakery
+]
 
+def is_layout_class(cls_string):
+    classes = cls_string.lower().split()
+    exact_blacklist = {"container", "wrapper", "layout", "header", "footer", "nav", "sidebar"}
+    fragment_blacklist = ["fl-row", "fl-col", "fl-module", "elementor-section",
+                          "elementor-column", "wp-block", "vc_row", "vc_column"]
+    if any(cls in exact_blacklist for cls in classes):
+        return True
+    if any(frag in cls_string.lower() for frag in fragment_blacklist):
+        return True
+    return False
+
+def has_card_structure(el):
+    has_link = bool(el.find("a"))
+    text_tags = el.find_all(["p", "span", "h1", "h2", "h3", "h4", "h5", "address"])
+    return has_link and len(text_tags) >= 2
 # --- SELECTOR LEARNING ---
 
 def extract_sample_html(raw_html: str) -> str:
-    """Extract a small sample containing 2-3 complete member cards for selector learning.
-    Sends just enough for Haiku to identify the repeating pattern - not the whole page."""
+    """Extract a small sample containing complete member cards for selector learning."""
     soup = BeautifulSoup(raw_html, "html.parser")
     for tag in soup(["script", "style", "svg", "img"]):
         tag.decompose()
 
-    # Find repeating elements - member cards always repeat with the same class
-    # Try common card-level tags and pick the first class that repeats 3+ times with real content
-    candidate_tags = ["div", "li", "article", "section", "tr"]
+    candidate_tags = ["tr", "article", "figure", "li", "div"]
+
     for tag in candidate_tags:
-        from collections import Counter
         elements = soup.find_all(tag)
+
+        # Pre-filter: must have a link, 3+ child elements, 100+ chars
+        elements = [
+            el for el in elements
+            if el.find("a")
+            and len(el.find_all()) >= 3
+            and len(el.get_text(strip=True)) > 100
+        ]
+
         class_counts = Counter(
-            " ".join(el.get("class", [])) for el in elements if el.get("class")
+            " ".join(el.get("class") or []) for el in elements if el.get("class")
         )
-        repeating = [(cls, count) for cls, count in class_counts.items() if count >= 3]
+
+        repeating = [
+            (cls, count) for cls, count in class_counts.items()
+            if count >= 4 and not is_layout_class(cls)
+        ]
+
         if not repeating:
             continue
 
-        # Pick the class whose elements have the most text content (real cards, not layout divs)
         def avg_text_len(cls):
-            samples = soup.find_all(tag, class_=cls.split())[:3]
+            samples = soup.find_all(tag, class_=" ".join(cls.split()))[:4]
             return sum(len(s.get_text(strip=True)) for s in samples) / max(len(samples), 1)
 
         best_cls = max(repeating, key=lambda x: avg_text_len(x[0]))[0]
-        cards = soup.find_all(tag, class_=best_cls.split())
 
-        if cards and len(cards[0].get_text(strip=True)) > 50:
-            # Return first 3 complete cards - enough to show the pattern clearly
-            sample = "\n".join(str(c) for c in cards[:3])
-            print(f"  Sample: found repeating '{best_cls}' ({len(cards)} total cards), sending first 3 to learn selectors")
+        cards = soup.find_all(tag, class_=best_cls.split())
+        cards = [c for c in cards if has_card_structure(c)]
+
+        if len(cards) >= 3 and len(cards[0].get_text(strip=True)) > 100:
+            sample = "\n".join(str(c) for c in cards[:4])
+            print(f"  Sample: found repeating '{best_cls}' ({len(cards)} total cards), sending first 6 to learn selectors")
             return sample
 
-    # Fallback: just send first 5000 chars of cleaned HTML
     print("  Sample: no repeating cards found, sending first 5000 chars")
     return str(soup)[:5000]
 
@@ -181,13 +213,15 @@ Rules:
 - Selectors for fields inside a card should be relative to the card element
 - If a field doesn't exist in the sample, use null
 - card_selector must be an absolute selector (not relative)
+- Never use :contains() pseudo-selectors as they are not supported by BeautifulSoup
+- For phone/fax: target the most specific parent div that contains only the phone number e.g. "div.phoneWrapper" not a broad container
 
 HTML SAMPLE:
 {sample}"""
         }]
     )
 
-    raw = response.content[0].text.strip()
+    raw = response.content[0].text.strip() # type: ignore
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -219,7 +253,11 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
                 return None
             try:
                 el = card.select_one(sel)
-                return el.get_text(strip=True) if el else None
+                if not el:
+                    return None
+                text = el.get_text(strip=True)
+                text = re.sub(r'^[\w\s]+:\s*', '', text)
+                return text or None
             except Exception:
                 return None
 
@@ -245,8 +283,8 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
                     name_el = cc.select_one(name_sel) if name_sel else None
                     email_el = cc.select_one(email_sel) if email_sel else None
                     contacts.append({
-                        "name": name_el.get_text(strip=True) if name_el else None,
-                        "email": (email_el.get("href", "").replace("mailto:", "") or email_el.get_text(strip=True)) if email_el else None
+                        "name": name_el.get_text(strip=True) if name_el else None, 
+                        "email": (email_el.get("href", "").replace("mailto:", "") or email_el.get_text(strip=True)) if email_el else None #type: ignore
                     })
             except Exception:
                 pass
@@ -255,7 +293,7 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
             "company_name":    get_text(selectors.get("company_name")),
             "description":     get_text(selectors.get("description")),
             "category":        get_text(selectors.get("category")),
-            "website":         get_href(selectors.get("website")),
+            "website":         get_href("a[href^='http']") or get_href(selectors.get("website")),
             "phone":           get_text(selectors.get("phone")),
             "fax":             get_text(selectors.get("fax")),
             "street_address":  get_text(selectors.get("street_address")),
@@ -340,8 +378,13 @@ def clean_members(members: list) -> list:
 
         # --- WEBSITE ---
         website = m.get("website") or ""
-        if website and not website.startswith("http"):
-            m["website"] = "https://" + website
+        if website:
+            if not website.startswith("http"):
+                if re.match(r'^[\w.-]+\.[a-z]{2,}', website):
+                    m["website"] = "https://" + website
+                else:
+                    m["website"] = None
+            # else: already starts with http, keep as is
 
         # --- CATEGORY ---
         # Strip URL slugs like "/services/banks/l/55" - keep only real text labels
@@ -502,6 +545,19 @@ def responsepull(playwright: Playwright, link):
     # Wait until idle timer fires
     done.wait()
 
+     # --- PLAIN HTML FALLBACK ---
+    # Always grab the live page HTML directly from the browser DOM
+    # Covers sites that render member cards server-side with no XHR/API calls
+    try:
+        html = page.content()
+        if any(kw in html.lower() for kw in ["member", "directory", "contact", "listing"]):
+            print(f"Captured plain HTML from: {page.url}")
+            results.append({
+                "url": page.url,
+                "data": {"raw_html": html}
+            })
+    except Exception as e:
+        print(f"Error capturing page HTML: {e}")
     # Read pending HTML response bodies while browser is still open
     print(f"Processing {len(pending_html_responses)} pending HTML responses...")
     for r in pending_html_responses:

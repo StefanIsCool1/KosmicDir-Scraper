@@ -1,0 +1,229 @@
+"""
+Directory Scraper — Main Entry Point
+
+Usage:
+    python main.py <url>
+    python main.py https://www.someassociation.org
+
+Pipeline:
+    1. browser.py  → Navigate to directory, capture network responses
+    2. parser.py   → Extract member data from HTML using learned selectors
+    3. cleaner.py  → Clean, normalize, deduplicate
+    4. Save raw + structured JSON to Data-dump/
+"""
+
+import sys
+import os
+import json
+from urllib.parse import urlparse
+
+from playwright.sync_api import sync_playwright
+from browser import capture_responses
+from html_parser import parse_member_html
+from cleaner import clean_members
+
+
+def normalize_json_member(raw: dict) -> dict:
+    """Map common API field names to our standard schema.
+    
+    Different directory APIs use different keys:
+      Name / CompanyName / company_name / name → company_name
+      MainPhone / Phone / phone / PhoneNumber → phone
+      WebSite / Website / website / URL / url → website
+    etc.
+    
+    This normalizes them all so clean_members() works correctly.
+    """
+    def find_field(candidates: list, data: dict):
+        """Return the value of the first matching key (case-insensitive)."""
+        data_lower = {k.lower(): v for k, v in data.items()}
+        for key in candidates:
+            val = data_lower.get(key.lower())
+            if val is not None:
+                return str(val).strip() if val else None
+        return None
+
+    # Phone: combine area code + number if split across fields
+    phone = find_field(["MainPhone", "Phone", "PhoneNumber", "phone", "telephone", "tel"], raw)
+    area_code = find_field(["PhoneAreaCode", "AreaCode", "areacode", "phone_area_code"], raw)
+    if phone and area_code and not phone.startswith(area_code):
+        phone = f"{area_code}-{phone}"
+
+    # Fax: same treatment
+    fax = find_field(["Fax", "FaxNumber", "fax", "fax_number"], raw)
+    fax_area = find_field(["FaxAreaCode", "fax_area_code"], raw)
+    if fax and fax_area and not fax.startswith(fax_area):
+        fax = f"{fax_area}-{fax}"
+
+    # Address: try to build from parts or use full string
+    street = find_field(["Address", "StreetAddress", "street_address", "Address1", "AddressLine1"], raw)
+    city = find_field(["City", "city"], raw)
+    state = find_field(["State", "state", "StateProvince", "Province"], raw)
+    zipcode = find_field(["ZipCode", "Zip", "zip", "PostalCode", "postal_code", "zipcode"], raw)
+
+    # Build a combined street address if we have parts
+    address_parts = [p for p in [street, city, state, zipcode] if p]
+    full_address = ", ".join(address_parts) if address_parts else None
+
+    return {
+        "company_name":    find_field(["Name", "CompanyName", "company_name", "BusinessName",
+                                       "OrganizationName", "name", "Title", "title"], raw),
+        "description":     find_field(["Description", "description", "About", "about",
+                                       "Bio", "bio", "Summary", "summary"], raw),
+        "category":        find_field(["Specialties", "Category", "category", "Type",
+                                       "type", "Classification", "Industry",
+                                       "specialty", "specialties"], raw),
+        "website":         find_field(["WebSite", "Website", "website", "URL", "url",
+                                       "Web", "web", "Homepage", "homepage"], raw),
+        "phone":           phone,
+        "fax":             fax,
+        "street_address":  full_address,
+        "mailing_address": find_field(["MailingAddress", "mailing_address", "Address2"], raw),
+        "contacts":        [],
+    }
+
+
+def is_member_list(data: list) -> bool:
+    """Check if a JSON list looks like member/directory data.
+    Must be a list of dicts with name-like fields."""
+    if not data or not isinstance(data[0], dict):
+        return False
+    if len(data) < 3:
+        return False
+    # Check first few items for name-like keys
+    name_keys = {"name", "companyname", "company_name", "businessname",
+                 "organizationname", "title"}
+    sample = data[:5]
+    matches = 0
+    for item in sample:
+        item_keys = {k.lower() for k in item.keys()}
+        if item_keys & name_keys:
+            matches += 1
+    return matches >= len(sample) * 0.5
+
+
+def parse_and_save_results(results: list, data_dump_dir: str, domain: str) -> list:
+    """Parse all captured responses, save both raw and structured data.
+    
+    Handles:
+    - JSON list responses (e.g. /GetDirectoryBasicInfo returns [{...}, {...}, ...])
+    - JSON dict responses (single member or config-like data)
+    - Raw HTML responses (parse with selector learning strategy)
+    """
+    all_members = []
+    has_json_members = False
+
+    for result in results:
+        data = result.get("data", {})
+
+        # --- JSON list of members (most common for API-based directories) ---
+        if isinstance(data, list) and is_member_list(data):
+            print(f"JSON member list from {result['url']}: {len(data)} entries")
+            for item in data:
+                normalized = normalize_json_member(item)
+                if normalized.get("company_name"):
+                    all_members.append(normalized)
+            has_json_members = True
+
+        # --- JSON dict (single record or non-member data like config) ---
+        elif isinstance(data, dict) and "raw_html" not in data:
+            # Check if it looks like a single member record
+            name_keys = {"name", "companyname", "company_name", "businessname"}
+            data_keys_lower = {k.lower() for k in data.keys()}
+            if data_keys_lower & name_keys:
+                normalized = normalize_json_member(data)
+                if normalized.get("company_name"):
+                    all_members.append(normalized)
+                    has_json_members = True
+            # else: skip non-member JSON (config files, auth responses, etc.)
+
+        # --- HTML response — parse with selector strategy ---
+        elif isinstance(data, dict) and "raw_html" in data:
+            # Skip HTML parsing if we already got good JSON data
+            if has_json_members and len(all_members) >= 10:
+                print(f"Skipping HTML parse (already have {len(all_members)} members from JSON)")
+                continue
+            print(f"Parsing HTML response from {result['url']}...")
+            try:
+                members = parse_member_html(data["raw_html"], domain=domain)
+                print(f"  Extracted {len(members)} members")
+                all_members.extend(members)
+            except Exception as e:
+                print(f"  Failed to parse: {e}")
+
+    # Clean and deduplicate all members
+    all_members = clean_members(all_members)
+
+    # --- Sanity checks ---
+    if len(all_members) < 3:
+        print(f"WARNING: Only {len(all_members)} members extracted for {domain} — scrape likely failed")
+
+    empty_names = sum(1 for m in all_members if not m.get("company_name"))
+    if all_members and empty_names > len(all_members) * 0.3:
+        print(
+            f"WARNING: {empty_names}/{len(all_members)} members missing company name "
+            f"in {domain} — extraction may be wrong"
+        )
+
+    # --- Save structured output ---
+    structured_path = os.path.join(data_dump_dir, f"{domain}_structured.json")
+    with open(structured_path, "w") as f:
+        json.dump(all_members, f, indent=4)
+    print(f"Saved {len(all_members)} structured members to {structured_path}")
+
+    return all_members
+
+
+def scrape_directory(url: str) -> list:
+    """Full pipeline: scrape a directory URL and return structured member data."""
+    domain = urlparse(url).netloc.replace(".", "_")
+
+    # Set up output directory
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    data_dump_dir = os.path.join(parent_dir, "Data-dump")
+    os.makedirs(data_dump_dir, exist_ok=True)
+
+    # --- Step 1: Browser automation — capture all responses ---
+    with sync_playwright() as playwright:
+        results = capture_responses(playwright, url)
+
+    # --- Step 2: Save raw responses ---
+    raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
+    print(f"Saving {len(results)} raw responses to {raw_output_path}")
+    with open(raw_output_path, "w") as f:
+        json.dump(results, f, indent=4)
+
+    # --- Step 3: Parse, clean, and save structured data ---
+    members = parse_and_save_results(results, data_dump_dir, domain)
+
+    return members
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python main.py <url>")
+        print("Example: python main.py https://www.someassociation.org")
+        sys.exit(1)
+
+    url = sys.argv[1]
+    print(f"Scraping directory: {url}")
+    print("=" * 60)
+
+    members = scrape_directory(url)
+
+    print("=" * 60)
+    print(f"Done! Extracted {len(members)} members")
+
+    # Print a quick summary
+    if members:
+        with_phone = sum(1 for m in members if m.get("phone"))
+        with_email = sum(1 for m in members if m.get("contacts") and any(c.get("email") for c in m["contacts"]))
+        with_website = sum(1 for m in members if m.get("website"))
+        print(f"  With phone:   {with_phone}")
+        print(f"  With email:   {with_email}")
+        print(f"  With website: {with_website}")
+
+
+if __name__ == "__main__":
+    main()
