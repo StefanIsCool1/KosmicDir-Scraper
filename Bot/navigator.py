@@ -4,9 +4,7 @@ Handles: AI-based multi-depth directory URL discovery, smart search strategy.
 """
 
 import re
-import json
 import anthropic
-from urllib.parse import urlparse
 from config import (
     SEARCH_INPUT_SELECTORS,
     RESULT_COUNT_SELECTORS,
@@ -187,7 +185,14 @@ def find_directory_url(page, link: str) -> str:
             break
 
         # Check if this page has a search input (strong signal we're on the directory)
-        has_search = find_search_input(page) is not None
+        # Use a lightweight check here — just see if any matching input is visible
+        # The full AI-enabled find_search_input is called later in trigger_search
+        has_search = False
+        try:
+            quick_check = page.locator(SEARCH_INPUT_SELECTORS).first
+            has_search = quick_check.is_visible(timeout=1000)
+        except:
+            pass
 
         print(f"  Depth {depth}: {len(filtered)} links, search_input={has_search}, asking AI...")
 
@@ -233,14 +238,108 @@ def find_directory_url(page, link: str) -> str:
 # --- SEARCH INPUT & STRATEGIES ---
 
 def find_search_input(page):
-    """Locate a search input on the page. Returns the locator or None."""
+    """Locate the member directory search input on the page.
+    
+    If only one visible search input → use it.
+    If multiple → ask AI which one is the member directory search.
+    
+    Returns the Playwright locator or None.
+    """
     try:
-        search = page.locator(SEARCH_INPUT_SELECTORS).first
-        if search.is_visible(timeout=2000):
-            return search
+        all_matches = page.locator(SEARCH_INPUT_SELECTORS)
+        match_count = all_matches.count()
     except:
-        pass
-    return None
+        return None
+
+    if match_count == 0:
+        return None
+
+    # Collect info about each visible input
+    visible = []
+    for i in range(match_count):
+        inp = all_matches.nth(i)
+        try:
+            if not inp.is_visible(timeout=500):
+                continue
+        except:
+            continue
+
+        # Grab context about this input for AI
+        try:
+            info = inp.evaluate("""el => {
+                let label = '';
+                if (el.id) {
+                    const labelEl = document.querySelector('label[for="' + el.id + '"]');
+                    if (labelEl) label = labelEl.innerText.trim();
+                }
+                let nearby = '';
+                let parent = el.parentElement;
+                for (let i = 0; i < 3 && parent; i++) {
+                    nearby = parent.innerText.trim().substring(0, 150);
+                    if (nearby.length > 20) break;
+                    parent = parent.parentElement;
+                }
+                return {
+                    placeholder: el.placeholder || '',
+                    id: el.id || '',
+                    name: el.name || '',
+                    label: label,
+                    nearby: nearby
+                };
+            }""")
+        except:
+            info = {}
+
+        visible.append({"index": i, "info": info})
+
+    if not visible:
+        return None
+
+    # Only one visible input — use it directly
+    if len(visible) == 1:
+        return all_matches.nth(visible[0]["index"])
+
+    # Multiple visible inputs — ask AI which is the directory search
+    print(f"  Found {len(visible)} search inputs, asking AI to pick...")
+
+    input_descriptions = "\n".join(
+        f"{j}. placeholder='{v['info'].get('placeholder', '')}' "
+        f"id='{v['info'].get('id', '')}' "
+        f"name='{v['info'].get('name', '')}' "
+        f"label='{v['info'].get('label', '')}' "
+        f"nearby='{v['info'].get('nearby', '')[:80]}'"
+        for j, v in enumerate(visible)
+    )
+
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=20,
+            messages=[{
+                "role": "user",
+                "content": f"""This page has multiple search inputs. Which one is the member directory search (to search for member companies)?
+
+{input_descriptions}
+
+Return ONLY the number (e.g. "0" or "1")."""
+            }]
+        )
+
+        answer = response.content[0].text.strip()  # type: ignore
+        match = re.match(r'^(\d+)', answer)
+        if match:
+            idx = int(match.group(1))
+            if 0 <= idx < len(visible):
+                chosen = visible[idx]
+                print(f"  AI picked input {idx}: {chosen['info'].get('placeholder', chosen['info'].get('id', ''))}")
+                return all_matches.nth(chosen["index"])
+    except Exception as e:
+        print(f"  AI input selection failed: {e}")
+
+    # Fallback — return the first visible one
+    print(f"  Falling back to first visible input")
+    return all_matches.nth(visible[0]["index"])
 
 
 def count_visible_results(page) -> int:
@@ -305,9 +404,114 @@ def search_all_letters(page, search_input):
     print("  Alphabet search complete")
 
 
+def get_compressed_page_text(page) -> str:
+    """Grab visible text from the page, compressed for AI input.
+    Strips HTML, collapses whitespace, takes first 1000 chars.
+    Result is ~250 tokens — cheap to send to Haiku."""
+    try:
+        text = page.inner_text("body")[:5000]
+    except:
+        return ""
+    # Collapse all whitespace (newlines, tabs, multiple spaces) into single spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    # First 1000 chars — count is always near the top, before the member cards
+    return text[:1000]
+
+
+def read_result_count(page, query: str = "") -> dict:
+    """Read the result count indicator from the page.
+    
+    Strategy:
+    1. Regex (free, instant) — handles 90% of sites
+    2. AI fallback (cheap, ~250 tokens) — handles weird formats
+    
+    Returns:
+        {"type": "all"} — page says it's showing all results
+        {"type": "number", "count": 667} — found a specific count
+        {"type": "unknown"} — no count indicator found
+    """
+    text = get_compressed_page_text(page)
+    if not text:
+        return {"type": "unknown"}
+
+    # --- REGEX FIRST (free) ---
+
+    # Check for "showing all" / "results: all" / "displaying all"
+    if re.search(r'(showing|results|displaying|viewing)[:\s]+all', text, re.IGNORECASE):
+        return {"type": "all"}
+    if re.search(r'(all)\s+(results|members|companies|listings|entries)', text, re.IGNORECASE):
+        return {"type": "all"}
+
+    # "Showing X-Y of Z" pattern (most reliable — Z is the total)
+    match = re.search(r'(?:of|\/)\s*(\d[\d,]*)\s*(?:results|members|companies|total|entries|listings|records)?', text, re.IGNORECASE)
+    if match:
+        count = int(match.group(1).replace(",", ""))
+        if count > 0:
+            return {"type": "number", "count": count}
+
+    # "X results found" / "Results Found: X" / "X members" / "Found X companies"
+    match = re.search(r'(\d[\d,]*)\s*(?:results|members|companies|entries|listings|records)\s*(?:found)?', text, re.IGNORECASE)
+    if match:
+        count = int(match.group(1).replace(",", ""))
+        if count > 0:
+            return {"type": "number", "count": count}
+
+    # "Results Found: X" / "Results: X" / "Total: X"
+    match = re.search(r'(?:results|total|found|count|matches)[:\s]+(\d[\d,]*)', text, re.IGNORECASE)
+    if match:
+        count = int(match.group(1).replace(",", ""))
+        if count > 0:
+            return {"type": "number", "count": count}
+
+    # --- AI FALLBACK (only when regex found nothing) ---
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=20,
+            messages=[{
+                "role": "user",
+                "content": f"""I searched "{query}" on a member directory page.
+How many total results does the page say it found?
+
+Respond with ONLY one of:
+- A number (e.g. "667")
+- "all" if it says showing all results
+- "unknown" if no count is visible
+
+Page text:
+{text}"""
+            }]
+        )
+
+        answer = response.content[0].text.strip().lower()  # type: ignore
+        print(f"    AI read result count: {answer}")
+
+        if answer == "all":
+            return {"type": "all"}
+        if answer == "unknown":
+            return {"type": "unknown"}
+
+        # Try to parse a number
+        num_match = re.match(r'^(\d[\d,]*)', answer)
+        if num_match:
+            count = int(num_match.group(1).replace(",", ""))
+            if count > 0:
+                return {"type": "number", "count": count}
+
+    except Exception as e:
+        print(f"    AI result count failed: {e}")
+
+    return {"type": "unknown"}
+
+
+# If a strategy returns this many results or more, stop immediately — we have enough
+STOP_THRESHOLD = 600
+
+
 def try_search_query(page, search_input, query: str) -> int:
     """Execute a single search query and return the visible result count.
-    Returns -1 if the search failed or made things worse."""
+    Returns -1 if the search failed."""
     try:
         search_input.click()
         search_input.fill("")
@@ -328,14 +532,16 @@ def try_search_query(page, search_input, query: str) -> int:
 
 
 def trigger_search(page, results_list: list) -> bool:
-    """Smart search strategy.
+    """Smart search strategy with result count awareness.
     
-    Priority order:
-    1. Skip if JSON already captured or enough visible results
-    2. Try "a" first — works on most sites (contains and starts-with)
-    3. If "a" worked, check if starts-with → iterate alphabet if so
-    4. Only if "a" failed, try fallbacks: empty → "all" → "*" → "%"
-    5. Stop as soon as something works
+    Flow:
+    1. Skip if confirmed JSON member data already captured
+    2. Check if page already shows all results before searching
+    3. Try strategies in order, comparing result counts:
+       - "a" → "all" → "" → "*" → "%"
+       - If any returns "all" or 600+ results → stop immediately
+       - If count is low, keep trying and the listener captures everything
+       - All responses are captured regardless, dedup handles overlap
     """
     search_input = find_search_input(page)
     if not search_input:
@@ -344,17 +550,12 @@ def trigger_search(page, results_list: list) -> bool:
 
     print("Search input found...")
 
-    baseline_count = count_visible_results(page)
     baseline_json = len(results_list)
-    print(f"  Baseline: {baseline_count} visible results, {baseline_json} JSON responses")
 
-    # If REAL member data was already captured on page load, skip search entirely
-    # Check that at least one response is a list of member-like records, not just
-    # config files or auth responses that happened to contain directory keywords
+    # --- Check for confirmed JSON member data ---
     has_member_data = False
     for result in results_list:
         data = result.get("data", {})
-        # Check for list of dicts with name-like fields (actual member data)
         if isinstance(data, list) and len(data) >= 3:
             sample = data[0] if data else {}
             if isinstance(sample, dict):
@@ -369,51 +570,90 @@ def trigger_search(page, results_list: list) -> bool:
         print(f"  Already have member data from page load ({len(results_list)} JSON responses), skipping search")
         return True
 
-    # Note: we do NOT skip based on visible result count alone.
-    # Many sites show 20-30 cards on page load but have hundreds more behind search.
-    # Only confirmed JSON member data (above) should skip search.
-
-    # --- Step 1: Try "a" first (most common, works on most sites) ---
-    print(f"  Trying 'a' search...")
-    a_count = try_search_query(page, search_input, "a")
-    print(f"  'a' search returned ~{a_count} visible results")
-
-    if a_count >= 3:
-        # "a" worked! Check if it's a starts-with site
-        if is_starts_with_site(page):
-            search_all_letters(page, search_input)
-        # Either way, we got results
+    # --- Check if page already shows all results (before any searching) ---
+    pre_count = read_result_count(page)
+    pre_visible = count_visible_results(page)
+    print(f"  Pre-search: count={pre_count}, visible={pre_visible}")
+    if pre_count["type"] == "all":
+        print(f"  Page already showing all results, no search needed")
+        return True
+    if pre_count["type"] == "number" and pre_count["count"] >= STOP_THRESHOLD:
+        print(f"  Page already showing {pre_count['count']} results, no search needed")
+        return True
+    if pre_visible >= STOP_THRESHOLD:
+        print(f"  Page already showing {pre_visible} visible results, no search needed")
         return True
 
-    # --- Step 2: "a" didn't work — try fallbacks ---
-    # These are strategies that might reveal all results without a specific letter
-    fallback_strategies = [
+    # --- Try strategies in order ---
+    strategies = [
+        ("a", "a"),
+        ("all", "all"),
         ("empty", ""),
-        ("wildcard_all", "all"),
         ("wildcard_star", "*"),
         ("wildcard_percent", "%"),
     ]
 
-    for name, query in fallback_strategies:
-        print(f"  Trying fallback '{name}' (query='{query}')...")
-        count = try_search_query(page, search_input, query)
-        print(f"  '{name}' returned ~{count} visible results")
+    best_count = 0
+    best_strategy = None
+    any_results = False
 
-        # If this strategy reduced results to near zero, revert
-        if count < baseline_count and count < 5:
-            print(f"  '{name}' reduced results, reverting")
-            try_search_query(page, search_input, "")
+    for name, query in strategies:
+        print(f"  Trying '{name}' (query='{query}')...")
+        visible = try_search_query(page, search_input, query)
+
+        if visible < 0:
+            print(f"  '{name}' search failed, skipping")
             continue
 
-        # If it worked, stop trying
-        if count >= 3:
-            print(f"  '{name}' worked, stopping")
+        if visible >= 3:
+            any_results = True
+
+        count_info = read_result_count(page, query=query)
+
+        # Determine the best count: use page indicator if available, else visible count
+        if count_info["type"] == "number":
+            effective_count = count_info["count"]
+        elif count_info["type"] == "all":
+            effective_count = visible  # "all" is always good
+        else:
+            effective_count = visible  # unknown — use visible as fallback
+
+        print(f"  '{name}': ~{visible} visible, count={count_info}, effective={effective_count}")
+
+        # Track best result
+        if effective_count > best_count:
+            best_count = effective_count
+            best_strategy = name
+
+        # STOP CHECK: "all" indicator, or high count from page, or lots of visible results
+        should_stop = (
+            count_info["type"] == "all" or
+            (count_info["type"] == "number" and count_info["count"] >= STOP_THRESHOLD) or
+            visible >= STOP_THRESHOLD
+        )
+
+        if should_stop:
+            print(f"  '{name}' is great (effective={effective_count}), stopping")
+            if name == "a" and is_starts_with_site(page):
+                search_all_letters(page, search_input)
             return True
 
-    # --- Step 3: Nothing worked with visible results, but responses may have been captured ---
-    # Check if any JSON was captured during our search attempts
+        # After "a", check if starts-with before moving on
+        if name == "a" and visible >= 3 and is_starts_with_site(page):
+            print(f"  Detected starts-with site, iterating alphabet")
+            search_all_letters(page, search_input)
+            return True
+
+    # --- All strategies tried, check what we got ---
+    print(f"  Best strategy: '{best_strategy}' with ~{best_count} results")
+
+    # Check if any JSON was captured during search attempts
     if len(results_list) > baseline_json:
         print(f"  Search captured {len(results_list) - baseline_json} new JSON responses")
+        return True
+
+    if any_results:
+        print(f"  Got partial results from search attempts")
         return True
 
     print("  No search strategy produced results")

@@ -368,6 +368,7 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
         selectors = learn_selectors(raw_html, domain)
         members = apply_selectors(raw_html, selectors)
         if is_extraction_valid(members):
+            print(f"SUCESS: Selector learned for {domain}!")
             return members
         print(f"  WARNING: Selector learning failed for {domain} - 0 valid members extracted")
     except Exception as e:

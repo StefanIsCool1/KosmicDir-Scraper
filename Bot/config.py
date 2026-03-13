@@ -34,8 +34,6 @@ SEARCH_INPUT_SELECTORS = (
     "input[name*='keyword' i]"
 )
 
-# Minimum result count to accept a search strategy as "good enough"
-SEARCH_GOOD_ENOUGH_THRESHOLD = 20
 
 # --- RESPONSE CAPTURE: KEYWORDS ---
 # JSON responses containing these words (in data OR url) are treated as directory data
