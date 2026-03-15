@@ -315,7 +315,7 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
             "company_name":    get_text(selectors.get("company_name")),
             "description":     get_text(selectors.get("description")),
             "category":        get_text(selectors.get("category")),
-            "website":         get_href("a[href^='http']") or get_href(selectors.get("website")),
+            "website":         get_href(selectors.get("website")),
             "phone":           get_text(selectors.get("phone")),
             "fax":             get_text(selectors.get("fax")),
             "street_address":  get_text(selectors.get("street_address")),

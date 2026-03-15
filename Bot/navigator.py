@@ -1,12 +1,16 @@
 """
 Navigation logic for finding directory pages and triggering searches.
-Handles: AI-based multi-depth directory URL discovery, smart search strategy.
+Handles: AI-based multi-depth directory URL discovery, smart search strategy,
+         both single-input search and multi-field form search.
 """
 
 import re
 import anthropic
 from config import (
     SEARCH_INPUT_SELECTORS,
+    FORM_INPUT_SELECTORS,
+    PREFERRED_NAME_FIELD_LABELS,
+    FORM_SUBMIT_SELECTORS,
     RESULT_COUNT_SELECTORS,
     RESULT_LINK_SELECTORS, NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
 )
@@ -81,7 +85,7 @@ def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool)
     """Ask Haiku to analyze the current page:
     - Is this already a directory/search page? (has search input or member listings)
     - If not, which link should we click to get there?
-    
+
     Returns dict with:
       {"action": "stay"}  — we're already on the directory page
       {"action": "click", "index": 7}  — click link #7 to go deeper
@@ -100,7 +104,7 @@ def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool)
     client = anthropic.Anthropic()
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=50,
+        max_tokens=100,
         messages=[{
             "role": "user",
             "content": f"""I'm on {page_url} trying to find the member directory/company search page.
@@ -109,28 +113,32 @@ Here are the links on this page:
 {link_list}
 
 Is this already the member directory or search page where I can find member companies?
-- If YES (this page has a search form for members or shows member listings), respond: STAY
-- If NO but a link leads there, respond: CLICK followed by the link number (e.g. CLICK 7)
-- If no directory exists, respond: NONE"""
+- If YES (this page has a search form for members or shows member listings), respond with ONLY: STAY
+- If NO but a link leads there, respond with ONLY: CLICK followed by the link number (e.g. CLICK 7)
+- If no directory exists, respond with ONLY: NONE
+
+Respond with a single word/command. Do not explain."""
         }]
     )
 
     answer = response.content[0].text.strip().upper()  # type: ignore
     print(f"  AI says: {answer}")
 
-    if answer.startswith("STAY"):
+    # Parse the response — search anywhere in text, not just at the start.
+    # Haiku sometimes wraps the command in explanation text.
+    if "STAY" in answer:
         return {"action": "stay"}
 
-    if answer.startswith("CLICK"):
-        match = re.search(r'(\d+)', answer)
-        if match:
-            idx = int(match.group(1))
-            if 0 <= idx < len(candidates):
-                chosen = candidates[idx]
-                print(f"  AI wants to click: [{chosen['text'][:60]}] → {chosen['href'][:100]}")
-                return {"action": "click", "index": idx, "link": chosen}
+    # Search for "CLICK" + number anywhere in the response
+    click_match = re.search(r'CLICK\s*(\d+)', answer)
+    if click_match:
+        idx = int(click_match.group(1))
+        if 0 <= idx < len(candidates):
+            chosen = candidates[idx]
+            print(f"  AI wants to click: [{chosen['text'][:60]}] → {chosen['href'][:100]}")
+            return {"action": "click", "index": idx, "link": chosen}
 
-    if answer.startswith("NONE"):
+    if "NONE" in answer:
         return {"action": "none"}
 
     # Fallback — if AI just returned a number, treat it as CLICK
@@ -146,15 +154,15 @@ Is this already the member directory or search page where I can find member comp
 
 def find_directory_url(page, link: str) -> str:
     """Navigate to a site and find the member directory page.
-    
+
     Multi-depth: clicks through up to 3 pages to find the actual directory.
     At each page, AI decides: are we there yet, or do we need to click deeper?
-    
+
     Examples:
     - Depth 1: Homepage → "Member Directory" → lands on search page (done)
     - Depth 2: Homepage → "Membership" → "Find a Member" → search page (done)
     - Depth 0: Homepage already has the directory loaded (done immediately)
-    
+
     Returns the URL of the page we ended up on.
     """
     page.goto(link)
@@ -184,15 +192,57 @@ def find_directory_url(page, link: str) -> str:
             print(f"  No usable links after filtering, stopping at depth {depth}")
             break
 
-        # Check if this page has a search input (strong signal we're on the directory)
-        # Use a lightweight check here — just see if any matching input is visible
-        # The full AI-enabled find_search_input is called later in trigger_search
+        # Check if this page has a DIRECTORY search form (not a site-wide search bar).
+        # A site-wide search bar in the nav exists on every page — it's not a signal
+        # that we're on the directory page. Only flag form-based directory inputs
+        # (Name/Company fields with a submit button) which are specific to directory pages.
         has_search = False
         try:
-            quick_check = page.locator(SEARCH_INPUT_SELECTORS).first
-            has_search = quick_check.is_visible(timeout=1000)
+            form_inputs = page.locator(FORM_INPUT_SELECTORS)
+            form_count = form_inputs.count()
+            for i in range(form_count):
+                inp = form_inputs.nth(i)
+                try:
+                    if not inp.is_visible(timeout=500):
+                        continue
+                    # Make sure it's NOT inside a nav/header (site-wide search)
+                    in_nav = inp.evaluate("""el => !!(
+                        el.closest('nav') ||
+                        el.closest('header') ||
+                        el.closest('[role="navigation"]') ||
+                        el.closest('[role="banner"]')
+                    )""")
+                    if not in_nav:
+                        has_search = True
+                        break
+                except:
+                    continue
         except:
             pass
+
+        # Also check for primary selectors, but only if NOT in nav/header
+        if not has_search:
+            try:
+                search_inputs = page.locator(SEARCH_INPUT_SELECTORS)
+                search_count = search_inputs.count()
+                for i in range(search_count):
+                    inp = search_inputs.nth(i)
+                    try:
+                        if not inp.is_visible(timeout=500):
+                            continue
+                        in_nav = inp.evaluate("""el => !!(
+                            el.closest('nav') ||
+                            el.closest('header') ||
+                            el.closest('[role="navigation"]') ||
+                            el.closest('[role="banner"]')
+                        )""")
+                        if not in_nav:
+                            has_search = True
+                            break
+                    except:
+                        continue
+            except:
+                pass
 
         print(f"  Depth {depth}: {len(filtered)} links, search_input={has_search}, asking AI...")
 
@@ -239,10 +289,10 @@ def find_directory_url(page, link: str) -> str:
 
 def find_search_input(page):
     """Locate the member directory search input on the page.
-    
+
     If only one visible search input → use it.
     If multiple → ask AI which one is the member directory search.
-    
+
     Returns the Playwright locator or None.
     """
     try:
@@ -342,6 +392,177 @@ Return ONLY the number (e.g. "0" or "1")."""
     return all_matches.nth(visible[0]["index"])
 
 
+def find_form_search(page):
+    """Detect multi-field form-based directory search (e.g. Name/Company/City + Continue).
+
+    Tried FIRST in trigger_search (more specific than generic search inputs).
+
+    Strategy:
+    1. Find visible text inputs matching FORM_INPUT_SELECTORS
+    2. Among them, pick the "name" field (preferred for searching)
+    3. Find the nearest submit button
+    4. Return (name_input, submit_button) or (None, None)
+
+    Returns:
+        Tuple of (input_locator, submit_locator) or (None, None).
+    """
+    try:
+        all_form_inputs = page.locator(FORM_INPUT_SELECTORS)
+        form_count = all_form_inputs.count()
+    except:
+        return None, None
+
+    if form_count == 0:
+        return None, None
+
+    # Collect visible form inputs with their labels/context
+    # Exclude inputs inside nav/header (those are site-wide search, not directory forms)
+    visible_inputs = []
+    for i in range(form_count):
+        inp = all_form_inputs.nth(i)
+        try:
+            if not inp.is_visible(timeout=500):
+                continue
+        except:
+            continue
+
+        # Skip inputs inside nav/header — they're site-wide search, not directory forms
+        try:
+            in_nav = inp.evaluate("""el => !!(
+                el.closest('nav') ||
+                el.closest('header') ||
+                el.closest('[role="navigation"]') ||
+                el.closest('[role="banner"]')
+            )""")
+            if in_nav:
+                continue
+        except:
+            pass
+
+        try:
+            info = inp.evaluate("""el => {
+                let label = '';
+                // Check for <td> label in table-based forms (YourMembership pattern)
+                let prevTd = el.closest('td')?.previousElementSibling;
+                if (prevTd) label = prevTd.innerText.trim();
+                // Also check <label for="...">
+                if (!label && el.id) {
+                    const labelEl = document.querySelector('label[for="' + el.id + '"]');
+                    if (labelEl) label = labelEl.innerText.trim();
+                }
+                // Walk up for nearby text
+                let nearby = '';
+                let parent = el.parentElement;
+                for (let i = 0; i < 3 && parent; i++) {
+                    nearby = parent.innerText.trim().substring(0, 150);
+                    if (nearby.length > 20) break;
+                    parent = parent.parentElement;
+                }
+                return {
+                    placeholder: el.placeholder || '',
+                    id: el.id || '',
+                    name: el.name || '',
+                    label: label,
+                    nearby: nearby
+                };
+            }""")
+        except:
+            info = {}
+
+        visible_inputs.append({"index": i, "info": info, "locator": inp})
+
+    if not visible_inputs:
+        return None, None
+
+    print(f"  Form search: found {len(visible_inputs)} form inputs")
+
+    # --- Pick the "name" field ---
+    # Score each input: prefer fields whose label/name/placeholder contains "name"
+    best_input = None
+    best_score = -1
+
+    for v in visible_inputs:
+        info = v["info"]
+        score = 0
+        # Build a combined text for matching
+        combined = " ".join([
+            info.get("label", ""),
+            info.get("name", ""),
+            info.get("placeholder", ""),
+            info.get("id", ""),
+        ]).lower()
+
+        # Check against preferred label patterns
+        for pattern in PREFERRED_NAME_FIELD_LABELS:
+            if pattern in combined:
+                score += 10
+                break
+
+        # Penalize city/state/zip fields — we never want to search by location
+        location_words = ["city", "town", "state", "zip", "postal", "address", "county"]
+        if any(w in combined for w in location_words):
+            score -= 20
+
+        # Penalize employer/company fields slightly (name is better)
+        company_words = ["company", "employer", "business", "organization"]
+        if any(w in combined for w in company_words):
+            score -= 5
+
+        if score > best_score:
+            best_score = score
+            best_input = v
+
+    if best_input is None:
+        best_input = visible_inputs[0]
+
+    input_label = best_input["info"].get("label") or best_input["info"].get("name") or "unknown"
+    print(f"  Form search: selected input '{input_label}' (score={best_score})")
+
+    # --- Find the submit button ---
+    # Look within the same form element first, then fall back to page-wide search
+    submit_btn = None
+    try:
+        # Try to find the form ancestor of the selected input
+        form_locator = best_input["locator"].locator("xpath=ancestor::form")
+        if form_locator.count() > 0:
+            # Look for submit button within the form
+            submit_in_form = form_locator.first.locator(FORM_SUBMIT_SELECTORS).first
+            if submit_in_form.is_visible(timeout=1000):
+                submit_btn = submit_in_form
+                print(f"  Form search: found submit button inside form")
+    except:
+        pass
+
+    if submit_btn is None:
+        # Fall back to page-wide search for submit button
+        try:
+            # Try within the same table (YourMembership forms use tables, not <form> tags)
+            table_locator = best_input["locator"].locator("xpath=ancestor::table")
+            if table_locator.count() > 0:
+                submit_in_table = table_locator.first.locator(FORM_SUBMIT_SELECTORS).first
+                if submit_in_table.is_visible(timeout=1000):
+                    submit_btn = submit_in_table
+                    print(f"  Form search: found submit button inside table")
+        except:
+            pass
+
+    if submit_btn is None:
+        # Last resort: any visible submit button on the page
+        try:
+            page_submit = page.locator(FORM_SUBMIT_SELECTORS).first
+            if page_submit.is_visible(timeout=1000):
+                submit_btn = page_submit
+                print(f"  Form search: found submit button on page (fallback)")
+        except:
+            pass
+
+    if submit_btn is None:
+        print(f"  Form search: no submit button found")
+        return None, None
+
+    return best_input["locator"], submit_btn
+
+
 def count_visible_results(page) -> int:
     """Quick estimate of how many member cards are currently visible on the page."""
     for sel in RESULT_COUNT_SELECTORS:
@@ -381,9 +602,16 @@ def is_starts_with_site(page) -> bool:
     return False
 
 
-def search_all_letters(page, search_input):
+def search_all_letters(page, search_input, submit_btn=None):
     """Iterate through the alphabet + digits for starts-with search engines.
-    The response listener in browser.py captures results from each search."""
+    The response listener in browser.py captures results from each search.
+
+    Args:
+        page: Playwright page object
+        search_input: The input locator to type into
+        submit_btn: Optional submit button locator. If provided, clicks it
+                    instead of pressing Enter.
+    """
     chars = "abcdefghijklmnopqrstuvwxyz0123456789"
     print(f"  Iterating alphabet search ({len(chars)} queries)...")
 
@@ -391,7 +619,10 @@ def search_all_letters(page, search_input):
         try:
             search_input.fill("")
             search_input.type(char, delay=100)
-            search_input.press("Enter")
+            if submit_btn:
+                submit_btn.click()
+            else:
+                search_input.press("Enter")
             try:
                 page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
             except:
@@ -419,105 +650,115 @@ def get_compressed_page_text(page) -> str:
 
 
 def read_result_count(page, query: str = "") -> dict:
-    """Read the result count indicator from the page.
-    
-    Strategy:
-    1. Regex (free, instant) — handles 90% of sites
-    2. AI fallback (cheap, ~250 tokens) — handles weird formats
-    
+    """Read the result count from the page — regex first, AI fallback.
+
     Returns:
-        {"type": "all"} — page says it's showing all results
-        {"type": "number", "count": 667} — found a specific count
-        {"type": "unknown"} — no count indicator found
+        {"type": "all"} — page says showing all results
+        {"type": "number", "count": N} — found specific count
+        {"type": "unknown"} — no count visible
     """
     text = get_compressed_page_text(page)
     if not text:
         return {"type": "unknown"}
 
-    # --- REGEX FIRST (free) ---
+    text_lower = text.lower()
 
-    # Check for "showing all" / "results: all" / "displaying all"
-    if re.search(r'(showing|results|displaying|viewing)[:\s]+all', text, re.IGNORECASE):
-        return {"type": "all"}
-    if re.search(r'(all)\s+(results|members|companies|listings|entries)', text, re.IGNORECASE):
-        return {"type": "all"}
+    # --- Regex pre-check: catch common "X results" patterns ---
+    # This avoids an AI call when the count is in a standard format.
+    result_patterns = [
+        # "Results Found: 48", "Results: 48"
+        r'results?\s*(?:found)?\s*:\s*(\d[\d,]*)',
+        # "48 results found", "48 results", "48 members found"
+        r'(\d[\d,]*)\s+(?:results?|members?|companies?|listings?|records?|builders?|vendors?|providers?|businesses?|organizations?)\s*(?:found)?',
+        # "Showing 48 results", "Displaying 48 members"
+        r'(?:showing|displaying)\s+(\d[\d,]*)\s+(?:results?|members?|companies?|listings?|records?|builders?|vendors?|providers?|businesses?|organizations?)',
+        # "1-20 of 48 results", "Showing 1-20 of 48"
+        r'of\s+(\d[\d,]*)\s+(?:results?|members?|companies?|listings?|records?|builders?|vendors?|providers?|businesses?|organizations?|total)',
+        # "Page 1 of 26" (total pages, not results — skip)
+        # "Total: 48", "Total Members: 48"
+        r'total\s*(?:members?|results?|companies?|listings?|builders?|vendors?|providers?)?\s*:\s*(\d[\d,]*)',
+    ]
 
-    # "Showing X-Y of Z" pattern (most reliable — Z is the total)
-    match = re.search(r'(?:of|\/)\s*(\d[\d,]*)\s*(?:results|members|companies|total|entries|listings|records)?', text, re.IGNORECASE)
-    if match:
-        count = int(match.group(1).replace(",", ""))
-        if count > 0:
-            return {"type": "number", "count": count}
+    for pattern in result_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            count = int(match.group(1).replace(",", ""))
+            if count > 0:
+                print(f"    Regex result count: {count}")
+                return {"type": "number", "count": count}
 
-    # "X results found" / "Results Found: X" / "X members" / "Found X companies"
-    match = re.search(r'(\d[\d,]*)\s*(?:results|members|companies|entries|listings|records)\s*(?:found)?', text, re.IGNORECASE)
-    if match:
-        count = int(match.group(1).replace(",", ""))
-        if count > 0:
-            return {"type": "number", "count": count}
+    # Check for "all results" / "showing all" phrases
+    all_patterns = [
+        r'showing\s+all\s+(?:results?|members?|records?)',
+        r'all\s+(?:\d[\d,]*\s+)?(?:results?|members?|records?)',
+        r'your\s+search\s+results?\s+include\s+all',
+    ]
+    for pattern in all_patterns:
+        if re.search(pattern, text_lower):
+            print(f"    Regex: detected 'all' results")
+            return {"type": "all"}
 
-    # "Results Found: X" / "Results: X" / "Total: X"
-    match = re.search(r'(?:results|total|found|count|matches)[:\s]+(\d[\d,]*)', text, re.IGNORECASE)
-    if match:
-        count = int(match.group(1).replace(",", ""))
-        if count > 0:
-            return {"type": "number", "count": count}
-
-    # --- AI FALLBACK (only when regex found nothing) ---
+    # --- AI fallback: send more text (first 800 chars) for better coverage ---
     try:
         client = anthropic.Anthropic()
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=20,
+            max_tokens=10,
             messages=[{
                 "role": "user",
-                "content": f"""I searched "{query}" on a member directory page.
-How many total results does the page say it found?
+                "content": f"""How many total results does this directory page show?
+Reply ONLY: a number, "all", or "unknown".
 
-Respond with ONLY one of:
-- A number (e.g. "667")
-- "all" if it says showing all results
-- "unknown" if no count is visible
-
-Page text:
-{text}"""
+{text[:800]}"""
             }]
         )
 
         answer = response.content[0].text.strip().lower()  # type: ignore
-        print(f"    AI read result count: {answer}")
+        print(f"    AI result count: {answer}")
 
-        if answer == "all":
+        if "all" in answer:
             return {"type": "all"}
-        if answer == "unknown":
-            return {"type": "unknown"}
 
-        # Try to parse a number
         num_match = re.match(r'^(\d[\d,]*)', answer)
         if num_match:
             count = int(num_match.group(1).replace(",", ""))
             if count > 0:
                 return {"type": "number", "count": count}
 
+        return {"type": "unknown"}
+
     except Exception as e:
         print(f"    AI result count failed: {e}")
-
-    return {"type": "unknown"}
+        return {"type": "unknown"}
 
 
 # If a strategy returns this many results or more, stop immediately — we have enough
 STOP_THRESHOLD = 600
 
 
-def try_search_query(page, search_input, query: str) -> int:
+def try_search_query(page, search_input, query: str, submit_btn=None) -> int:
     """Execute a single search query and return the visible result count.
-    Returns -1 if the search failed."""
+
+    Args:
+        page: Playwright page object
+        search_input: The input locator to type into
+        query: The search query string
+        submit_btn: Optional submit button locator. If provided, clicks it
+                    instead of pressing Enter. Used for form-based directories
+                    where Enter doesn't trigger the search.
+
+    Returns -1 if the search failed.
+    """
     try:
         search_input.click()
         search_input.fill("")
         if query:
             search_input.type(query, delay=100)
-        search_input.press("Enter")
+
+        if submit_btn:
+            submit_btn.click()
+        else:
+            search_input.press("Enter")
 
         try:
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
@@ -531,24 +772,87 @@ def try_search_query(page, search_input, query: str) -> int:
         return -1
 
 
+def try_form_search_query(page, search_input, submit_btn, query: str) -> int:
+    """Execute a search query using a multi-field form.
+
+    Tries Enter key first (works on React/SPA forms where button.click()
+    may not trigger the onSubmit handler), then clicks the submit button
+    as fallback.
+
+    Returns the visible result count on the results page, or -1 on failure.
+    """
+    try:
+        search_input.click()
+        search_input.fill("")
+        if query:
+            search_input.type(query, delay=100)
+
+        # Store current URL to detect navigation
+        url_before = page.url
+
+        # Try Enter first — works on React/SPA forms and standard forms
+        search_input.press("Enter")
+        page.wait_for_timeout(1000)
+
+        # If nothing happened (no navigation, no new content), click the button
+        url_after_enter = page.url
+        visible_after_enter = count_visible_results(page)
+        if url_after_enter == url_before and visible_after_enter <= 1:
+            submit_btn.click()
+
+        # Wait for results to load
+        try:
+            page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+        except:
+            pass
+        page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+
+        # If we navigated to a new page, wait a bit more for results to render
+        if page.url != url_before:
+            print(f"  Form navigated to: {page.url}")
+            page.wait_for_timeout(1000)
+
+        return count_visible_results(page)
+    except Exception as e:
+        print(f"  Form search query '{query}' failed: {e}")
+        return -1
+
+
 def trigger_search(page, results_list: list) -> bool:
     """Smart search strategy with result count awareness.
-    
+
     Flow:
     1. Skip if confirmed JSON member data already captured
-    2. Check if page already shows all results before searching
-    3. Try strategies in order, comparing result counts:
-       - "a" → "all" → "" → "*" → "%"
-       - If any returns "all" or 600+ results → stop immediately
-       - If count is low, keep trying and the listener captures everything
-       - All responses are captured regardless, dedup handles overlap
+    2. Detect search method: prefer form-based search (more specific) over
+       generic site-wide search inputs when both exist
+    3. Pre-search: check visible results (skip for form pages)
+    4. Search "a" → check starts-with → ask AI for count
+    5. If "all" or ≥600: stop
+       If "unknown" (no counter): search blank, stop
+       If low number: try more strategies ("all", "", "*", "%")
     """
-    search_input = find_search_input(page)
-    if not search_input:
-        print("No search input detected")
-        return False
+    # --- Detect search method ---
+    # Try form-based search FIRST (more specific: Name/Company/City + Submit).
+    # If a form exists, it's almost certainly the directory search.
+    # Only fall back to generic search inputs if no form is found.
+    search_input = None
+    submit_btn = None
+    is_form_search = False
 
-    print("Search input found...")
+    form_input, form_submit = find_form_search(page)
+    if form_input and form_submit:
+        search_input = form_input
+        submit_btn = form_submit
+        is_form_search = True
+        print("  Form-based search detected (Name/Company form with submit button)")
+    else:
+        # No form found — try standard single-input search
+        search_input = find_search_input(page)
+        if search_input:
+            print("Search input found...")
+        else:
+            print("No search input detected (standard or form-based)")
+            return False
 
     baseline_json = len(results_list)
 
@@ -570,91 +874,142 @@ def trigger_search(page, results_list: list) -> bool:
         print(f"  Already have member data from page load ({len(results_list)} JSON responses), skipping search")
         return True
 
-    # --- Check if page already shows all results (before any searching) ---
-    pre_count = read_result_count(page)
-    pre_visible = count_visible_results(page)
-    print(f"  Pre-search: count={pre_count}, visible={pre_visible}")
-    if pre_count["type"] == "all":
-        print(f"  Page already showing all results, no search needed")
+    # --- Pre-search: check if page already shows lots of results ---
+    # Only use visible count — no AI call. Skip for form pages (form not submitted yet).
+    if not is_form_search:
+        pre_visible = count_visible_results(page)
+        print(f"  Pre-search: {pre_visible} visible results")
+        if pre_visible >= STOP_THRESHOLD:
+            print(f"  Page already showing {pre_visible} results, no search needed")
+            return True
+    else:
+        print(f"  Form-based search — skipping pre-search check")
+
+    url_before = page.url
+
+    # Pick the right query executor based on search type
+    def execute_query(query: str) -> int:
+        if is_form_search:
+            return try_form_search_query(page, search_input, submit_btn, query)
+        else:
+            return try_search_query(page, search_input, query, submit_btn=None)
+
+    def go_back_to_form() -> bool:
+        """For form-based search: navigate back to the form page after a search.
+        Returns True if successful, False if failed."""
+        nonlocal search_input, submit_btn
+        if not is_form_search or page.url == url_before:
+            return True  # no navigation happened, nothing to do
+        try:
+            page.go_back()
+            page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+            page.wait_for_timeout(1000)
+            search_input, submit_btn = find_form_search(page)
+            if not search_input or not submit_btn:
+                print(f"  Could not re-find form after navigating back")
+                return False
+            return True
+        except Exception as e:
+            print(f"  Error navigating back: {e}")
+            return False
+
+    # ─────────────────────────────────────────────────
+    #  STEP 1: Search "" (blank) — most sites return all results
+    # ─────────────────────────────────────────────────
+    print(f"  Trying '' (blank)...")
+    visible_blank = execute_query("")
+
+    if visible_blank < 0:
+        # Blank failed — try "a" as fallback
+        print(f"  Blank failed, trying 'a'...")
+        if go_back_to_form():
+            execute_query("a")
+        return len(results_list) > baseline_json
+
+    # ─────────────────────────────────────────────────
+    #  STEP 2: Read result count after blank
+    # ─────────────────────────────────────────────────
+    count_info = read_result_count(page, query="")
+    count_type = str(count_info.get("type", "unknown"))
+    count_number = int(count_info.get("count", 0))
+    print(f"  '': ~{visible_blank} visible, count: {count_type}"
+          f"{f' ({count_number})' if count_type == 'number' else ''}")
+
+    # ─────────────────────────────────────────────────
+    #  STEP 3: Decide based on count
+    # ─────────────────────────────────────────────────
+
+    # "all" or high count → we have everything, stop
+    if count_type == "all":
+        print(f"  Blank shows all results, stopping")
         return True
-    if pre_count["type"] == "number" and pre_count["count"] >= STOP_THRESHOLD:
-        print(f"  Page already showing {pre_count['count']} results, no search needed")
+    if count_type == "number" and count_number >= STOP_THRESHOLD:
+        print(f"  Blank shows {count_number} results, stopping")
         return True
-    if pre_visible >= STOP_THRESHOLD:
-        print(f"  Page already showing {pre_visible} visible results, no search needed")
+    if visible_blank >= STOP_THRESHOLD:
+        print(f"  Blank shows {visible_blank} visible results, stopping")
         return True
 
-    # --- Try strategies in order ---
-    strategies = [
-        ("a", "a"),
+    # ─────────────────────────────────────────────────
+    #  STEP 4: Try more strategies to get better results
+    # ─────────────────────────────────────────────────
+    # "unknown" or low count → try more queries
+    best_count = count_number if count_type == "number" else 0
+    site_has_counter = count_type != "unknown"
+
+    remaining = [
         ("all", "all"),
-        ("empty", ""),
-        ("wildcard_star", "*"),
+        ("a", "a"),
         ("wildcard_percent", "%"),
+        ("wildcard_star", "*"),
     ]
 
-    best_count = 0
-    best_strategy = None
-    any_results = False
+    for strat_name, strat_query in remaining:
+        if not go_back_to_form():
+            break
 
-    for name, query in strategies:
-        print(f"  Trying '{name}' (query='{query}')...")
-        visible = try_search_query(page, search_input, query)
+        print(f"  Trying '{strat_name}' (query='{strat_query}')...")
+        visible = execute_query(strat_query)
 
         if visible < 0:
-            print(f"  '{name}' search failed, skipping")
+            print(f"  '{strat_name}' failed, skipping")
             continue
 
-        if visible >= 3:
-            any_results = True
-
-        count_info = read_result_count(page, query=query)
-
-        # Determine the best count: use page indicator if available, else visible count
-        if count_info["type"] == "number":
-            effective_count = count_info["count"]
-        elif count_info["type"] == "all":
-            effective_count = visible  # "all" is always good
-        else:
-            effective_count = visible  # unknown — use visible as fallback
-
-        print(f"  '{name}': ~{visible} visible, count={count_info}, effective={effective_count}")
-
-        # Track best result
-        if effective_count > best_count:
-            best_count = effective_count
-            best_strategy = name
-
-        # STOP CHECK: "all" indicator, or high count from page, or lots of visible results
-        should_stop = (
-            count_info["type"] == "all" or
-            (count_info["type"] == "number" and count_info["count"] >= STOP_THRESHOLD) or
-            visible >= STOP_THRESHOLD
-        )
-
-        if should_stop:
-            print(f"  '{name}' is great (effective={effective_count}), stopping")
-            if name == "a" and is_starts_with_site(page):
-                search_all_letters(page, search_input)
-            return True
-
-        # After "a", check if starts-with before moving on
-        if name == "a" and visible >= 3 and is_starts_with_site(page):
+        # --- Special handling for "a": check starts-with ---
+        if strat_query == "a" and visible >= 3 and is_starts_with_site(page):
             print(f"  Detected starts-with site, iterating alphabet")
-            search_all_letters(page, search_input)
+            search_all_letters(page, search_input, submit_btn=submit_btn)
             return True
 
-    # --- All strategies tried, check what we got ---
-    print(f"  Best strategy: '{best_strategy}' with ~{best_count} results")
+        # Check visible count threshold
+        if visible >= STOP_THRESHOLD:
+            print(f"  '{strat_name}': {visible} visible results, stopping")
+            return True
 
-    # Check if any JSON was captured during search attempts
-    if len(results_list) > baseline_json:
-        print(f"  Search captured {len(results_list) - baseline_json} new JSON responses")
-        return True
+        # Read result count (skip AI if site had no counter on blank search)
+        if site_has_counter:
+            count_info = read_result_count(page, query=strat_query)
+            ct = str(count_info.get("type", "unknown"))
+            cn = int(count_info.get("count", 0))
+            print(f"  '{strat_name}': ~{visible} visible, count: {ct}"
+                  f"{f' ({cn})' if ct == 'number' else ''}")
 
-    if any_results:
-        print(f"  Got partial results from search attempts")
-        return True
+            if ct == "all":
+                print(f"  '{strat_name}' shows all results, stopping")
+                return True
+            if ct == "number" and cn >= STOP_THRESHOLD:
+                print(f"  '{strat_name}' shows {cn} results, stopping")
+                return True
+            if ct == "number" and cn > best_count:
+                best_count = cn
 
-    print("  No search strategy produced results")
-    return False
+            # If counter disappeared, stop trying
+            if ct == "unknown":
+                print(f"  Counter no longer visible, stopping")
+                break
+        else:
+            print(f"  '{strat_name}': ~{visible} visible (no counter)")
+
+    # --- Done trying strategies ---
+    print(f"  Best result count: {best_count}")
+    return best_count > 0 or len(results_list) > baseline_json or visible_blank >= 3

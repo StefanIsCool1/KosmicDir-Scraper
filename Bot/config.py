@@ -15,7 +15,21 @@ PAGINATION_IDLE_TIMEOUT = 30    # seconds when paginating through results
 NETWORK_IDLE_TIMEOUT = 5000     # ms for page.wait_for_load_state("networkidle")
 PAGE_WAIT_AFTER_ACTION = 1500   # ms to wait after clicking/searching
 
+# --- DETAIL PAGE CRAWLING ---
+DETAIL_CRAWL_DELAY_MIN = 0.5   # min seconds between detail page requests
+DETAIL_CRAWL_DELAY_MAX = 1.5   # max seconds between detail page requests
+DETAIL_SAMPLE_COUNT = 3         # number of sample pages to learn selectors from
+
+# URL keywords that indicate a detail link is directory-related
+# Used to score template groups — templates with these keywords rank higher
+DETAIL_URL_KEYWORDS = [
+    "member", "profile", "company", "detail", "listing",
+    "vendor", "supplier", "directory", "contact", "business",
+    "organization", "firm", "provider",
+]
+
 # --- SEARCH INPUT DETECTION ---
+# Primary selectors: standard search inputs (type=search, placeholder hints, id/name hints)
 SEARCH_INPUT_SELECTORS = (
     "input[type='search'], "
     "input[placeholder*='search' i], "
@@ -32,6 +46,40 @@ SEARCH_INPUT_SELECTORS = (
     "input[name*='query' i], "
     "input[id*='keyword' i], "
     "input[name*='keyword' i]"
+)
+
+# Fallback selectors: form-based directory inputs (e.g. YourMembership, GrowthZone)
+# These match inputs in multi-field forms like Name / Company / City + Continue button.
+# Only used when primary selectors find nothing.
+FORM_INPUT_SELECTORS = (
+    "input[name*='name' i][type='text'], "
+    "input[name*='company' i][type='text'], "
+    "input[name*='employer' i][type='text'], "
+    "input[name*='member' i][type='text'], "
+    "input[name*='business' i][type='text'], "
+    "input[name*='organization' i][type='text']"
+)
+
+# Labels / nearby-text patterns that indicate a "name" field (preferred for searching).
+# When multiple form inputs match, we pick the one whose label matches these patterns.
+PREFERRED_NAME_FIELD_LABELS = [
+    "name", "member name", "company name", "business name",
+    "organization name", "last name", "first name",
+]
+
+# Submit button selectors for form-based directories.
+# Used when form inputs are detected via FORM_INPUT_SELECTORS.
+FORM_SUBMIT_SELECTORS = (
+    "input[type='submit'], "
+    "button[type='submit'], "
+    "input[type='button'][value*='search' i], "
+    "input[type='button'][value*='continue' i], "
+    "input[type='button'][value*='find' i], "
+    "button:has-text('Search'), "
+    "button:has-text('Continue'), "
+    "button:has-text('Find'), "
+    "button:has-text('Submit'), "
+    "button:has-text('Go')"
 )
 
 
@@ -71,20 +119,34 @@ DIRECTORY_URL_KEYWORDS = [
 # --- PAGINATION ---
 NEXT_BUTTON_SELECTORS = (
     "a:has-text('Next'), a:has-text('next'), "
-    "a:has-text('>>'), a:has-text('›'), "
+    "a:has-text('>>'), a:has-text('»'), "
+    "a:has-text('›'), a:has-text('→'), "
     "a[rel='next'], "
     "button:has-text('Next'), button:has-text('next'), "
+    "button:has(i.fa-arrow-right), "
+    "button:has(i.fa-chevron-right), "
+    "button:has(i[class*='arrow-right']), "
+    "button:has(i[class*='chevron-right']), "
+    "a:has(i.fa-arrow-right), "
+    "a:has(i.fa-chevron-right), "
     "[class*='next']:not([class*='disabled']):not([class*='prev']), "
     "a[aria-label='Next page'], a[aria-label='next page'], "
-    "a[aria-label='Next'], "
+    "a[aria-label='Next'], a[aria-label='Go to next page'], "
     "li.next > a, li.pagination-next > a"
 )
 
 LOAD_MORE_SELECTORS = (
     "button:has-text('Load More'), button:has-text('load more'), "
+    "button:has-text('LOAD MORE'), "
     "button:has-text('Show More'), button:has-text('show more'), "
     "button:has-text('View More'), button:has-text('view more'), "
-    "a:has-text('Load More'), a:has-text('Show More'), "
+    "a:has-text('Load More'), a:has-text('LOAD MORE'), "
+    "a:has-text('Show More'), a:has-text('View More'), "
+    "input[value*='Load More' i], "
+    "input[value*='Show More' i], "
+    "input[value*='View More' i], "
+    "[role='button']:has-text('Load More'), "
+    "[role='button']:has-text('LOAD MORE'), "
     "[class*='load-more'], [class*='loadmore'], "
     "[class*='show-more'], [class*='showmore']"
 )

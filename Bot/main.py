@@ -7,9 +7,10 @@ Usage:
 
 Pipeline:
     1. browser.py  → Navigate to directory, capture network responses
-    2. parser.py   → Extract member data from HTML using learned selectors
-    3. cleaner.py  → Clean, normalize, deduplicate
-    4. Save raw + structured JSON to Data-dump/
+    2. detail_crawler.py → (optional) Crawl nested detail pages if data is shallow
+    3. parser.py   → Extract member data from HTML using learned selectors
+    4. cleaner.py  → Clean, normalize, deduplicate
+    5. Save raw + structured JSON to Data-dump/
 """
 
 import sys
@@ -21,17 +22,18 @@ from playwright.sync_api import sync_playwright
 from browser import capture_responses
 from html_parser import parse_member_html
 from cleaner import clean_members
+from detail_crawler import crawl_detail_pages
 
 
 def normalize_json_member(raw: dict) -> dict:
     """Map common API field names to our standard schema.
-    
+
     Different directory APIs use different keys:
       Name / CompanyName / company_name / name → company_name
       MainPhone / Phone / phone / PhoneNumber → phone
       WebSite / Website / website / URL / url → website
     etc.
-    
+
     This normalizes them all so clean_members() works correctly.
     """
     def find_field(candidates: list, data: dict):
@@ -102,16 +104,23 @@ def is_member_list(data: list) -> bool:
     return matches >= len(sample) * 0.5
 
 
-def parse_and_save_results(results: list, data_dump_dir: str, domain: str) -> list:
+def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
+                           detail_members: list | None = None) -> list:
     """Parse all captured responses, save both raw and structured data.
-    
+
     Handles:
     - JSON list responses (e.g. /GetDirectoryBasicInfo returns [{...}, {...}, ...])
     - JSON dict responses (single member or config-like data)
     - Raw HTML responses (parse with selector learning strategy)
+    - Pre-parsed detail page members (from detail_crawler)
     """
     all_members = []
     has_json_members = False
+
+    # --- Include detail crawl results first (already parsed) ---
+    if detail_members:
+        all_members.extend(detail_members)
+        print(f"Included {len(detail_members)} members from detail page crawl")
 
     for result in results:
         data = result.get("data", {})
@@ -139,9 +148,9 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str) -> li
 
         # --- HTML response — parse with selector strategy ---
         elif isinstance(data, dict) and "raw_html" in data:
-            # Skip HTML parsing if we already got good JSON data
-            if has_json_members and len(all_members) >= 10:
-                print(f"Skipping HTML parse (already have {len(all_members)} members from JSON)")
+            # Skip HTML parsing if we already got good data from JSON or detail crawl
+            if (has_json_members or detail_members) and len(all_members) >= 10:
+                print(f"Skipping HTML parse (already have {len(all_members)} members)")
                 continue
             print(f"Parsing HTML response from {result['url']}...")
             try:
@@ -174,6 +183,32 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str) -> li
     return all_members
 
 
+def prompt_detail_crawl(detail_url_count: int) -> bool:
+    """Ask the user whether to crawl nested detail pages.
+
+    Called when the scraper detects that member data is shallow (names only)
+    and detail page links exist that likely contain full contact info.
+
+    Returns True if the user confirms.
+    """
+    print("\n" + "=" * 60)
+    print("NESTED DETAIL PAGES DETECTED")
+    print("=" * 60)
+    print(f"  Found {detail_url_count} member profile links.")
+    print(f"  The listing page only shows names — full details (phone,")
+    print(f"  email, website, address) require visiting each profile page.")
+    print()
+
+    while True:
+        answer = input(f"  Crawl all {detail_url_count} detail pages? (y/n): ").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            print("  Skipping detail crawl.")
+            return False
+        print("  Please enter 'y' or 'n'.")
+
+
 def scrape_directory(url: str) -> list:
     """Full pipeline: scrape a directory URL and return structured member data."""
     domain = urlparse(url).netloc.replace(".", "_")
@@ -186,7 +221,7 @@ def scrape_directory(url: str) -> list:
 
     # --- Step 1: Browser automation — capture all responses ---
     with sync_playwright() as playwright:
-        results = capture_responses(playwright, url)
+        results, detail_urls = capture_responses(playwright, url)
 
     # --- Step 2: Save raw responses ---
     raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
@@ -194,8 +229,22 @@ def scrape_directory(url: str) -> list:
     with open(raw_output_path, "w") as f:
         json.dump(results, f, indent=4)
 
-    # --- Step 3: Parse, clean, and save structured data ---
-    members = parse_and_save_results(results, data_dump_dir, domain)
+    # --- Step 3: (Optional) Crawl nested detail pages ---
+    detail_members = []
+    if detail_urls:
+        if prompt_detail_crawl(len(detail_urls)):
+            detail_members = crawl_detail_pages(detail_urls, domain)
+
+            # Save detail crawl results separately for debugging
+            if detail_members:
+                detail_path = os.path.join(data_dump_dir, f"{domain}_detail_raw.json")
+                with open(detail_path, "w") as f:
+                    json.dump(detail_members, f, indent=4)
+                print(f"Saved {len(detail_members)} detail members to {detail_path}")
+
+    # --- Step 4: Parse, clean, and save structured data ---
+    members = parse_and_save_results(results, data_dump_dir, domain,
+                                     detail_members=detail_members)
 
     return members
 
