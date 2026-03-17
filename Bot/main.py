@@ -29,59 +29,84 @@ def normalize_json_member(raw: dict) -> dict:
     """Map common API field names to our standard schema.
 
     Different directory APIs use different keys:
-      Name / CompanyName / company_name / name → company_name
+      Name / CompanyName / company_name / name / nam → company_name
       MainPhone / Phone / phone / PhoneNumber → phone
       WebSite / Website / website / URL / url → website
     etc.
 
+    Also handles APIs with nested address objects (e.g. adr: {ad1, cit, sta, zip})
+    by flattening them into the top-level dict before field lookup.
+
     This normalizes them all so clean_members() works correctly.
     """
+    # Flatten nested address/location dicts into top-level for field lookup
+    # e.g. {"adr": {"ad1": "123 Main", "cit": "NYC"}} → {"ad1": "123 Main", "cit": "NYC", ...}
+    flat = dict(raw)
+    for key in ["adr", "address", "ShippingAddress"]:
+        nested = raw.get(key)
+        if isinstance(nested, dict):
+            for nk, nv in nested.items():
+                if nk not in flat:  # don't overwrite top-level keys
+                    flat[nk] = nv
+            break  # only flatten one address object
+
     def find_field(candidates: list, data: dict):
         """Return the value of the first matching key (case-insensitive)."""
         data_lower = {k.lower(): v for k, v in data.items()}
         for key in candidates:
             val = data_lower.get(key.lower())
             if val is not None:
+                # Skip non-scalar values (dicts, lists) — those are nested objects, not field values
+                if isinstance(val, (dict, list)):
+                    continue
                 return str(val).strip() if val else None
         return None
 
     # Phone: combine area code + number if split across fields
-    phone = find_field(["MainPhone", "Phone", "PhoneNumber", "phone", "telephone", "tel"], raw)
-    area_code = find_field(["PhoneAreaCode", "AreaCode", "areacode", "phone_area_code"], raw)
+    phone = find_field(["MainPhone", "Phone", "PhoneNumber", "phone", "telephone", "tel"], flat)
+    area_code = find_field(["PhoneAreaCode", "AreaCode", "areacode", "phone_area_code"], flat)
     if phone and area_code and not phone.startswith(area_code):
         phone = f"{area_code}-{phone}"
 
     # Fax: same treatment
-    fax = find_field(["Fax", "FaxNumber", "fax", "fax_number"], raw)
-    fax_area = find_field(["FaxAreaCode", "fax_area_code"], raw)
+    fax = find_field(["Fax", "FaxNumber", "fax", "fax_number"], flat)
+    fax_area = find_field(["FaxAreaCode", "fax_area_code"], flat)
     if fax and fax_area and not fax.startswith(fax_area):
         fax = f"{fax_area}-{fax}"
 
     # Address: try to build from parts or use full string
-    street = find_field(["Address", "StreetAddress", "street_address", "Address1", "AddressLine1"], raw)
-    city = find_field(["City", "city"], raw)
-    state = find_field(["State", "state", "StateProvince", "Province"], raw)
-    zipcode = find_field(["ZipCode", "Zip", "zip", "PostalCode", "postal_code", "zipcode"], raw)
+    street = find_field(["Address", "StreetAddress", "street_address", "Address1", "AddressLine1",
+                         "ShippingAddress1", "ad1"], flat)
+    city = find_field(["City", "city", "ShippingCity", "cit"], flat)
+    state = find_field(["State", "state", "StateProvince", "Province", "ShippingState", "sta"], flat)
+    zipcode = find_field(["ZipCode", "Zip", "zip", "PostalCode", "postal_code", "zipcode",
+                          "ShippingZip"], flat)
 
     # Build a combined street address if we have parts
     address_parts = [p for p in [street, city, state, zipcode] if p]
     full_address = ", ".join(address_parts) if address_parts else None
 
+    # Email: capture top-level email into contacts
+    email = find_field(["Email", "email", "EmailAddress", "email_address"], flat)
+    contacts = []
+    if email:
+        contacts.append({"name": None, "email": email})
+
     return {
         "company_name":    find_field(["Name", "CompanyName", "company_name", "BusinessName",
-                                       "OrganizationName", "name", "Title", "title"], raw),
+                                       "OrganizationName", "name", "Title", "title", "nam"], flat),
         "description":     find_field(["Description", "description", "About", "about",
-                                       "Bio", "bio", "Summary", "summary"], raw),
+                                       "Bio", "bio", "Summary", "summary", "cnm"], flat),
         "category":        find_field(["Specialties", "Category", "category", "Type",
                                        "type", "Classification", "Industry",
-                                       "specialty", "specialties"], raw),
+                                       "specialty", "specialties"], flat),
         "website":         find_field(["WebSite", "Website", "website", "URL", "url",
-                                       "Web", "web", "Homepage", "homepage"], raw),
+                                       "Web", "web", "Homepage", "homepage"], flat),
         "phone":           phone,
         "fax":             fax,
         "street_address":  full_address,
-        "mailing_address": find_field(["MailingAddress", "mailing_address", "Address2"], raw),
-        "contacts":        [],
+        "mailing_address": find_field(["MailingAddress", "mailing_address", "Address2", "ad2"], flat),
+        "contacts":        contacts,
     }
 
 
@@ -94,14 +119,23 @@ def is_member_list(data: list) -> bool:
         return False
     # Check first few items for name-like keys
     name_keys = {"name", "companyname", "company_name", "businessname",
-                 "organizationname", "title"}
+                 "organizationname", "title", "nam"}
     sample = data[:5]
     matches = 0
     for item in sample:
         item_keys = {k.lower() for k in item.keys()}
         if item_keys & name_keys:
             matches += 1
-    return matches >= len(sample) * 0.5
+    if matches < len(sample) * 0.5:
+        return False
+
+    # Reject simple option/filter lists (e.g. {"Name":"Accounting","Value":405810})
+    # Real member records have 5+ fields, not just name+value pairs
+    avg_keys = sum(len(item.keys()) for item in sample) / len(sample)
+    if avg_keys < 5:
+        return False
+
+    return True
 
 
 def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
@@ -110,6 +144,7 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
 
     Handles:
     - JSON list responses (e.g. /GetDirectoryBasicInfo returns [{...}, {...}, ...])
+    - JSON dict responses with nested member lists (e.g. {"Status":"OK", "Members":[...]})
     - JSON dict responses (single member or config-like data)
     - Raw HTML responses (parse with selector learning strategy)
     - Pre-parsed detail page members (from detail_crawler)
@@ -134,16 +169,33 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
                     all_members.append(normalized)
             has_json_members = True
 
-        # --- JSON dict (single record or non-member data like config) ---
+        # --- JSON dict (check for nested member list first, then single record) ---
         elif isinstance(data, dict) and "raw_html" not in data:
-            # Check if it looks like a single member record
-            name_keys = {"name", "companyname", "company_name", "businessname"}
-            data_keys_lower = {k.lower() for k in data.keys()}
-            if data_keys_lower & name_keys:
-                normalized = normalize_json_member(data)
-                if normalized.get("company_name"):
-                    all_members.append(normalized)
-                    has_json_members = True
+            # Check if any value in the dict is a member list
+            nested_list = None
+            nested_key = None
+            for key, val in data.items():
+                if isinstance(val, list) and len(val) >= 3 and is_member_list(val):
+                    nested_list = val
+                    nested_key = key
+                    break
+
+            if nested_list:
+                print(f"JSON nested member list '{nested_key}' from {result['url']}: {len(nested_list)} entries")
+                for item in nested_list:
+                    normalized = normalize_json_member(item)
+                    if normalized.get("company_name"):
+                        all_members.append(normalized)
+                has_json_members = True
+            else:
+                # Check if it looks like a single member record
+                name_keys = {"name", "companyname", "company_name", "businessname"}
+                data_keys_lower = {k.lower() for k in data.keys()}
+                if data_keys_lower & name_keys:
+                    normalized = normalize_json_member(data)
+                    if normalized.get("company_name"):
+                        all_members.append(normalized)
+                        has_json_members = True
             # else: skip non-member JSON (config files, auth responses, etc.)
 
         # --- HTML response — parse with selector strategy ---

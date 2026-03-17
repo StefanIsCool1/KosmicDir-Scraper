@@ -100,6 +100,14 @@ JSON_URL_KEYWORDS = [
     "contact", "vendor", "supplier", "provider",
 ]
 
+# URL patterns that EXCLUDE a JSON response from being treated as directory data
+# These endpoints match JSON_URL_KEYWORDS but never contain actual member records
+JSON_URL_EXCLUDE_PATTERNS = [
+    "filter", "config", "setting", "auth", "token",
+    "login", "session", "analytics", "visitor",
+    "tracking", "nrdata", "nr-data", "newrelic", "stripe",
+]
+
 # Field names that signal a JSON response contains member/company records
 # If a JSON object/array has 3+ of these keys, it's probably directory data
 JSON_STRUCTURE_FIELDS = [

@@ -860,15 +860,32 @@ def trigger_search(page, results_list: list) -> bool:
     has_member_data = False
     for result in results_list:
         data = result.get("data", {})
+
+        # Check top-level list
         if isinstance(data, list) and len(data) >= 3:
             sample = data[0] if data else {}
             if isinstance(sample, dict):
                 keys_lower = {k.lower() for k in sample.keys()}
                 name_fields = {"name", "companyname", "company_name", "businessname",
-                               "organizationname", "title"}
+                               "organizationname", "title", "nam"}
                 if keys_lower & name_fields:
                     has_member_data = True
                     break
+
+        # Check nested list inside dict (e.g. {"Status":"OK", "Members":[...]})
+        elif isinstance(data, dict):
+            for key, val in data.items():
+                if isinstance(val, list) and len(val) >= 3:
+                    sample = val[0]
+                    if isinstance(sample, dict):
+                        keys_lower = {k.lower() for k in sample.keys()}
+                        name_fields = {"name", "companyname", "company_name", "businessname",
+                                       "organizationname", "title", "nam"}
+                        if keys_lower & name_fields and len(sample.keys()) >= 5:
+                            has_member_data = True
+                            break
+            if has_member_data:
+                break
 
     if has_member_data:
         print(f"  Already have member data from page load ({len(results_list)} JSON responses), skipping search")
@@ -913,6 +930,10 @@ def trigger_search(page, results_list: list) -> bool:
             print(f"  Error navigating back: {e}")
             return False
 
+    # Track the best query to re-execute at the end
+    best_visible = 0
+    best_query = ""
+
     # ─────────────────────────────────────────────────
     #  STEP 1: Search "" (blank) — most sites return all results
     # ─────────────────────────────────────────────────
@@ -925,6 +946,10 @@ def trigger_search(page, results_list: list) -> bool:
         if go_back_to_form():
             execute_query("a")
         return len(results_list) > baseline_json
+
+    if visible_blank > best_visible:
+        best_visible = visible_blank
+        best_query = ""
 
     # ─────────────────────────────────────────────────
     #  STEP 2: Read result count after blank
@@ -975,6 +1000,10 @@ def trigger_search(page, results_list: list) -> bool:
             print(f"  '{strat_name}' failed, skipping")
             continue
 
+        if visible > best_visible:
+            best_visible = visible
+            best_query = strat_query
+
         # --- Special handling for "a": check starts-with ---
         if strat_query == "a" and visible >= 3 and is_starts_with_site(page):
             print(f"  Detected starts-with site, iterating alphabet")
@@ -1009,6 +1038,15 @@ def trigger_search(page, results_list: list) -> bool:
                 break
         else:
             print(f"  '{strat_name}': ~{visible} visible (no counter)")
+
+    # --- Re-execute the best query so the page shows the most results ---
+    # This ensures the HTML capture in browser.py gets the best page,
+    # not the last strategy which may have returned fewer results.
+    current_visible = count_visible_results(page)
+    if best_visible > current_visible and best_visible > 3:
+        print(f"  Re-executing best query '{best_query}' ({best_visible} visible vs current {current_visible})")
+        if go_back_to_form():
+            execute_query(best_query)
 
     # --- Done trying strategies ---
     print(f"  Best result count: {best_count}")

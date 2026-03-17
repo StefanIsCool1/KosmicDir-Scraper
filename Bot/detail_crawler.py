@@ -69,6 +69,8 @@ def detect_detail_links(collected_links: list) -> list:
             r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
             '/{ID}', t, flags=re.IGNORECASE
         )
+        # MongoDB ObjectId (24 hex chars): /68fbd440c81c665af209c70d → /{ID}
+        t = re.sub(r'/([0-9a-f]{24})(?=/|$)', '/{ID}', t, flags=re.IGNORECASE)
         return t
 
     # Known external domains that are never detail pages
@@ -348,6 +350,11 @@ HTML SAMPLES:
             raw = raw[4:]
 
     selectors = json.loads(raw.strip())
+
+    # Don't cache useless selectors — Haiku couldn't find anything
+    if not selectors.get("company_name"):
+        print(f"  Haiku returned no company_name selector for {domain}, skipping cache")
+        return selectors
 
     cache_key = f"detail_{domain}"
     set_cached_selectors(cache_key, selectors)

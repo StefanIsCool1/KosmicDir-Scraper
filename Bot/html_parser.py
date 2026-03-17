@@ -8,7 +8,7 @@ Strategy:
 3. Send sample to Haiku to learn CSS selectors (one cheap call per domain ever)
 4. Apply learned selectors with BS4 (zero AI cost forever after)
 """
-
+import os
 import re
 import json
 import anthropic
@@ -180,8 +180,31 @@ def extract_sample_html(raw_html: str) -> str:
             })
 
     if not candidates:
-        print("  Sample: no repeating card candidates found, sending first 5000 chars")
-        return str(soup)[:5000]
+        print("  Sample: no repeating card candidates found, scanning for densest content region")
+        # Find the region with the most links and contact signals instead of
+        # blindly taking first 5000 chars (which is often headers/forms/nav)
+        html_str = str(soup)
+        chunk_size = 5000
+        if len(html_str) <= chunk_size:
+            return html_str
+
+        best_chunk = html_str[:chunk_size]
+        best_score = 0
+
+        # Slide a window across the HTML, scoring each chunk
+        step = chunk_size // 2
+        for i in range(0, len(html_str) - step, step):
+            chunk = html_str[i:i + chunk_size]
+            chunk_lower = chunk.lower()
+            # Score by link density and contact-like content
+            score = chunk_lower.count('<a ') + chunk_lower.count('href=')
+            score += sum(2 for sig in CONTACT_SIGNALS if sig in chunk_lower)
+            if score > best_score:
+                best_score = score
+                best_chunk = chunk
+
+        print(f"  Sample: picked chunk with score {best_score} (links + contact signals)")
+        return best_chunk
 
     # Pick the highest scoring candidate
     best = max(candidates, key=lambda c: c["score"])
@@ -197,7 +220,7 @@ def extract_sample_html(raw_html: str) -> str:
 
 def learn_selectors(raw_html: str, domain: str) -> dict:
     """Ask Haiku to identify CSS selectors from a small sample.
-    Called ONCE per domain everthen the result is cached permanently."""
+    Called ONCE per domain, then the result is cached permanently."""
     sample = extract_sample_html(raw_html)
 
     client = anthropic.Anthropic()
@@ -243,6 +266,12 @@ HTML SAMPLE:
             raw = raw[4:]
 
     selectors = json.loads(raw.strip())
+
+    # Don't cache useless selectors — Haiku couldn't find anything
+    if not selectors.get("card_selector"):
+        print(f"  Haiku returned no card_selector for {domain}, skipping cache")
+        return selectors
+
     set_cached_selectors(domain, selectors)
     return selectors
 
@@ -368,7 +397,7 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
         selectors = learn_selectors(raw_html, domain)
         members = apply_selectors(raw_html, selectors)
         if is_extraction_valid(members):
-            print(f"SUCESS: Selector learned for {domain}!")
+            print(f"SUCCESS: Selector learned for {domain}!")
             return members
         print(f"  WARNING: Selector learning failed for {domain} - 0 valid members extracted")
     except Exception as e:

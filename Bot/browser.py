@@ -8,10 +8,11 @@ Handles: launching browser, capturing responses, human-like scrolling, paginatio
 import random
 import time
 import threading
+from urllib.parse import urlparse
 from config import (
     DEFAULT_IDLE_TIMEOUT, SEARCH_IDLE_TIMEOUT, PAGINATION_IDLE_TIMEOUT,
     NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
-    JSON_DIRECTORY_KEYWORDS, JSON_URL_KEYWORDS, JSON_STRUCTURE_FIELDS,
+    JSON_DIRECTORY_KEYWORDS, JSON_URL_KEYWORDS, JSON_URL_EXCLUDE_PATTERNS, JSON_STRUCTURE_FIELDS,
     DIRECTORY_URL_KEYWORDS,
     NEXT_BUTTON_SELECTORS, LOAD_MORE_SELECTORS,
 )
@@ -44,6 +45,26 @@ IFRAME_SELECTORS = [
     "iframe[src*='feeds']",
 ]
 
+# Third-party domains that are NEVER directory result frames
+THIRD_PARTY_FRAME_DOMAINS = [
+    "stripe.com", "js.stripe.com", "m.stripe.network", "m.stripe.com",
+    "facebook.com", "connect.facebook.net",
+    "google.com", "googleapis.com", "gstatic.com",
+    "youtube.com", "twitter.com", "linkedin.com",
+    "newrelic.com", "nr-data.net",
+    "cloudflare.com", "recaptcha.net",
+    "doubleclick.net", "googlesyndication.com",
+]
+
+
+def _is_third_party_frame(frame_url: str) -> bool:
+    """Check if a frame URL belongs to a known third-party domain."""
+    try:
+        frame_domain = urlparse(frame_url).netloc.lower()
+        return any(domain in frame_domain for domain in THIRD_PARTY_FRAME_DOMAINS)
+    except Exception:
+        return False
+
 
 def find_content_frame(page):
     """Detect if search results are loaded inside an iframe.
@@ -68,6 +89,8 @@ def find_content_frame(page):
             url = f.url.lower()
             if any(junk in url for junk in JUNK_FRAME_PATTERNS):
                 continue
+            if _is_third_party_frame(f.url):
+                continue
             # This frame has a real URL — might be a content iframe loading
             return True
         return False
@@ -87,6 +110,9 @@ def find_content_frame(page):
                 if iframe_el.is_visible(timeout=2000):
                     frame = iframe_el.content_frame()
                     if frame:
+                        # Skip third-party iframes
+                        if _is_third_party_frame(frame.url):
+                            continue
                         try:
                             frame_html = frame.content()
                             if any(kw in frame_html.lower() for kw in
@@ -100,11 +126,19 @@ def find_content_frame(page):
                 continue
 
         # Method 2: Scan all frames by URL pattern
+        # Match against the iframe's path only — not the full URL with fragments/params.
+        # This prevents false matches where the site's own URL (containing "directory"
+        # or "member") is embedded in a third-party iframe's hash/query params.
         for frame in page.frames:
             if frame == page.main_frame:
                 continue
-            frame_url = frame.url.lower()
-            if any(pattern in frame_url for pattern in IFRAME_CONTENT_URL_PATTERNS):
+
+            # Skip third-party iframes
+            if _is_third_party_frame(frame.url):
+                continue
+
+            frame_path = urlparse(frame.url).path.lower()
+            if any(pattern in frame_path for pattern in IFRAME_CONTENT_URL_PATTERNS):
                 try:
                     frame_html = frame.content()
                     if any(kw in frame_html.lower() for kw in
@@ -138,7 +172,7 @@ def human_scroll(page, done_event, scroll_target="body", times=20):
         pass
 
 
-def handle_pagination(page, done_event, link_collector=None):
+def handle_pagination(page, done_event, link_collector=None, html_collector=None):
     """Click through pagination to capture all pages.
 
     Handles two types of pagination:
@@ -150,6 +184,7 @@ def handle_pagination(page, done_event, link_collector=None):
         page: Playwright page or Frame object
         done_event: Threading event that signals when to stop
         link_collector: Optional list to accumulate page links into.
+        html_collector: Optional list to capture page HTML after each pagination click.
 
     Returns the number of extra pages loaded.
     """
@@ -169,6 +204,15 @@ def handle_pagination(page, done_event, link_collector=None):
         except:
             pass
         page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+
+    def _capture_html():
+        """Capture current page HTML into the html_collector."""
+        if html_collector is None:
+            return
+        try:
+            html_collector.append(page.content())
+        except Exception:
+            pass
 
     def _find_page_button(target_num: int):
         """Find a visible button or link with exact page number text."""
@@ -216,6 +260,7 @@ def handle_pagination(page, done_event, link_collector=None):
                 current_page_num = next_num
                 print(f"  Pagination: page {current_page_num}")
                 _collect_links()
+                _capture_html()
                 found_next = True
         except:
             pass
@@ -240,6 +285,7 @@ def handle_pagination(page, done_event, link_collector=None):
                         current_page_num += 1  # no numbered buttons — just increment
                     print(f"  Pagination: next/arrow → page {current_page_num}")
                     _collect_links()
+                    _capture_html()
                     found_next = True
         except:
             pass
@@ -345,7 +391,9 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
                 url_lower = response.url.lower()
                 if not is_directory_data:
                     if any(kw in url_lower for kw in JSON_URL_KEYWORDS):
-                        is_directory_data = True
+                        # Exclude known non-data endpoints (filters, config, analytics, etc.)
+                        if not any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
+                            is_directory_data = True
 
                 # Method 3: JSON structure has member-like fields
                 # Works for both list-of-dicts and single dict
@@ -356,6 +404,11 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
                         matches = keys_lower & set(JSON_STRUCTURE_FIELDS)
                         if len(matches) >= 3:
                             is_directory_data = True
+
+                # Final veto: exclude known non-data endpoints even if content matched
+                # (e.g. /memberdirectory/Filters contains "member" in data but isn't member data)
+                if is_directory_data and any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
+                    is_directory_data = False
 
                 if is_directory_data:
                     print("Likely directory data at:", response.url)
@@ -412,7 +465,13 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     # Some platforms (YourMembership, etc.) load search results in an iframe.
     # If so, we need to collect links, paginate, and capture HTML from the
     # iframe's Frame object — not the main page.
-    content_frame = find_content_frame(page)
+    # Skip iframe detection if we already captured JSON directory data —
+    # iframe is a fallback for sites that ONLY render results in an iframe.
+    content_frame = None
+    if not results:
+        content_frame = find_content_frame(page)
+    else:
+        print(f"  Skipping iframe detection (already have {len(results)} captured responses)")
     content_context = content_frame if content_frame else page
     if content_frame:
         print(f"  Operating inside iframe for link collection and pagination")
@@ -423,7 +482,18 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     if content_frame:
         print(f"  Collected {len(initial_links)} links from iframe (page 1)")
 
-    # --- Step 5: Handle pagination (also collects links from each new page) ---
+    # --- Step 4.5: Capture initial page HTML before pagination ---
+    # Pagination navigates away from each page, so we must capture page 1 now.
+    # Subsequent pages are captured inside handle_pagination via html_collector.
+    all_page_htmls = []
+    try:
+        initial_html = content_context.content()
+        if any(kw in initial_html.lower() for kw in ["member", "directory", "contact", "listing"]):
+            all_page_htmls.append(initial_html)
+    except Exception:
+        pass
+
+    # --- Step 5: Handle pagination (also collects links and HTML from each new page) ---
     # Pagination buttons (Next, →, Load More) are inside the content context.
     # Skip pagination if the search already loaded a large number of results —
     # sites that show 600+ results on one page don't need pagination, and
@@ -445,7 +515,8 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
         done.clear()
         idle_timeout_value = PAGINATION_IDLE_TIMEOUT
         reset_idle_timer()
-        extra_pages = handle_pagination(content_context, done, link_collector=all_page_links)
+        extra_pages = handle_pagination(content_context, done, link_collector=all_page_links,
+                                        html_collector=all_page_htmls)
         if extra_pages > 0:
             reset_idle_timer()  # give time for last page's responses
     else:
@@ -458,19 +529,31 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     # Wait until idle timer fires
     done.wait()
 
-    # --- Step 6: Capture content HTML as fallback ---
-    # If results are in an iframe, capture the iframe's HTML (not the main page).
-    try:
-        html = content_context.content()
-        if any(kw in html.lower() for kw in ["member", "directory", "contact", "listing"]):
-            source_url = content_frame.url if content_frame else page.url
-            print(f"Captured plain HTML from: {source_url}")
+    # --- Step 6: Add captured page HTML(s) to results ---
+    # If pagination captured multiple pages, add all of them.
+    # If no pagination, all_page_htmls has just the initial page (same as before).
+    # If pagination used Load More (no navigation), capture final page state now.
+    if all_page_htmls:
+        source_url = content_frame.url if content_frame else page.url
+        print(f"Captured {len(all_page_htmls)} HTML page(s)")
+        for html in all_page_htmls:
             results.append({
                 "url": source_url,
                 "data": {"raw_html": html}
             })
-    except Exception as e:
-        print(f"Error capturing page HTML: {e}")
+    else:
+        # Fallback: capture whatever is on screen now
+        try:
+            html = content_context.content()
+            if any(kw in html.lower() for kw in ["member", "directory", "contact", "listing"]):
+                source_url = content_frame.url if content_frame else page.url
+                print(f"Captured plain HTML from: {source_url}")
+                results.append({
+                    "url": source_url,
+                    "data": {"raw_html": html}
+                })
+        except Exception as e:
+            print(f"Error capturing page HTML: {e}")
 
     # --- Step 7: Read pending HTML responses (ASP.NET UpdatePanel etc.) ---
     print(f"Processing {len(pending_html_responses)} pending HTML responses...")
