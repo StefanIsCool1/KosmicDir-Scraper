@@ -366,6 +366,23 @@ function MiniTerminal({ onClose, onRainbow }) {
   const [input, setInput] = useState("");
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
+  const historyRef = useRef([]);
+  const historyIdxRef = useRef(-1);
+  const savedInputRef = useRef("");
+
+  const KNOWN_COMMANDS = [
+    "cat", "ls", "pwd", "whoami", "hostname", "date", "uptime", "echo",
+    "uname", "id", "clear", "exit", "quit", "help", "cd", "tree", "file",
+    "wc", "head", "tail", "neofetch", "screenfetch",
+  ];
+  const KNOWN_FILES = ["readme.md", "rainbow_mode.sh"];
+  const TAB_COMPLETIONS = [...KNOWN_COMMANDS, ...KNOWN_FILES,
+    "cat readme.md", "cat rainbow_mode.sh", "./rainbow_mode.sh",
+    "bash rainbow_mode.sh", "ls -la", "ls -a", "ls -l",
+    "uname -a", "wc readme.md", "wc -l readme.md",
+    "head readme.md", "tail readme.md", "file readme.md",
+    "file rainbow_mode.sh",
+  ];
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -382,6 +399,11 @@ function MiniTerminal({ onClose, onRainbow }) {
   const handleCommand = (cmd) => {
     const trimmed = cmd.trim();
     const lower = trimmed.toLowerCase();
+    if (trimmed) {
+      historyRef.current.push(trimmed);
+      historyIdxRef.current = -1;
+      savedInputRef.current = "";
+    }
     const newLines = [
       ...lines,
       { text: `stefan@underdeck:~$ ${trimmed}`, type: "command" },
@@ -567,7 +589,48 @@ function MiniTerminal({ onClose, onRainbow }) {
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => {
-              if (e.key === "Enter") handleCommand(input);
+              if (e.key === "Enter") {
+                handleCommand(input);
+              } else if (e.key === "Tab") {
+                e.preventDefault();
+                const partial = input.toLowerCase();
+                if (!partial) return;
+                const matches = TAB_COMPLETIONS.filter(c => c.startsWith(partial) && c !== partial);
+                if (matches.length === 1) {
+                  setInput(matches[0]);
+                } else if (matches.length > 1) {
+                  // Find longest common prefix
+                  let prefix = matches[0];
+                  for (const m of matches) {
+                    while (!m.startsWith(prefix)) prefix = prefix.slice(0, -1);
+                  }
+                  if (prefix.length > partial.length) {
+                    setInput(prefix);
+                  }
+                }
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                const hist = historyRef.current;
+                if (hist.length === 0) return;
+                if (historyIdxRef.current === -1) {
+                  savedInputRef.current = input;
+                  historyIdxRef.current = hist.length - 1;
+                } else if (historyIdxRef.current > 0) {
+                  historyIdxRef.current--;
+                }
+                setInput(hist[historyIdxRef.current]);
+              } else if (e.key === "ArrowDown") {
+                e.preventDefault();
+                const hist = historyRef.current;
+                if (historyIdxRef.current === -1) return;
+                if (historyIdxRef.current < hist.length - 1) {
+                  historyIdxRef.current++;
+                  setInput(hist[historyIdxRef.current]);
+                } else {
+                  historyIdxRef.current = -1;
+                  setInput(savedInputRef.current);
+                }
+              }
             }}
             style={{
               flex: 1,
@@ -592,69 +655,53 @@ function MiniTerminal({ onClose, onRainbow }) {
    ─────────────────────────────────────────── */
 function RainbowMode({ onClose }) {
   const catRef = useRef(null);
+  const hudRef = useRef(null);
   const animRef = useRef(null);
   const audioRef = useRef(null);
-  const [bouncesLeft, setBouncesLeft] = useState(50);
+  const winAudioRef = useRef(null);
+  const [bouncesLeft, setBouncesLeft] = useState(25);
   const [timeLeft, setTimeLeft] = useState(60);
-  const [gameOver, setGameOver] = useState(null); // null | "win" | "lose"
-  const [touching, setTouching] = useState(false);
+  const [gameOver, setGameOver] = useState(null);
   const gameOverRef = useRef(false);
-  const bouncesRef = useRef(50);
+  const bouncesRef = useRef(25);
 
   const state = useRef({
     x: window.innerWidth / 2 - 60,
     y: window.innerHeight / 2 - 40,
-    vx: 2,
-    vy: 1.5,
-    rotation: 0,
-    touching: false,
+    vx: 2, vy: 1.5, rotation: 0,
   });
 
   const mouseRef = useRef({ x: -999, y: -999 });
 
-  // Mouse tracking
   useEffect(() => {
     const handler = (e) => { mouseRef.current = { x: e.clientX, y: e.clientY }; };
     window.addEventListener("mousemove", handler);
     return () => window.removeEventListener("mousemove", handler);
   }, []);
 
-  // Audio — preload and start immediately
+  // Single audio — playbackRate changed directly, no React state involved
   useEffect(() => {
     const audio = new Audio("/nyancat.mp3");
     audio.loop = true;
     audio.volume = 0.5;
     audio.preload = "auto";
-    audioRef.current = audio;
-    // Force browser to buffer the file
     audio.load();
-    audio.play().catch(() => {});
-  }, []);
+    audioRef.current = audio;
 
-  const winAudioRef = useRef(null);
-  useEffect(() => {
     const win = new Audio("/winning.mp3");
     win.preload = "auto";
     win.volume = 0.6;
     win.load();
     winAudioRef.current = win;
+
+    audio.play().catch(() => {});
+    return () => { audio.pause(); audio.src = ""; };
   }, []);
 
   const startAudio = useCallback(() => {
     if (audioRef.current && audioRef.current.paused) {
       audioRef.current.play().catch(() => {});
     }
-  }, []);
-
-  // Cleanup audio only on unmount
-  useEffect(() => {
-    return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.currentTime = 0;
-        audioRef.current = null;
-      }
-    };
   }, []);
 
   // Countdown timer
@@ -665,7 +712,7 @@ function RainbowMode({ onClose }) {
           clearInterval(interval);
           if (!gameOverRef.current && bouncesRef.current > 0) {
             gameOverRef.current = true;
-            if (audioRef.current) { audioRef.current.pause(); }
+            if (audioRef.current) audioRef.current.pause();
             setGameOver("lose");
           }
           return 0;
@@ -692,7 +739,7 @@ function RainbowMode({ onClose }) {
     return out;
   });
 
-  // Game loop
+  // Game loop — ALL touch effects via direct DOM. Zero React re-renders.
   useEffect(() => {
     const s = state.current;
     const CW = 260;
@@ -707,17 +754,20 @@ function RainbowMode({ onClose }) {
       const catCx = s.x + CW / 2;
       const catCy = s.y + CH / 2;
       const dist = Math.sqrt((mx - catCx) ** 2 + (my - catCy) ** 2);
-      // Generous hit zone — 40px beyond the cat edge
       const isTouching = dist < (CW / 2 + 40);
 
+      // Touch state changed 
       if (isTouching !== lastTouchState) {
         lastTouchState = isTouching;
-        s.touching = isTouching;
-        setTouching(isTouching);
-        if (audioRef.current) audioRef.current.playbackRate = isTouching ? 1.3 : 1.0;
+        if (audioRef.current) audioRef.current.playbackRate = isTouching ? 1.4 : 1.0;
+        if (hudRef.current) {
+          hudRef.current.style.fontSize = isTouching ? "26px" : "16px";
+          hudRef.current.style.color = isTouching ? "" : "#ffffff40";
+          hudRef.current.style.animation = isTouching ? "scoreRainbow 0.4s linear infinite" : "none";
+          hudRef.current.style.textShadow = isTouching ? "0 0 15px rgba(255,255,255,0.3)" : "none";
+        }
       }
 
-      // Boost while touching — push away from cursor
       if (isTouching) {
         const angle = Math.atan2(catCy - my, catCx - mx);
         s.vx += Math.cos(angle) * 0.8;
@@ -727,7 +777,6 @@ function RainbowMode({ onClose }) {
       s.x += s.vx;
       s.y += s.vy;
 
-      // Wall bounces — each one costs a bounce
       let bounced = false;
       if (s.x <= 0) { s.x = 0; s.vx = Math.abs(s.vx); bounced = true; }
       if (s.x + CW >= window.innerWidth) { s.x = window.innerWidth - CW; s.vx = -Math.abs(s.vx); bounced = true; }
@@ -739,29 +788,21 @@ function RainbowMode({ onClose }) {
         setBouncesLeft(bouncesRef.current);
         if (bouncesRef.current <= 0 && !gameOverRef.current) {
           gameOverRef.current = true;
-          if (audioRef.current) { audioRef.current.pause(); }
-          if (winAudioRef.current) { winAudioRef.current.play().catch(() => {}); }
+          if (audioRef.current) audioRef.current.pause();
+          if (winAudioRef.current) winAudioRef.current.play().catch(() => {});
           setGameOver("win");
           return;
         }
       }
 
-      // Friction
       s.vx *= 0.998;
       s.vy *= 0.998;
-
-      // Minimum speed so it never fully stops
       const speed = Math.sqrt(s.vx ** 2 + s.vy ** 2);
-      if (speed < 1.5) {
-        s.vx *= 1.5 / speed;
-        s.vy *= 1.5 / speed;
-      }
+      if (speed < 1.5) { s.vx *= 1.5 / speed; s.vy *= 1.5 / speed; }
 
-      // Speed cap
       const cap = isTouching ? 14 : 6;
       s.vx = Math.min(Math.max(s.vx, -cap), cap);
       s.vy = Math.min(Math.max(s.vy, -cap), cap);
-
       s.rotation = s.vx * 1.5;
 
       if (catRef.current) {
@@ -774,6 +815,7 @@ function RainbowMode({ onClose }) {
 
     animRef.current = requestAnimationFrame(animate);
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -799,10 +841,17 @@ function RainbowMode({ onClose }) {
           100% { color: #ff6b6b; }
         }
         @keyframes popIn {
-          0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
-          50% { transform: translate(-50%, -50%) scale(1.15); opacity: 1; }
-          70% { transform: translate(-50%, -50%) scale(0.95); }
-          100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+          0%   { transform: translate(-50%, -50%) scale(0) rotate(0deg); opacity: 0; }
+          12%  { transform: translate(-50%, -50%) scale(1.15) rotate(720deg); opacity: 1; }
+          20%  { transform: translate(-50%, -50%) scale(1) rotate(720deg); }
+          30%  { transform: translate(-50%, -50%) scale(1.05) rotate(900deg); }
+          40%  { transform: translate(-50%, -50%) scale(1) rotate(900deg); }
+          50%  { transform: translate(-50%, -50%) scale(1.1) rotate(1440deg); }
+          60%  { transform: translate(-50%, -50%) scale(0.95) rotate(1440deg); }
+          70%  { transform: translate(-50%, -50%) scale(1.05) rotate(1620deg); }
+          80%  { transform: translate(-50%, -50%) scale(1) rotate(1620deg); }
+          90%  { transform: translate(-50%, -50%) scale(1.02) rotate(1800deg); }
+          100% { transform: translate(-50%, -50%) scale(1) rotate(1800deg); opacity: 1; }
         }
         @keyframes winTextGlow {
           0%, 100% { text-shadow: 0 0 10px #a3e63540; }
@@ -814,7 +863,7 @@ function RainbowMode({ onClose }) {
       <div style={{
         position: "absolute", inset: 0,
         background: "radial-gradient(ellipse at 20% 80%, #0a0a2e 0%, transparent 50%), " +
-                    "radial-gradient(ellipse at 80% 20%, #1a0a1e 0%, transparent 50%)",
+                    "radial-gradient(ellipse at 80% 20%,rgb(63, 33, 71) 0%, transparent 50%)",
       }} />
 
       {/* Stars */}
@@ -824,7 +873,7 @@ function RainbowMode({ onClose }) {
           left: `${s.x}%`, top: `${s.y}%`,
           width: s.size, height: s.size,
           borderRadius: "50%",
-          background: s.size > 2.5 ? "#e8e0ff" : "#fff",
+          background: s.size > 2.5 ? "#e8e0ff" : "rgba(0, 42, 255, 0.15)",
           opacity: s.opacity,
           boxShadow: s.size > 2 ? `0 0 ${s.size * 2}px ${s.size}px rgba(200,180,255,0.15)` : "none",
           ...(s.twinkle ? {
@@ -854,14 +903,11 @@ function RainbowMode({ onClose }) {
           {fmt(timeLeft)}
         </div>
 
-        {/* Bounces left */}
-        <div style={{
-          fontSize: touching ? 26 : 16,
+        {/* Bounces left — styled via hudRef from game loop */}
+        <div ref={hudRef} style={{
+          fontSize: 16,
+          color: "#ffffff40",
           transition: "font-size 0.2s ease, color 0.2s",
-          ...(touching ? {
-            animation: "scoreRainbow 0.4s linear infinite",
-            textShadow: "0 0 15px rgba(255,255,255,0.3)",
-          } : { color: "#ffffff40" }),
         }}>
           {bouncesLeft} bounces left
         </div>
@@ -902,7 +948,7 @@ function RainbowMode({ onClose }) {
                 width: "70vw",
                 maxWidth: 700,
                 borderRadius: 12,
-                animation: "popIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards",
+                animation: "popIn 3s ease-in-out forwards",
                 imageRendering: "auto",
               }}
             />
@@ -953,12 +999,12 @@ function RainbowMode({ onClose }) {
         <div style={{
           position: "absolute", bottom: 20, left: "50%",
           transform: "translateX(-50%)",
-          color: "#ffffff12",
+          color: "#fff",
           fontFamily: "'Hacked', monospace",
-          fontSize: 9, letterSpacing: 2, textTransform: "uppercase",
+          fontSize: 15, letterSpacing: 2, textTransform: "uppercase",
           textAlign: "center",
         }}>
-          hover the cat to make it bounce | click for music | deplete all bounces to win
+          hover the cat to make it bounce | click for music | WHEN THIS CAT BOUNCES ON ALL, U WIN
         </div>
       )}
     </div>
@@ -981,6 +1027,28 @@ export default function App() {
   const [balls, setBalls] = useState([]);
   const [showReadme, setShowReadme] = useState(false);
   const [rainbowActive, setRainbowActive] = useState(false);
+  const [showScraped, setShowScraped] = useState(false);
+  const [scrapedSites, setScrapedSites] = useState([
+    { domain: "agcwa.performancepublishing.net", count: 711 },
+    { domain: "business.hbagbr.org", count: 747 },
+    { domain: "business.uvhba.com", count: 915 },
+    { domain: "contractorhub.com", count: 57 },
+    { domain: "members.agc-utah.org", count: 668 },
+    { domain: "members.buildingncw.org", count: 239 },
+    { domain: "members.cmbaonline.org", count: 275 },
+    { domain: "mnmca.com", count: 53 },
+    { domain: "obd.hcraontario.ca", count: 45839 },
+    { domain: "thebuildersagc.com", count: 100 },
+    { domain: "www.abcwestwamembership.org", count: 334 },
+    { domain: "www.agcmn.org", count: 356 },
+    { domain: "www.agcwa.com", count: 711 },
+    { domain: "www.bomaseattle.org", count: 609 },
+    { domain: "www.hbade.org", count: 215 },
+    { domain: "www.mbaks.com", count: 2381 },
+    { domain: "www.mnrba.com", count: 100 },
+    { domain: "www.nadra.org", count: 693 },
+    { domain: "www.northstatebia.org", count: 26 },
+  ]);
   const fileRef = useRef();
 
   const spawnBall = useCallback((type) => {
@@ -990,6 +1058,16 @@ export default function App() {
 
   const removeBall = useCallback((id) => {
     setBalls(prev => prev.filter(b => b.id !== id));
+  }, []);
+
+  const fetchScrapedSites = useCallback(async () => {
+    try {
+      const res = await fetch("http://localhost:5000/scraped-sites");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.length > 0) setScrapedSites(data);
+      }
+    } catch { /* keep existing data on failure */ }
   }, []);
 
   const handleFile = (e) => {
@@ -1330,6 +1408,94 @@ export default function App() {
       ))}
 
       {/* readme.md button */}
+      {/* Scraped Sites button */}
+      <div onClick={() => { setShowScraped(s => !s); if (!showScraped) fetchScrapedSites(); }} style={{
+        position: "fixed",
+        top: 20,
+        right: 130,
+        padding: "6px 14px",
+        background: "#0a0a0a",
+        border: "1px solid #222",
+        borderRadius: 4,
+        color: "#555",
+        fontFamily: "'Hacked', monospace",
+        fontSize: 10,
+        letterSpacing: 2,
+        cursor: "pointer",
+        transition: "all 0.2s",
+        zIndex: 50,
+      }}
+        onMouseEnter={e => { e.currentTarget.style.color = "#a3e635"; e.currentTarget.style.borderColor = "#333"; }}
+        onMouseLeave={e => { e.currentTarget.style.color = "#555"; e.currentTarget.style.borderColor = "#222"; }}
+      >
+        scraped [{scrapedSites.length || "·"}]
+      </div>
+
+      {/* Scraped Sites panel */}
+      {showScraped && (
+        <div style={{
+          position: "fixed",
+          top: 54,
+          right: 130,
+          width: 320,
+          maxHeight: "60vh",
+          background: "#111",
+          border: "1px solid #222",
+          borderRadius: 6,
+          overflow: "hidden",
+          zIndex: 100,
+          fontFamily: "'Hacked', monospace",
+        }}>
+          <div style={{
+            padding: "10px 14px",
+            borderBottom: "1px solid #1a1a1a",
+            fontSize: 10,
+            letterSpacing: 2,
+            color: "#555",
+            textTransform: "uppercase",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}>
+            <span>scraped sites</span>
+            <span onClick={() => setShowScraped(false)} style={{ cursor: "pointer", color: "#333", fontSize: 14 }}>×</span>
+          </div>
+          <div style={{ overflowY: "auto", maxHeight: "calc(60vh - 40px)", padding: "6px 0" }}>
+            {scrapedSites.length === 0 && (
+              <div style={{ padding: "20px 14px", color: "#333", fontSize: 10, textAlign: "center", letterSpacing: 1 }}>
+                no sites scraped yet
+              </div>
+            )}
+            {scrapedSites.map((site, i) => (
+              <div key={i} style={{
+                padding: "8px 14px",
+                borderBottom: "1px solid #1a1a1a",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                transition: "background 0.15s",
+                cursor: "default",
+              }}
+                onMouseEnter={e => e.currentTarget.style.background = "#1a1a1a"}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+              >
+                <span style={{ color: "#888", fontSize: 10, letterSpacing: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>
+                  {site.domain}
+                </span>
+                <span style={{
+                  color: site.count > 0 ? "#a3e635" : "#f87171",
+                  fontSize: 9,
+                  letterSpacing: 1,
+                  flexShrink: 0,
+                }}>
+                  {site.count > 0 ? `${site.count}` : "0"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div onClick={() => setShowReadme(true)} style={{
         position: "fixed",
         top: 20,

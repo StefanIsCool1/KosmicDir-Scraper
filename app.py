@@ -206,5 +206,24 @@ def scrape_csv():
     return Response(stream(), mimetype="text/event-stream")
 
 
+@app.route("/scraped-sites", methods=["GET"])
+def scraped_sites():
+    """Return list of sites that have been scraped (based on structured JSON files)."""
+    sites = []
+    if os.path.isdir(DATA_DUMP):
+        for f in sorted(os.listdir(DATA_DUMP)):
+            if f.endswith("_structured.json") and not f.endswith("_detail_structured.json"):
+                domain = f.replace("_structured.json", "").replace("_", ".")
+                # Read the file to get member count
+                try:
+                    with open(os.path.join(DATA_DUMP, f), "r") as fh:
+                        data = json.load(fh)
+                        count = len(data) if isinstance(data, list) else 0
+                except Exception:
+                    count = 0
+                sites.append({"domain": domain, "file": f, "count": count})
+    return jsonify(sites)
+
+
 if __name__ == "__main__":
     app.run(host="localhost", port=5000, debug=False, threaded=True)

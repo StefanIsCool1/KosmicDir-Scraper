@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from config import (
     DEFAULT_IDLE_TIMEOUT, SEARCH_IDLE_TIMEOUT, PAGINATION_IDLE_TIMEOUT,
     NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
+    JSON_JUNK_DOMAINS,
     JSON_DIRECTORY_KEYWORDS, JSON_URL_KEYWORDS, JSON_URL_EXCLUDE_PATTERNS, JSON_STRUCTURE_FIELDS,
     DIRECTORY_URL_KEYWORDS,
     NEXT_BUTTON_SELECTORS, LOAD_MORE_SELECTORS,
@@ -494,6 +495,11 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
 
     def on_response(response):
         """Listener for all network responses. Captures JSON and queues HTML."""
+        # Skip known third-party domains that never contain member data
+        resp_domain = urlparse(response.url).netloc.lower()
+        if any(junk in resp_domain for junk in JSON_JUNK_DOMAINS):
+            return
+
         content_type = response.headers.get("content-type", "")
         print(f"RESPONSE: [{content_type}] {response.url}")
         debug.log("CAPTURE", f"Response: [{content_type[:30]}] {response.url[:120]}")

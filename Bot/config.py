@@ -85,6 +85,35 @@ FORM_SUBMIT_SELECTORS = (
 
 # --- RESPONSE CAPTURE: KEYWORDS ---
 # JSON responses containing these words (in data OR url) are treated as directory data
+# Third-party domains that NEVER contain directory member data.
+# Responses from these domains are silently skipped — no content inspection needed.
+JSON_JUNK_DOMAINS = [
+    "split.io", "cookielaw.org", "onetrust.com",       # feature flags / cookie consent
+    "google-analytics.com", "googletagmanager.com",     # analytics
+    "google.com/maps", "maps.googleapis.com",           # maps
+    "facebook.com", "facebook.net", "fbcdn.net",        # social
+    "twitter.com", "x.com",                             # social
+    "linkedin.com",                                     # social
+    "doubleclick.net", "googlesyndication.com",         # ads
+    "cloudflare.com", "cloudflareinsights.com",         # CDN / security
+    "newrelic.com", "nr-data.net",                      # monitoring
+    "sentry.io", "sentry-cdn.com",                      # error tracking
+    "hotjar.com", "hotjar.io",                          # heatmaps
+    "clarity.ms",                                       # Microsoft Clarity
+    "stripe.com", "stripe.network",                     # payments
+    "recaptcha.net", "gstatic.com",                     # captcha / static
+    "segment.io", "segment.com",                        # analytics
+    "hubspot.com", "hsforms.com",                       # marketing
+    "intercom.io",                                      # chat
+    "zendesk.com", "zdassets.com",                      # support
+    "amplitude.com",                                    # analytics
+    "mixpanel.com",                                     # analytics
+    "optimizely.com",                                   # A/B testing
+    "launchdarkly.com",                                 # feature flags
+    "unpkg.com", "cdnjs.cloudflare.com", "jsdelivr.net", # CDN
+    "fontawesome.com", "fonts.googleapis.com",          # fonts
+]
+
 JSON_DIRECTORY_KEYWORDS = [
     "member", "user", "directory", "contact", "company",
     "listing", "organization", "vendor", "supplier",
