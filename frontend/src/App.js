@@ -349,6 +349,623 @@ function DebugPanel({ entries, summary }) {
 }
 
 /* ───────────────────────────────────────────
+   Mini Linux Terminal (readme.md)
+   ─────────────────────────────────────────── */
+const README_CONTENT = `Hey, my name is Stefan.
+
+I've always enjoyed working on passion projects like these
+(although they always take a lot of my school/work time away :(.
+
+I hope you can play around with this code, good luck :)`;
+
+function MiniTerminal({ onClose, onRainbow }) {
+  const [lines, setLines] = useState([
+    { text: "stefan@underdeck:~$ ", type: "prompt" },
+    { text: "Type 'cat readme.md' to read the readme.", type: "hint" },
+  ]);
+  const [input, setInput] = useState("");
+  const scrollRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [lines]);
+
+  useEffect(() => {
+    if (inputRef.current) inputRef.current.focus();
+  }, [lines]);
+
+  const DESTRUCTIVE = ["mkdir", "touch", "rm", "mv", "cp", "nano", "vim", "vi",
+    "chmod", "chown", "write", "dd", "mkfs", "apt", "brew", "npm", "pip",
+    "git init", "git commit", "git push", "wget", "curl -o", "sudo"];
+
+  const handleCommand = (cmd) => {
+    const trimmed = cmd.trim();
+    const lower = trimmed.toLowerCase();
+    const newLines = [
+      ...lines,
+      { text: `stefan@underdeck:~$ ${trimmed}`, type: "command" },
+    ];
+
+    if (!trimmed) {
+      setLines([...newLines, { text: "stefan@underdeck:~$ ", type: "prompt" }]);
+      return;
+    }
+
+    if (DESTRUCTIVE.some(d => lower.startsWith(d))) {
+      newLines.push({ text: "this ain't a real terminal buddy >:(", type: "error" });
+    } else if (lower === "cat readme.md") {
+      README_CONTENT.split("\n").forEach(line => {
+        newLines.push({ text: line, type: "output" });
+      });
+    } else if (lower === "cat" || lower.startsWith("cat ")) {
+      const file = trimmed.slice(4).trim();
+      if (!file) {
+        newLines.push({ text: "cat: missing file operand", type: "error" });
+      } else {
+        newLines.push({ text: `cat: ${file}: No such file or directory`, type: "error" });
+      }
+    } else if (lower === "ls" || lower === "ls -la" || lower === "ls -a" || lower === "ls -l") {
+      if (lower.includes("-a") || lower.includes("-la")) {
+        newLines.push({ text: "drwxr-xr-x  stefan  staff  ..", type: "output" });
+        newLines.push({ text: "drwxr-xr-x  stefan  staff  .", type: "output" });
+      }
+      newLines.push({ text: "-rw-r--r--  stefan  staff  readme.md", type: "output" });
+      newLines.push({ text: "-rwxr-xr-x  stefan  staff  rainbow_mode.sh", type: "rainbow" });
+    } else if (lower === "./rainbow_mode.sh" || lower === "bash rainbow_mode.sh" || lower === "sh rainbow_mode.sh") {
+      newLines.push({ text: "🌈 RAINBOW MODE ACTIVATED 🌈", type: "rainbow" });
+      newLines.push({ text: "nyan nyan nyan nyan nyan nyan nyan...", type: "rainbow" });
+      newLines.push({ text: "stefan@underdeck:~$ ", type: "prompt" });
+      setLines(newLines);
+      setInput("");
+      setTimeout(() => onRainbow(), 300);
+      return;
+    } else if (lower === "cat rainbow_mode.sh") {
+      newLines.push({ text: "#!/bin/bash", type: "output" });
+      newLines.push({ text: "# top secret easter egg", type: "hint" });
+      newLines.push({ text: 'echo "activating rainbow mode..."', type: "output" });
+      newLines.push({ text: 'echo "summoning nyan cat..."', type: "output" });
+      newLines.push({ text: "# try running me with ./rainbow_mode.sh", type: "hint" });
+    } else if (lower === "file rainbow_mode.sh") {
+      newLines.push({ text: "rainbow_mode.sh: Bourne-Again shell script, extremely vibes", type: "output" });
+    } else if (lower === "pwd") {
+      newLines.push({ text: "/home/stefan", type: "output" });
+    } else if (lower === "whoami") {
+      newLines.push({ text: "stefan", type: "output" });
+    } else if (lower === "hostname") {
+      newLines.push({ text: "underdeck", type: "output" });
+    } else if (lower === "date") {
+      newLines.push({ text: new Date().toString(), type: "output" });
+    } else if (lower === "uptime") {
+      newLines.push({ text: "up since you opened this page, probably", type: "output" });
+    } else if (lower === "echo" || lower.startsWith("echo ")) {
+      newLines.push({ text: trimmed.slice(5), type: "output" });
+    } else if (lower === "uname" || lower === "uname -a") {
+      newLines.push({ text: "UnderDeckOS 2.0 stefan-macbook x86_64", type: "output" });
+    } else if (lower === "id") {
+      newLines.push({ text: "uid=1000(stefan) gid=1000(staff) groups=1000(staff),27(sudo)", type: "output" });
+    } else if (lower === "clear") {
+      setLines([{ text: "stefan@underdeck:~$ ", type: "prompt" }]);
+      setInput("");
+      return;
+    } else if (lower === "exit" || lower === "quit") {
+      onClose();
+      return;
+    } else if (lower === "help") {
+      newLines.push({ text: "available: ls, cat, pwd, whoami, echo, date, clear, exit", type: "output" });
+      newLines.push({ text: "try: cat readme.md", type: "hint" });
+    } else if (lower.startsWith("cd")) {
+      newLines.push({ text: "you're not going anywhere buddy", type: "error" });
+    } else if (lower === "tree") {
+      newLines.push({ text: "/home/stefan", type: "output" });
+      newLines.push({ text: "├── readme.md", type: "output" });
+      newLines.push({ text: "└── rainbow_mode.sh", type: "rainbow" });
+    } else if (lower === "file readme.md") {
+      newLines.push({ text: "readme.md: UTF-8 Unicode text, with very good vibes", type: "output" });
+    } else if (lower === "wc readme.md" || lower === "wc -l readme.md") {
+      newLines.push({ text: `  ${README_CONTENT.split("\n").length}  readme.md`, type: "output" });
+    } else if (lower === "head readme.md") {
+      README_CONTENT.split("\n").slice(0, 3).forEach(line => {
+        newLines.push({ text: line, type: "output" });
+      });
+    } else if (lower === "tail readme.md") {
+      README_CONTENT.split("\n").slice(-3).forEach(line => {
+        newLines.push({ text: line, type: "output" });
+      });
+    } else if (lower === "neofetch" || lower === "screenfetch") {
+      newLines.push({ text: "      ___       stefan@underdeck", type: "output" });
+      newLines.push({ text: "     /   \\      OS: UnderDeckOS 2.0", type: "output" });
+      newLines.push({ text: "    | U D |     Host: localhost:3000", type: "output" });
+      newLines.push({ text: "     \\___/      Shell: not-real-sh", type: "output" });
+      newLines.push({ text: "               Mood: vibing", type: "output" });
+    } else {
+      newLines.push({ text: `bash: ${trimmed}: command not found`, type: "error" });
+    }
+
+    newLines.push({ text: "stefan@underdeck:~$ ", type: "prompt" });
+    setLines(newLines);
+    setInput("");
+  };
+
+  return (
+    <div style={{
+      position: "fixed",
+      top: 40,
+      right: 40,
+      width: 420,
+      background: "#0a0a0a",
+      border: "1px solid #1a1a1a",
+      borderRadius: 6,
+      zIndex: 100,
+      boxShadow: "0 8px 32px rgba(0,0,0,0.6)",
+      overflow: "hidden",
+    }}>
+      {/* Title bar */}
+      <div style={{
+        padding: "8px 12px",
+        borderBottom: "1px solid #1a1a1a",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        background: "#111",
+      }}>
+        <span style={{
+          color: "#444", fontSize: 10, letterSpacing: 2,
+          fontFamily: "'Hacked', monospace", textTransform: "uppercase",
+        }}>
+          stefan@underdeck:~
+        </span>
+        <div onClick={onClose} style={{
+          width: 14, height: 14, borderRadius: 2,
+          background: "#222", border: "1px solid #333",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          cursor: "pointer", fontSize: 9, color: "#555", lineHeight: 1,
+          transition: "background 0.15s",
+        }}
+          onMouseEnter={e => e.currentTarget.style.background = "#333"}
+          onMouseLeave={e => e.currentTarget.style.background = "#222"}
+        >
+          x
+        </div>
+      </div>
+
+      {/* Output */}
+      <div ref={scrollRef} onClick={() => inputRef.current?.focus()} style={{
+        maxHeight: 300,
+        overflowY: "auto",
+        padding: "10px 14px",
+        cursor: "text",
+      }}>
+        {lines.map((line, i) => (
+          <div key={i} style={{
+            fontFamily: "'Hacked', monospace",
+            fontSize: 11,
+            lineHeight: "19px",
+            color: line.type === "error" ? "#f87171"
+              : line.type === "hint" ? "#555"
+              : line.type === "command" ? "#a3e635"
+              : line.type === "prompt" ? "#a3e635"
+              : line.type === "rainbow" ? "#c084fc"
+              : "#888",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}>
+            {line.text}
+          </div>
+        ))}
+
+        {/* Active input line */}
+        <div style={{
+          display: "flex",
+          fontFamily: "'Hacked', monospace",
+          fontSize: 11,
+          lineHeight: "19px",
+        }}>
+          <span style={{ color: "#a3e635" }}>stefan@underdeck:~$&nbsp;</span>
+          <input
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === "Enter") handleCommand(input);
+            }}
+            style={{
+              flex: 1,
+              background: "transparent",
+              border: "none",
+              color: "#ccc",
+              fontFamily: "'Hacked', monospace",
+              fontSize: 11,
+              outline: "none",
+              padding: 0,
+              caretColor: "#a3e635",
+            }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────────────────────────────
+   Nyan Cat Mini Game
+   ─────────────────────────────────────────── */
+function RainbowMode({ onClose }) {
+  const catRef = useRef(null);
+  const animRef = useRef(null);
+  const audioRef = useRef(null);
+  const [bouncesLeft, setBouncesLeft] = useState(50);
+  const [timeLeft, setTimeLeft] = useState(60);
+  const [gameOver, setGameOver] = useState(null); // null | "win" | "lose"
+  const [touching, setTouching] = useState(false);
+  const gameOverRef = useRef(false);
+  const bouncesRef = useRef(50);
+
+  const state = useRef({
+    x: window.innerWidth / 2 - 60,
+    y: window.innerHeight / 2 - 40,
+    vx: 2,
+    vy: 1.5,
+    rotation: 0,
+    touching: false,
+  });
+
+  const mouseRef = useRef({ x: -999, y: -999 });
+
+  // Mouse tracking
+  useEffect(() => {
+    const handler = (e) => { mouseRef.current = { x: e.clientX, y: e.clientY }; };
+    window.addEventListener("mousemove", handler);
+    return () => window.removeEventListener("mousemove", handler);
+  }, []);
+
+  // Audio — preload and start immediately
+  useEffect(() => {
+    const audio = new Audio("/nyancat.mp3");
+    audio.loop = true;
+    audio.volume = 0.5;
+    audio.preload = "auto";
+    audioRef.current = audio;
+    // Force browser to buffer the file
+    audio.load();
+    audio.play().catch(() => {});
+  }, []);
+
+  const winAudioRef = useRef(null);
+  useEffect(() => {
+    const win = new Audio("/winning.mp3");
+    win.preload = "auto";
+    win.volume = 0.6;
+    win.load();
+    winAudioRef.current = win;
+  }, []);
+
+  const startAudio = useCallback(() => {
+    if (audioRef.current && audioRef.current.paused) {
+      audioRef.current.play().catch(() => {});
+    }
+  }, []);
+
+  // Cleanup audio only on unmount
+  useEffect(() => {
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+        audioRef.current = null;
+      }
+    };
+  }, []);
+
+  // Countdown timer
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          if (!gameOverRef.current && bouncesRef.current > 0) {
+            gameOverRef.current = true;
+            if (audioRef.current) { audioRef.current.pause(); }
+            setGameOver("lose");
+          }
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Stars
+  const [stars] = useState(() => {
+    const out = [];
+    for (let i = 0; i < 120; i++) {
+      out.push({
+        x: Math.random() * 100, y: Math.random() * 100,
+        size: Math.random() < 0.08 ? 2 + Math.random() * 1.5 : 0.5 + Math.random() * 1.2,
+        opacity: 0.1 + Math.random() * 0.5,
+        twinkle: Math.random() < 0.3,
+        duration: 3 + Math.random() * 4,
+        delay: Math.random() * 5,
+      });
+    }
+    return out;
+  });
+
+  // Game loop
+  useEffect(() => {
+    const s = state.current;
+    const CW = 260;
+    const CH = 180;
+    let lastTouchState = false;
+
+    const animate = () => {
+      if (gameOverRef.current) return;
+
+      const mx = mouseRef.current.x;
+      const my = mouseRef.current.y;
+      const catCx = s.x + CW / 2;
+      const catCy = s.y + CH / 2;
+      const dist = Math.sqrt((mx - catCx) ** 2 + (my - catCy) ** 2);
+      // Generous hit zone — 40px beyond the cat edge
+      const isTouching = dist < (CW / 2 + 40);
+
+      if (isTouching !== lastTouchState) {
+        lastTouchState = isTouching;
+        s.touching = isTouching;
+        setTouching(isTouching);
+        if (audioRef.current) audioRef.current.playbackRate = isTouching ? 1.3 : 1.0;
+      }
+
+      // Boost while touching — push away from cursor
+      if (isTouching) {
+        const angle = Math.atan2(catCy - my, catCx - mx);
+        s.vx += Math.cos(angle) * 0.8;
+        s.vy += Math.sin(angle) * 0.8;
+      }
+
+      s.x += s.vx;
+      s.y += s.vy;
+
+      // Wall bounces — each one costs a bounce
+      let bounced = false;
+      if (s.x <= 0) { s.x = 0; s.vx = Math.abs(s.vx); bounced = true; }
+      if (s.x + CW >= window.innerWidth) { s.x = window.innerWidth - CW; s.vx = -Math.abs(s.vx); bounced = true; }
+      if (s.y <= 0) { s.y = 0; s.vy = Math.abs(s.vy); bounced = true; }
+      if (s.y + CH >= window.innerHeight) { s.y = window.innerHeight - CH; s.vy = -Math.abs(s.vy); bounced = true; }
+
+      if (bounced) {
+        bouncesRef.current--;
+        setBouncesLeft(bouncesRef.current);
+        if (bouncesRef.current <= 0 && !gameOverRef.current) {
+          gameOverRef.current = true;
+          if (audioRef.current) { audioRef.current.pause(); }
+          if (winAudioRef.current) { winAudioRef.current.play().catch(() => {}); }
+          setGameOver("win");
+          return;
+        }
+      }
+
+      // Friction
+      s.vx *= 0.998;
+      s.vy *= 0.998;
+
+      // Minimum speed so it never fully stops
+      const speed = Math.sqrt(s.vx ** 2 + s.vy ** 2);
+      if (speed < 1.5) {
+        s.vx *= 1.5 / speed;
+        s.vy *= 1.5 / speed;
+      }
+
+      // Speed cap
+      const cap = isTouching ? 14 : 6;
+      s.vx = Math.min(Math.max(s.vx, -cap), cap);
+      s.vy = Math.min(Math.max(s.vy, -cap), cap);
+
+      s.rotation = s.vx * 1.5;
+
+      if (catRef.current) {
+        const scale = isTouching ? 1.4 : 1;
+        catRef.current.style.transform = `translate(${s.x}px, ${s.y}px) rotate(${s.rotation}deg) scale(${scale})`;
+      }
+
+      animRef.current = requestAnimationFrame(animate);
+    };
+
+    animRef.current = requestAnimationFrame(animate);
+    return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
+  }, []);
+
+  const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+  return (
+    <div onClick={startAudio} style={{
+      position: "fixed", inset: 0, zIndex: 9999,
+      cursor: "crosshair", overflow: "hidden",
+      background: "#020208",
+    }}>
+      <style>{`
+        @keyframes starPulse {
+          0%, 100% { opacity: var(--base-opacity); }
+          50% { opacity: 1; }
+        }
+        @keyframes scoreRainbow {
+          0% { color: #ff6b6b; }
+          16% { color: #ffa94d; }
+          33% { color: #ffd43b; }
+          50% { color: #69db7c; }
+          66% { color: #74c0fc; }
+          83% { color: #b197fc; }
+          100% { color: #ff6b6b; }
+        }
+        @keyframes popIn {
+          0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+          50% { transform: translate(-50%, -50%) scale(1.15); opacity: 1; }
+          70% { transform: translate(-50%, -50%) scale(0.95); }
+          100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+        }
+        @keyframes winTextGlow {
+          0%, 100% { text-shadow: 0 0 10px #a3e63540; }
+          50% { text-shadow: 0 0 30px #a3e63580, 0 0 60px #a3e63530; }
+        }
+      `}</style>
+
+      {/* Space */}
+      <div style={{
+        position: "absolute", inset: 0,
+        background: "radial-gradient(ellipse at 20% 80%, #0a0a2e 0%, transparent 50%), " +
+                    "radial-gradient(ellipse at 80% 20%, #1a0a1e 0%, transparent 50%)",
+      }} />
+
+      {/* Stars */}
+      {stars.map((s, i) => (
+        <div key={i} style={{
+          position: "absolute",
+          left: `${s.x}%`, top: `${s.y}%`,
+          width: s.size, height: s.size,
+          borderRadius: "50%",
+          background: s.size > 2.5 ? "#e8e0ff" : "#fff",
+          opacity: s.opacity,
+          boxShadow: s.size > 2 ? `0 0 ${s.size * 2}px ${s.size}px rgba(200,180,255,0.15)` : "none",
+          ...(s.twinkle ? {
+            animation: `starPulse ${s.duration}s ease-in-out infinite`,
+            animationDelay: `${s.delay}s`,
+            "--base-opacity": s.opacity,
+          } : {}),
+        }} />
+      ))}
+
+      {/* HUD — top bar */}
+      <div style={{
+        position: "absolute", top: 0, left: 0, right: 0,
+        padding: "16px 30px",
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        fontFamily: "'Hacked', monospace",
+        textTransform: "uppercase",
+        letterSpacing: 4,
+        zIndex: 2,
+      }}>
+        {/* Timer */}
+        <div style={{
+          fontSize: 16,
+          color: timeLeft <= 10 ? "#f87171" : "#ffffff40",
+          transition: "color 0.3s",
+        }}>
+          {fmt(timeLeft)}
+        </div>
+
+        {/* Bounces left */}
+        <div style={{
+          fontSize: touching ? 26 : 16,
+          transition: "font-size 0.2s ease, color 0.2s",
+          ...(touching ? {
+            animation: "scoreRainbow 0.4s linear infinite",
+            textShadow: "0 0 15px rgba(255,255,255,0.3)",
+          } : { color: "#ffffff40" }),
+        }}>
+          {bouncesLeft} bounces left
+        </div>
+      </div>
+
+      {/* Nyan Cat */}
+      <div ref={catRef} style={{
+        position: "absolute", top: 0, left: 0,
+        pointerEvents: "none", willChange: "transform",
+        transition: "scale 0.15s",
+      }}>
+        <img
+          src="/nyancat.gif" alt="nyan"
+          style={{
+            width: 260, height: 180,
+            imageRendering: "pixelated",
+            userSelect: "none", pointerEvents: "none",
+          }}
+          draggable={false}
+        />
+      </div>
+
+      {/* Game over overlay */}
+      {gameOver && (
+        <div onClick={onClose} style={{
+          position: "absolute", inset: 0,
+          background: "#020208ee",
+          zIndex: 10,
+          cursor: "pointer",
+        }}>
+          {/* Winner gif — pops out from center */}
+          {gameOver === "win" && (
+            <img
+              src="/winner.gif" alt="winner"
+              style={{
+                position: "absolute",
+                top: "50%", left: "50%",
+                width: "70vw",
+                maxWidth: 700,
+                borderRadius: 12,
+                animation: "popIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards",
+                imageRendering: "auto",
+              }}
+            />
+          )}
+
+          {/* Text over the gif */}
+          <div style={{
+            position: "absolute",
+            top: gameOver === "win" ? "12%" : "50%",
+            left: "50%",
+            transform: "translateX(-50%)",
+            textAlign: "center",
+            zIndex: 11,
+          }}>
+            <div style={{
+              fontFamily: "'Hacked', monospace",
+              fontSize: 42, letterSpacing: 6,
+              color: gameOver === "win" ? "#a3e635" : "#f87171",
+              textTransform: "uppercase",
+              marginBottom: 8,
+              animation: gameOver === "win" ? "winTextGlow 2s ease-in-out infinite" : "none",
+            }}>
+              {gameOver === "win" ? "you did it!" : "time's up!"}
+            </div>
+            <div style={{
+              fontFamily: "'Hacked', monospace",
+              fontSize: 13, color: "#888",
+              letterSpacing: 3, marginBottom: 20,
+            }}>
+              {gameOver === "win"
+                ? `cleared all bounces with ${fmt(timeLeft)} remaining`
+                : `${bouncesLeft} bounces remaining`
+              }
+            </div>
+            <div style={{
+              fontFamily: "'Hacked', monospace",
+              fontSize: 10, color: "#ffffff20",
+              letterSpacing: 2, textTransform: "uppercase",
+            }}>
+              click anywhere to close
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Instructions */}
+      {!gameOver && (
+        <div style={{
+          position: "absolute", bottom: 20, left: "50%",
+          transform: "translateX(-50%)",
+          color: "#ffffff12",
+          fontFamily: "'Hacked', monospace",
+          fontSize: 9, letterSpacing: 2, textTransform: "uppercase",
+          textAlign: "center",
+        }}>
+          hover the cat to make it bounce | click for music | deplete all bounces to win
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ───────────────────────────────────────────
    Main App
    ─────────────────────────────────────────── */
 export default function App() {
@@ -362,6 +979,8 @@ export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [awaitingInput, setAwaitingInput] = useState(false);
   const [balls, setBalls] = useState([]);
+  const [showReadme, setShowReadme] = useState(false);
+  const [rainbowActive, setRainbowActive] = useState(false);
   const fileRef = useRef();
 
   const spawnBall = useCallback((type) => {
@@ -709,6 +1328,35 @@ export default function App() {
       {balls.map(b => (
         <BouncingBall key={b.id} type={b.type} onDone={() => removeBall(b.id)} />
       ))}
+
+      {/* readme.md button */}
+      <div onClick={() => setShowReadme(true)} style={{
+        position: "fixed",
+        top: 20,
+        right: 20,
+        padding: "6px 14px",
+        background: "rgb(0, 82, 3)",
+        border: "2px solidrgb(240, 0, 0)",
+        borderRadius: 4,
+        color: "#fff",
+        fontFamily: "'Hacked', monospace",
+        fontSize: 10,
+        letterSpacing: 2,
+        cursor: "pointer",
+        transition: "all 0.2s",
+        zIndex: 50,
+      }}
+        onMouseEnter={e => { e.currentTarget.style.color = "#888"; e.currentTarget.style.borderColor = "#333"; }}
+        onMouseLeave={e => { e.currentTarget.style.color = "#fff"; e.currentTarget.style.borderColor = "#1a1a1a"; }}
+      >
+        readme.md
+      </div>
+
+      {/* Mini terminal */}
+      {showReadme && <MiniTerminal onClose={() => setShowReadme(false)} onRainbow={() => setRainbowActive(true)} />}
+
+      {/* Rainbow mode overlay */}
+      {rainbowActive && <RainbowMode onClose={() => setRainbowActive(false)} />}
 
       {/* Footer */}
       <div style={{
