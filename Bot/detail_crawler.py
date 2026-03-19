@@ -19,6 +19,8 @@ import re
 import json
 import time
 import random
+import ssl
+import urllib.request
 import anthropic
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
@@ -26,9 +28,9 @@ from bs4 import BeautifulSoup
 from config import (
     DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX,
     DETAIL_SAMPLE_COUNT, DETAIL_URL_KEYWORDS,
-    NETWORK_IDLE_TIMEOUT,
+    NETWORK_IDLE_TIMEOUT, EXTERNAL_SKIP_DOMAINS,
 )
-from html_parser import strip_junk
+from html_parser import strip_junk, regex_extract_from_card, _merge_member_data
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
 
 
@@ -69,16 +71,7 @@ def detect_detail_links(collected_links: list) -> list:
             r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
             '/{ID}', t, flags=re.IGNORECASE
         )
-        # MongoDB ObjectId (24 hex chars): /68fbd440c81c665af209c70d → /{ID}
-        t = re.sub(r'/([0-9a-f]{24})(?=/|$)', '/{ID}', t, flags=re.IGNORECASE)
         return t
-
-    # Known external domains that are never detail pages
-    EXTERNAL_DOMAINS = [
-        "google.com", "facebook.com", "twitter.com", "linkedin.com",
-        "instagram.com", "youtube.com", "yelp.com", "maps.google",
-        "goo.gl", "bit.ly", "apple.com", "microsoft.com",
-    ]
 
     # Group links by their URL template
     template_groups: dict[str, list[str]] = {}
@@ -91,7 +84,7 @@ def detect_detail_links(collected_links: list) -> list:
 
         # Skip external domains — these are never member detail pages
         href_lower = href.lower()
-        if any(domain in href_lower for domain in EXTERNAL_DOMAINS):
+        if any(d in href_lower for d in EXTERNAL_SKIP_DOMAINS):
             continue
 
         template = templatize(href)
@@ -250,20 +243,86 @@ def html_has_contact_info(results: list) -> bool:
 #  DETAIL PAGE SELECTOR LEARNING
 # ───────────────────────────────────────────
 
-def clean_detail_html(raw_html: str) -> str:
-    """Strip junk from a detail page HTML, return the main content area."""
-    soup = BeautifulSoup(raw_html, "html.parser")
-    soup = strip_junk(soup)
+def _get_ancestors(el):
+    """Return list of parent elements from el up to the root."""
+    ancestors = []
+    parent = el.parent
+    while parent and parent.name:
+        ancestors.append(parent)
+        parent = parent.parent
+    return ancestors
 
-    # Try to find the main content container — ordered from most specific to broadest
+
+def _find_common_ancestor(elements):
+    """Find the smallest common ancestor of a list of BeautifulSoup elements."""
+    if not elements:
+        return None
+    if len(elements) == 1:
+        return elements[0].parent
+
+    # Get ancestor chains for each element
+    ancestor_chains = [_get_ancestors(el) for el in elements]
+
+    # Find common ancestors (present in ALL chains)
+    common = set(id(a) for a in ancestor_chains[0])
+    ancestor_map = {id(a): a for a in ancestor_chains[0]}
+    for chain in ancestor_chains[1:]:
+        chain_ids = set(id(a) for a in chain)
+        ancestor_map.update({id(a): a for a in chain})
+        common &= chain_ids
+
+    if not common:
+        return None
+
+    # Pick the smallest (deepest) common ancestor by text length
+    candidates = [ancestor_map[aid] for aid in common]
+    return min(candidates, key=lambda a: len(a.get_text(strip=True)))
+
+
+def clean_detail_html(raw_html: str) -> str:
+    """Extract the contact/member detail section from a full page HTML.
+
+    Universal approach:
+    1. Remove scripts/styles (safe cleanup)
+    2. Find contact signal elements (itemprop, tel:, mailto: links)
+    3. Walk up to their smallest common ancestor — that's the detail panel
+    4. Fall back to standard content selectors if no contact signals found
+    """
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    # Safe cleanup — only remove elements that never contain useful text
+    for tag in soup(["script", "style", "svg", "noscript"]):
+        tag.decompose()
+
+    # --- Strategy 1: Find contact signal elements and their common ancestor ---
+    signal_elements = []
+
+    # Schema.org markup (itemprop="telephone", "email", "streetAddress", etc.)
+    for el in soup.find_all(attrs={"itemprop": True}):
+        prop = str(el.get("itemprop", "")).lower()
+        if prop in ("telephone", "email", "streetaddress", "addresslocality",
+                     "postalcode", "addressregion", "url", "name", "contactpoint"):
+            signal_elements.append(el)
+
+    # tel: and mailto: links
+    for el in soup.find_all("a", href=True):
+        href = str(el.get("href", ""))
+        if href.startswith("tel:") or href.startswith("mailto:"):
+            signal_elements.append(el)
+
+    if len(signal_elements) >= 2:
+        ancestor = _find_common_ancestor(signal_elements)
+        if ancestor and ancestor.name not in ("html", "body", "[document]"):
+            text_len = len(ancestor.get_text(strip=True))
+            # Good ancestor: has real content but isn't the whole page
+            if 50 < text_len < 20000:
+                return str(ancestor)
+
+    # --- Strategy 2: Standard content container selectors (on unstripped soup) ---
     content_selectors = [
-        # YourMembership / association platforms (most specific)
         "#SpContent_Container", "#SpContent", "#sp-content",
-        # Standard HTML5 semantic elements
         "main", "[role='main']", "article",
-        # Common CMS content wrappers (ID-based — more specific)
         "#content", "#main-content", "#primary", "#main",
-        # Class-based (less specific — could match sidebar/footer divs)
         ".main-content", ".page-content", ".entry-content", ".post-content",
     ]
 
@@ -275,15 +334,15 @@ def clean_detail_html(raw_html: str) -> str:
         except Exception:
             continue
 
-    # Fallback: look for tables with member data (YourMembership uses ViewTable1)
+    # --- Strategy 3: Strip junk, then find largest content block ---
+    soup = strip_junk(soup)
+
     tables = soup.find_all("table")
     if tables:
-        # Pick the table with the most text (likely the member info table)
         best_table = max(tables, key=lambda t: len(t.get_text(strip=True)))
         if len(best_table.get_text(strip=True)) > 100:
             return str(best_table)
 
-    # Last resort: largest div by text content
     divs = soup.find_all("div")
     if divs:
         best = max(divs, key=lambda d: len(d.get_text(strip=True)))
@@ -301,11 +360,12 @@ def learn_detail_selectors(sample_htmls: list, domain: str) -> dict:
     Result is cached with a 'detail_' prefix to avoid colliding with
     listing-page selectors.
     """
-    # Clean and truncate each sample — 5000 chars to capture full member info
+    # Clean and truncate each sample — 8000 chars to ensure contact section is included
+    # (detail panels often have description/images before the contact info at the bottom)
     samples = []
     for html in sample_htmls[:DETAIL_SAMPLE_COUNT]:
         cleaned = clean_detail_html(html)
-        samples.append(cleaned[:5000])
+        samples.append(cleaned[:8000])
 
     combined = "\n\n---PAGE BREAK---\n\n".join(samples)
 
@@ -335,7 +395,7 @@ Rules:
 - Use ID selectors (#tdWorkPhone), class selectors (.member-phone), or tag selectors as needed
 - If a field doesn't exist in the samples, use null
 - Never use :contains() pseudo-selectors (not supported by BeautifulSoup)
-- For phone: target the <td> or <div> that contains the phone number text
+- For phone/website: target the element containing the text (could be <a>, <td>, <div>, <span>, etc.)
 
 HTML SAMPLES:
 {combined}"""
@@ -431,6 +491,19 @@ def apply_detail_selectors(raw_html: str, selectors: dict) -> dict:
 
 
 # ───────────────────────────────────────────
+#  REGEX FALLBACK FOR DETAIL PAGES
+# ───────────────────────────────────────────
+
+def regex_extract_from_detail_html(raw_html: str, domain: str) -> dict:
+    """Extract member data from a detail page using regex fallback.
+    Uses clean_detail_html() to isolate the detail panel first,
+    then applies the same regex extraction used for listing cards."""
+    cleaned = clean_detail_html(raw_html)
+    detail_soup = BeautifulSoup(cleaned, "html.parser")
+    return regex_extract_from_card(detail_soup, domain)
+
+
+# ───────────────────────────────────────────
 #  VALIDATION
 # ───────────────────────────────────────────
 
@@ -484,6 +557,191 @@ def collect_page_links(page) -> list:
 
 
 # ───────────────────────────────────────────
+#  API FAST PATH: Detect & use JSON API endpoints
+# ───────────────────────────────────────────
+
+def _extract_uid_from_url(url: str) -> str:
+    """Extract a UID/ID from a detail URL. Works for hash and path-based URLs."""
+    # Hash-based: ...#!biz/id/68fbd440c81c665af209c70d
+    hash_match = re.search(r'[/#]([0-9a-f]{24})(?:/|$)', url)
+    if hash_match:
+        return hash_match.group(1)
+    # Numeric ID in query: ?id=12345
+    query_match = re.search(r'[?&]\w*id\w*=(\d+)', url, re.IGNORECASE)
+    if query_match:
+        return query_match.group(1)
+    # Numeric ID in path: /members/12345
+    path_match = re.search(r'/(\d{3,})(?:/|$|\?)', url)
+    if path_match:
+        return path_match.group(1)
+    return ""
+
+
+def _detect_detail_api(sample_urls: list) -> dict | None:
+    """Navigate to one detail page and listen for API calls that return member JSON.
+
+    If the page's JavaScript makes a fetch/XHR that returns JSON containing the
+    member's UID, we've found the API pattern.
+
+    Returns:
+        {"template": "https://api.example.com/v2/account/{uid}/profile",
+         "headers": {...}} or None
+    """
+    if not sample_urls:
+        return None
+
+    url = sample_urls[0]
+    uid = _extract_uid_from_url(url)
+    if not uid:
+        return None
+
+    api_responses = []
+
+    def on_response(response):
+        try:
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type:
+                return
+            resp_url = response.url
+            # Must contain the UID in the URL — that's the per-member API call
+            if uid not in resp_url:
+                return
+            body = response.text()
+            if uid in body and len(body) > 50:
+                api_responses.append({
+                    "url": resp_url,
+                    "headers": dict(response.request.headers),
+                    "body": body,
+                })
+        except Exception:
+            pass
+
+    print(f"  Probing for API endpoint (navigating to first detail page)...")
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=False)
+        page = browser.new_page()
+        page.on("response", on_response)
+
+        try:
+            page.goto(url, timeout=15000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+            except Exception:
+                pass
+            page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"  API probe failed: {e}")
+            browser.close()
+            return None
+
+        browser.close()
+
+    if not api_responses:
+        print(f"  No API endpoint detected, falling back to HTML crawl")
+        return None
+
+    # Pick the best API response (most data)
+    best = max(api_responses, key=lambda r: len(r["body"]))
+    api_url = best["url"]
+
+    # Build a URL template by replacing the UID with {uid}
+    template = api_url.replace(uid, "{uid}")
+    # Copy relevant headers (auth tokens, API keys, etc.)
+    headers = {k: v for k, v in best["headers"].items()
+               if k.lower() not in ("host", "connection", "content-length",
+                                     "accept-encoding", "user-agent")}
+
+    # Verify the template works — try parsing the response as JSON
+    try:
+        data = json.loads(best["body"])
+        if not isinstance(data, dict):
+            return None
+        # Must have name-like field
+        has_name = any(k.lower() in ("nam", "name", "companyname", "company_name",
+                                      "businessname", "title")
+                       for k in data.keys())
+        if not has_name:
+            return None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    return {"template": template, "headers": headers}
+
+
+def _fetch_all_via_api(api_pattern: dict, detail_urls: list) -> list:
+    """Fetch all member profiles via direct API calls. No browser needed.
+
+    Args:
+        api_pattern: {"template": "...{uid}...", "headers": {...}}
+        detail_urls: Original detail URLs (used to extract UIDs)
+
+    Returns:
+        List of member dicts, or empty list if too many failures.
+    """
+    template = api_pattern["template"]
+    headers = api_pattern["headers"]
+    # Add a reasonable user-agent
+    headers["user-agent"] = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    uids = []
+    for url in detail_urls:
+        uid = _extract_uid_from_url(url)
+        if uid:
+            uids.append(uid)
+
+    if not uids:
+        return []
+
+    total = len(uids)
+    print(f"  Fetching {total} member profiles via API (fast path)...")
+
+    all_members = []
+    failed = 0
+
+    for i, uid in enumerate(uids):
+        api_url = template.replace("{uid}", uid)
+        try:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+                if resp.status != 200:
+                    failed += 1
+                    if failed <= 3:
+                        print(f"    API error for {uid}: HTTP {resp.status}")
+                    elif failed == 4:
+                        print(f"    (suppressing further API errors)")
+                    if failed >= 20:
+                        print(f"  Too many API failures ({failed}), aborting fast path")
+                        return []
+                    continue
+
+                data = json.loads(resp.read().decode("utf-8"))
+                if isinstance(data, dict):
+                    all_members.append(data)
+
+        except Exception as e:
+            failed += 1
+            if failed <= 3:
+                print(f"    API error for {uid}: {e}")
+            continue
+
+        # Progress reporting
+        done = i + 1
+        if done % 50 == 0 or done == total:
+            print(f"    Progress: {done}/{total} fetched ({len(all_members)} OK)")
+
+        # Small delay to be polite
+        time.sleep(random.uniform(0.1, 0.3))
+
+    print(f"  API fast path complete: {len(all_members)} members fetched")
+    return all_members
+
+
+# ───────────────────────────────────────────
 #  MAIN CRAWL ENTRY POINT
 # ───────────────────────────────────────────
 
@@ -510,13 +768,60 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
 
     all_members = []
     sample_htmls = []
+    use_regex_fallback = False
+    use_merge_mode = False
 
     total = len(detail_urls)
     print(f"\n  Starting detail page crawl ({total} pages)...")
 
+    # --- Fast path: detect API endpoints behind detail pages ---
+    # Navigate to one detail page with a network listener. If the SPA makes
+    # an API call that returns JSON with the member's data, we can skip
+    # Playwright entirely and fetch all members via direct HTTP requests.
+    api_pattern = _detect_detail_api(detail_urls[:1])
+    if api_pattern:
+        print(f"  API endpoint detected: {api_pattern['template']}")
+        api_members = _fetch_all_via_api(api_pattern, detail_urls)
+        if api_members:
+            return api_members
+
+    # Detect if detail URLs use hash-fragment routing (SPA pattern)
+    is_hash_route = any("#" in url for url in detail_urls[:3])
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=False)
         page = browser.new_page()
+
+        def _navigate_detail(url):
+            """Navigate to a detail page URL — handles both regular and hash-fragment URLs.
+            For hash URLs (SPA routes like #!biz/id/xxx), changes the hash via JS
+            and waits for the SPA to render, since page.goto() may not re-navigate
+            when only the hash changes."""
+            if is_hash_route and "#" in url:
+                base_url = url.split("#")[0]
+                hash_fragment = url.split("#", 1)[1]
+                current_base = page.url.split("#")[0]
+
+                if current_base.rstrip("/") != base_url.rstrip("/"):
+                    # First visit — full navigation needed
+                    page.goto(url, timeout=15000)
+                else:
+                    # Already on the same page — just change the hash
+                    page.evaluate(f"window.location.hash = '{hash_fragment}'")
+
+                # Wait for SPA to render the new member profile
+                try:
+                    page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                except Exception:
+                    pass
+                # Extra wait for SPA rendering (hash changes don't trigger full navigation)
+                page.wait_for_timeout(2000)
+            else:
+                page.goto(url, timeout=15000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                except Exception:
+                    pass
 
         # ── Phase 1: Learn selectors from sample pages ──
         if not cached:
@@ -525,11 +830,7 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
 
             for i, url in enumerate(sample_urls):
                 try:
-                    page.goto(url, timeout=15000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-                    except Exception:
-                        pass
+                    _navigate_detail(url)
                     html = page.content()
                     sample_htmls.append(html)
                     print(f"    Sample {i + 1}/{len(sample_urls)}: OK")
@@ -555,14 +856,34 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
             # Validate on the sample pages
             sample_members = [apply_detail_selectors(html, selectors) for html in sample_htmls]
             if not is_detail_extraction_valid(sample_members):
-                print("  ERROR: Detail selector validation failed — selectors don't extract real data")
-                delete_cached_selectors(cache_key)
-                browser.close()
-                return []
+                print("  Detail selectors failed validation, trying regex fallback...")
+                regex_sample_members = [
+                    regex_extract_from_detail_html(html, domain) for html in sample_htmls
+                ]
+                if is_detail_extraction_valid(regex_sample_members):
+                    print("  Regex fallback succeeded on sample pages!")
+                    use_regex_fallback = True
+                    all_members.extend(regex_sample_members)
+                else:
+                    # Try merging selector + regex results
+                    merged_samples = [
+                        _merge_member_data(sel, reg)
+                        for sel, reg in zip(sample_members, regex_sample_members)
+                    ]
+                    if is_detail_extraction_valid(merged_samples):
+                        print("  Merged selector+regex succeeded on sample pages!")
+                        use_merge_mode = True
+                        all_members.extend(merged_samples)
+                    else:
+                        print("  ERROR: All detail extraction methods failed")
+                        delete_cached_selectors(cache_key)
+                        browser.close()
+                        return []
+            else:
+                all_members.extend(sample_members)
 
-            all_members.extend(sample_members)
             remaining_urls = detail_urls[DETAIL_SAMPLE_COUNT:]
-            print(f"  Selectors validated! {len(sample_members)} members from samples.")
+            print(f"  Selectors validated! {len(all_members)} members from samples.")
         else:
             selectors = cached
             remaining_urls = detail_urls
@@ -576,14 +897,19 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
         failed = 0
         for i, url in enumerate(remaining_urls):
             try:
-                page.goto(url, timeout=15000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-                except Exception:
-                    pass
+                _navigate_detail(url)
 
                 html = page.content()
-                member = apply_detail_selectors(html, selectors)
+
+                if use_regex_fallback:
+                    member = regex_extract_from_detail_html(html, domain)
+                elif use_merge_mode:
+                    sel_member = apply_detail_selectors(html, selectors)
+                    reg_member = regex_extract_from_detail_html(html, domain)
+                    member = _merge_member_data(sel_member, reg_member)
+                else:
+                    member = apply_detail_selectors(html, selectors)
+
                 if member.get("company_name"):
                     all_members.append(member)
 

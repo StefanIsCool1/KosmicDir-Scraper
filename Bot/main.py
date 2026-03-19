@@ -261,8 +261,14 @@ def prompt_detail_crawl(detail_url_count: int) -> bool:
         print("  Please enter 'y' or 'n'.")
 
 
-def scrape_directory(url: str) -> list:
-    """Full pipeline: scrape a directory URL and return structured member data."""
+def scrape_directory(url: str, prompt_callback=None) -> list:
+    """Full pipeline: scrape a directory URL and return structured member data.
+
+    Args:
+        url: The directory URL to scrape.
+        prompt_callback: Optional callback for interactive prompts (e.g. detail crawl y/n).
+                         If None, falls back to terminal input() for CLI usage.
+    """
     domain = urlparse(url).netloc.replace(".", "_")
 
     # Set up output directory
@@ -284,7 +290,12 @@ def scrape_directory(url: str) -> list:
     # --- Step 3: (Optional) Crawl nested detail pages ---
     detail_members = []
     if detail_urls:
-        if prompt_detail_crawl(len(detail_urls)):
+        should_crawl = False
+        if prompt_callback:
+            should_crawl = prompt_callback(len(detail_urls))
+        else:
+            should_crawl = prompt_detail_crawl(len(detail_urls))
+        if should_crawl:
             detail_members = crawl_detail_pages(detail_urls, domain)
 
             # Save detail crawl results separately for debugging

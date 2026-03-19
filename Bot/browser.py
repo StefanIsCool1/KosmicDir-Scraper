@@ -15,10 +15,13 @@ from config import (
     JSON_DIRECTORY_KEYWORDS, JSON_URL_KEYWORDS, JSON_URL_EXCLUDE_PATTERNS, JSON_STRUCTURE_FIELDS,
     DIRECTORY_URL_KEYWORDS,
     NEXT_BUTTON_SELECTORS, LOAD_MORE_SELECTORS,
+    SCROLL_BATCH_SIZE, SCROLL_STALE_THRESHOLD,
+    CATEGORY_SKIP_VISIBLE_THRESHOLD,
 )
-from navigator import find_directory_url, trigger_search
+from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all
+from debug import debug
 from playwright.sync_api import Playwright
-from detail_crawler import collect_page_links, detect_detail_links, is_shallow_data, html_has_contact_info
+from detail_crawler import collect_page_links, detect_detail_links, is_shallow_data, html_has_contact_info, CONTACT_KEYS
 
 
 # --- IFRAME DETECTION ---
@@ -152,16 +155,73 @@ def find_content_frame(page):
     return None
 
 
-def human_scroll(page, done_event, scroll_target="body", times=20):
+def human_scroll(page, done_event, scroll_target="body", times=20, adaptive=False):
     """Simulate human-like scrolling to trigger lazy-loaded content.
-    Stops early if done_event is set (e.g. idle timer fired)."""
-    for _ in range(times):
-        if done_event.is_set():
-            break
-        distance = random.randint(300, 600)
-        page.evaluate(f"document.querySelector('{scroll_target}').scrollBy(0, {distance});")
-        page.mouse.wheel(0, distance)
-        time.sleep(random.uniform(0.15, 1))
+    Stops early if done_event is set (e.g. idle timer fired).
+
+    When adaptive=True, scrolls in batches and checks if new content loaded
+    after each batch. Stops when page height and visible result count stop
+    growing (handles infinite scroll pages).
+    """
+    if adaptive:
+        stale_batches = 0
+        max_batches = max(times // SCROLL_BATCH_SIZE, 4)
+
+        for batch in range(max_batches):
+            if done_event.is_set():
+                break
+
+            # Measure before scrolling
+            try:
+                prev_height = page.evaluate(
+                    f"document.querySelector('{scroll_target}').scrollHeight"
+                )
+            except Exception:
+                prev_height = 0
+            prev_count = count_visible_results(page)
+
+            # Scroll a batch
+            for _ in range(SCROLL_BATCH_SIZE):
+                if done_event.is_set():
+                    break
+                distance = random.randint(300, 600)
+                page.evaluate(
+                    f"document.querySelector('{scroll_target}').scrollBy(0, {distance});"
+                )
+                page.mouse.wheel(0, distance)
+                time.sleep(random.uniform(0.15, 0.5))
+
+            # Wait for lazy content to load
+            page.wait_for_timeout(1500)
+
+            # Measure after
+            try:
+                new_height = page.evaluate(
+                    f"document.querySelector('{scroll_target}').scrollHeight"
+                )
+            except Exception:
+                new_height = prev_height
+            new_count = count_visible_results(page)
+
+            if new_height <= prev_height and new_count <= prev_count:
+                stale_batches += 1
+                if stale_batches >= SCROLL_STALE_THRESHOLD:
+                    print(f"  Scroll: no new content after {batch + 1} batches "
+                          f"({new_count} results), stopping")
+                    break
+            else:
+                stale_batches = 0
+                if new_count > prev_count:
+                    print(f"  Scroll: {new_count} results (+{new_count - prev_count})")
+    else:
+        # Original fixed-count scrolling
+        for _ in range(times):
+            if done_event.is_set():
+                break
+            distance = random.randint(300, 600)
+            page.evaluate(f"document.querySelector('{scroll_target}').scrollBy(0, {distance});")
+            page.mouse.wheel(0, distance)
+            time.sleep(random.uniform(0.15, 1))
 
     # Try site-specific scroll container (some sites use custom scrollable divs)
     try:
@@ -191,6 +251,60 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
     pages_loaded = 0
     max_pages = 200
     current_page_num = 1
+
+    # Record the starting URL path to detect accidental navigation away
+    # (e.g. clicking a member detail link instead of a pagination button).
+    from urllib.parse import urlparse
+    try:
+        start_url = page.url
+        start_path = urlparse(start_url).path.rstrip("/")
+    except Exception:
+        start_url = ""
+        start_path = ""
+
+    def _navigated_away() -> bool:
+        """Check if a pagination click accidentally navigated to a different page.
+        If so, go back and return True to stop pagination.
+
+        Uses the parent directory of the start path to allow minor path changes
+        from searching (e.g. /directory → /directory/search) while catching
+        navigation to a completely different section (e.g. /directory/Find → /directory/Details/...).
+        """
+        if not start_path:
+            return False
+        try:
+            current_url = page.url
+            current_path = urlparse(current_url).path.rstrip("/")
+            # Exact same path → definitely still on the listing page
+            if current_path == start_path:
+                return False
+            # Allow paths that share the same parent directory as the start.
+            # e.g. start=/member-directory/Find → parent=/member-directory
+            #   /member-directory/Find?page=2 → path=/member-directory/Find → OK (same)
+            #   /member-directory/search → OK (same parent)
+            #   /member-directory/Details/company-123 → NOT OK (deeper than parent)
+            start_parent = start_path.rsplit("/", 1)[0] if "/" in start_path else start_path
+            # The current path must start with the parent AND not go more than
+            # one level deeper. This catches /parent/Details/slug (2 levels deeper).
+            if current_path.startswith(start_parent):
+                # Count path segments after the parent
+                remainder = current_path[len(start_parent):].strip("/")
+                depth = len(remainder.split("/")) if remainder else 0
+                # Allow up to 1 extra segment (e.g. /directory → /directory/search)
+                # Block 2+ extra segments (e.g. /directory/Details/company-name)
+                if depth <= 1:
+                    return False
+            # Different section entirely, or too deep → navigated away
+            print(f"  Pagination: navigated away from listing ({start_path} → {current_path}), going back")
+            try:
+                page.go_back()
+                page.wait_for_load_state("domcontentloaded", timeout=NETWORK_IDLE_TIMEOUT)
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
     def _collect_links():
         if link_collector is None:
@@ -256,6 +370,8 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
             if num_btn:
                 num_btn.click()
                 _wait_for_page()
+                if _navigated_away():
+                    break
                 pages_loaded += 1
                 current_page_num = next_num
                 print(f"  Pagination: page {current_page_num}")
@@ -276,6 +392,8 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
                 if "disabled" not in cls and "active" not in cls:
                     next_btn.click()
                     _wait_for_page()
+                    if _navigated_away():
+                        break
                     pages_loaded += 1
                     # Read actual page number from the active button (numbered pagination)
                     detected_num = _read_active_page_num()
@@ -309,6 +427,8 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
                     # Fallback: force click even if not "actionable"
                     load_more.click(force=True)
                 page.wait_for_timeout(2000)
+                if _navigated_away():
+                    break
                 pages_loaded += 1
                 current_page_num += 1
                 print(f"  Load More: click #{pages_loaded}")
@@ -349,6 +469,7 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     results = []
     detail_urls = []
     all_page_links = []  # accumulated across all paginated pages
+    all_page_htmls = []  # accumulated HTML from each page/category
     done = threading.Event()
     idle_timer = None
     idle_timeout_value = DEFAULT_IDLE_TIMEOUT
@@ -375,6 +496,7 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
         """Listener for all network responses. Captures JSON and queues HTML."""
         content_type = response.headers.get("content-type", "")
         print(f"RESPONSE: [{content_type}] {response.url}")
+        debug.log("CAPTURE", f"Response: [{content_type[:30]}] {response.url[:120]}")
 
         # --- JSON responses ---
         if "application/json" in content_type:
@@ -431,6 +553,7 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
 
     # --- Step 1: Find and navigate to directory page ---
     directory_url = find_directory_url(page, link)
+    debug.log("NAV", f"Directory URL resolved: {directory_url}")
     # Only navigate if we're not already on the directory page
     # (find_directory_url may have already clicked a JS link to get there)
     if page.url.rstrip("/") != directory_url.rstrip("/"):
@@ -441,8 +564,13 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
             pass
 
     # --- Step 2: Try search strategies ---
+    pre_search_count = len(results)
+    debug.log("SEARCH", f"Starting search. JSON results so far: {pre_search_count}")
     search_triggered = trigger_search(page, results)
-    if search_triggered:
+    debug.log("SEARCH", f"Search complete. triggered={search_triggered}, "
+              f"results before={pre_search_count} after={len(results)}")
+    if search_triggered and len(results) > pre_search_count:
+        # Only use longer timeout if search actually produced new responses
         idle_timeout_value = SEARCH_IDLE_TIMEOUT
         print(f"Idle timeout set to: {idle_timeout_value}s (search mode)")
 
@@ -452,14 +580,72 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     timer_enabled = True
     reset_idle_timer()
 
-    # --- Step 3: If no search, scroll to trigger lazy loading ---
+    # --- Step 3: If no search, try view-all / categories / scroll ---
+    # Priority order: View All > Categories > Adaptive Scroll
+    # Each step is gated by "do we already have data?" to avoid useless work.
+    categories_handled = False
+    view_all_clicked = False
     if not search_triggered:
-        # Check if results were already captured from page load (pre-loaded JSON)
-        if results:
-            print(f"Already captured {len(results)} JSON responses, minimal scrolling")
-            human_scroll(page, done, scroll_target="body", times=5)
-        else:
-            human_scroll(page, scroll_target="body", done_event=done)
+        visible_count = count_visible_results(page)
+        debug.log("SEARCH", f"No search triggered. visible_results={visible_count}, "
+                  f"json_results={len(results)}")
+        if not results and visible_count < CATEGORY_SKIP_VISIBLE_THRESHOLD:
+            # No search input, no JSON captured, no members visible.
+            # Try the simplest discovery method first.
+
+            # 1. Try "View All" / "Show All" link (loads everything at once)
+            view_all_clicked = try_view_all(page)
+            debug.log("SEARCH", f"View All attempt: {'clicked' if view_all_clicked else 'not found'}")
+
+            # 2. If no View All, try category iteration
+            if not view_all_clicked:
+                categories = detect_category_links(page)
+                if categories:
+                    print(f"  Iterating {len(categories)} categories...")
+                    timer_enabled = False
+                    for ci, cat in enumerate(categories):
+                        try:
+                            page.goto(cat["href"], timeout=15000)
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                            except Exception:
+                                pass
+                            page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+                            print(f"  Category {ci + 1}/{len(categories)}: {cat['text']}")
+
+                            cat_links = collect_page_links(page)
+                            all_page_links.extend(cat_links)
+
+                            try:
+                                cat_html = page.content()
+                                if any(kw in cat_html.lower() for kw in
+                                       ["member", "directory", "contact", "listing"]):
+                                    all_page_htmls.append(cat_html)
+                            except Exception:
+                                pass
+
+                            cat_done = threading.Event()
+                            handle_pagination(page, cat_done,
+                                              link_collector=all_page_links,
+                                              html_collector=all_page_htmls)
+
+                        except Exception as e:
+                            print(f"  Error on category '{cat['text']}': {e}")
+                            continue
+                    print(f"  Category iteration complete")
+                    categories_handled = True
+                    timer_enabled = True
+                    reset_idle_timer()
+
+        # 3. Scroll — but only what's appropriate
+        if not categories_handled:
+            if results or view_all_clicked:
+                # Data already captured — just light scroll in case of lazy stragglers
+                print(f"Already captured data, minimal scrolling")
+                human_scroll(page, done, scroll_target="body", times=5)
+            else:
+                # Nothing found yet — adaptive scroll for infinite scroll pages
+                human_scroll(page, scroll_target="body", done_event=done, adaptive=True)
 
     # --- Step 3.5: Detect if results are inside an iframe ---
     # Some platforms (YourMembership, etc.) load search results in an iframe.
@@ -485,11 +671,13 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     # --- Step 4.5: Capture initial page HTML before pagination ---
     # Pagination navigates away from each page, so we must capture page 1 now.
     # Subsequent pages are captured inside handle_pagination via html_collector.
-    all_page_htmls = []
     try:
         initial_html = content_context.content()
         if any(kw in initial_html.lower() for kw in ["member", "directory", "contact", "listing"]):
             all_page_htmls.append(initial_html)
+            debug.log("CAPTURE", f"Captured initial HTML: {len(initial_html)} chars")
+        else:
+            debug.log("CAPTURE", "Initial HTML has no directory keywords — skipped", level="warn")
     except Exception:
         pass
 
@@ -500,13 +688,29 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     # false "next" button matches (carousel arrows, nav links) can navigate away.
     skip_pagination = False
     try:
-        from navigator import count_visible_results
         visible_now = count_visible_results(content_context)
         if visible_now >= 600:
             print(f"  Skipping pagination — already have {visible_now} visible results")
             skip_pagination = True
     except:
         pass
+
+    # Also skip pagination if JSON already has substantial member data.
+    # Prevents false Next button matches (carousel arrows, nav links) from
+    # navigating away when we already have what we need.
+    if not skip_pagination:
+        json_record_count = 0
+        for r in results:
+            data = r.get("data", {})
+            if isinstance(data, list):
+                json_record_count += len(data)
+            elif isinstance(data, dict) and "raw_html" not in data:
+                for val in data.values():
+                    if isinstance(val, list):
+                        json_record_count += len(val)
+        if json_record_count >= 50:
+            print(f"  Skipping pagination — already have {json_record_count} JSON records")
+            skip_pagination = True
 
     if not skip_pagination:
         # Always attempt pagination — clear any previously fired done event and
@@ -610,8 +814,71 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
                     print(f"\n  HTML-only listing with no contact info detected")
                     print(f"  Found {len(detail_urls)} member detail page links")
 
+    # --- Step 8.5: Construct detail URLs from UIDs in shallow JSON data ---
+    # MembershipWorks and similar platforms return JSON with uid fields but no
+    # detail links in the DOM (they use hash-fragment routes like #!biz/id/{uid}).
+    # If no detail links were found, check UID-bearing records directly for
+    # shallowness (don't use is_shallow_data — it gets fooled by unrelated JSON
+    # like chat widget localization files that have keys like "email"/"phone").
+    if not detail_urls:
+        uid_list = []
+        for result in results:
+            data = result.get("data", {})
+            # Check top-level list
+            members = data if isinstance(data, list) else None
+            # Check nested list inside dict (e.g. {"typ":"a", "usr":[...]})
+            if not members and isinstance(data, dict):
+                for val in data.values():
+                    if isinstance(val, list) and len(val) >= 3:
+                        if isinstance(val[0], dict) and "uid" in val[0]:
+                            members = val
+                            break
+            if members:
+                # Check if these specific records lack contact info
+                sample = members[:20]
+                has_contact = 0
+                for m in sample:
+                    if isinstance(m, dict) and any(
+                        k.lower() in CONTACT_KEYS and m[k] and str(m[k]).strip()
+                        for k in m
+                    ):
+                        has_contact += 1
+                if has_contact / len(sample) >= 0.2:
+                    print(f"  UID records already have contact info ({has_contact}/{len(sample)} sampled) — skipping")
+                    continue
+                for m in members:
+                    if isinstance(m, dict) and "uid" in m:
+                        uid_list.append(m["uid"])
+
+        if uid_list:
+            # Deduplicate while preserving order
+            seen = set()
+            unique_uids = []
+            for uid in uid_list:
+                if uid not in seen:
+                    seen.add(uid)
+                    unique_uids.append(uid)
+            uid_list = unique_uids
+            # Build detail URLs using the page's base URL + hash fragment
+            base_url = page.url.split("#")[0].rstrip("/")
+            detail_urls = [f"{base_url}#!biz/id/{uid}" for uid in uid_list]
+            print(f"\n  Shallow JSON data with UIDs detected (MembershipWorks pattern)")
+            print(f"  Constructed {len(detail_urls)} detail URLs from JSON uid fields")
+
     browser.close()
     print(f"Total results captured: {len(results)}")
+
+    # Debug summary of everything captured
+    json_count = sum(1 for r in results if isinstance(r.get("data"), (list, dict)) and "raw_html" not in r.get("data", {}))
+    html_count = sum(1 for r in results if isinstance(r.get("data"), dict) and "raw_html" in r.get("data", {}))
+    debug.log("CAPTURE", f"Final capture summary", data={
+        "total_results": len(results),
+        "json_responses": json_count,
+        "html_pages": html_count,
+        "detail_urls_found": len(detail_urls),
+        "page_links_collected": len(all_page_links),
+        "final_page_url": page.url if not page.is_closed() else "closed",
+    })
     if not results:
         print("No responses were captured!")
 

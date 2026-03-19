@@ -6,6 +6,8 @@ Handles: AI-based multi-depth directory URL discovery, smart search strategy,
 
 import re
 import anthropic
+from urllib.parse import urlparse, parse_qs
+from debug import debug
 from config import (
     SEARCH_INPUT_SELECTORS,
     FORM_INPUT_SELECTORS,
@@ -13,6 +15,7 @@ from config import (
     FORM_SUBMIT_SELECTORS,
     RESULT_COUNT_SELECTORS,
     RESULT_LINK_SELECTORS, NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
+    EXTERNAL_SKIP_DOMAINS, CATEGORY_URL_KEYWORDS, CATEGORY_SKIP_VISIBLE_THRESHOLD,
 )
 
 MAX_NAVIGATION_DEPTH = 3  # max clicks deep to find the directory page
@@ -81,7 +84,7 @@ def navigate_to_link(page, chosen_link: dict, fallback_url: str) -> str:
         return href
 
 
-def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool) -> dict:
+def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool, page_text: str = "") -> dict:
     """Ask Haiku to analyze the current page:
     - Is this already a directory/search page? (has search input or member listings)
     - If not, which link should we click to get there?
@@ -101,6 +104,10 @@ def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool)
     if has_search_input:
         search_hint = "\nNOTE: This page has a search input field visible."
 
+    content_hint = ""
+    if page_text:
+        content_hint = f"\nVisible page content (preview):\n{page_text[:500]}\n"
+
     client = anthropic.Anthropic()
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -108,12 +115,12 @@ def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool)
         messages=[{
             "role": "user",
             "content": f"""I'm on {page_url} trying to find the member directory/company search page.
-{search_hint}
+{search_hint}{content_hint}
 Here are the links on this page:
 {link_list}
 
 Is this already the member directory or search page where I can find member companies?
-- If YES (this page has a search form for members or shows member listings), respond with ONLY: STAY
+- If YES (this page has a search form for members, shows member listings, or shows member categories to browse), respond with ONLY: STAY
 - If NO but a link leads there, respond with ONLY: CLICK followed by the link number (e.g. CLICK 7)
 - If no directory exists, respond with ONLY: NONE
 
@@ -244,10 +251,14 @@ def find_directory_url(page, link: str) -> str:
             except:
                 pass
 
+        # Grab visible page text for AI context (helps detect member listings on screen)
+        page_text = get_compressed_page_text(page)
+
         print(f"  Depth {depth}: {len(filtered)} links, search_input={has_search}, asking AI...")
+        debug.log("NAV", f"Depth {depth}: {len(filtered)} links, search={has_search}, url={current_url[:100]}")
 
         try:
-            result = ai_analyze_page(filtered, current_url, has_search)
+            result = ai_analyze_page(filtered, current_url, has_search, page_text=page_text)
         except Exception as e:
             print(f"  AI analysis failed: {e}, stopping here")
             break
@@ -750,7 +761,9 @@ def try_search_query(page, search_input, query: str, submit_btn=None) -> int:
     Returns -1 if the search failed.
     """
     try:
-        search_input.click()
+        # Short timeout — if the input isn't visible (e.g. collapsed after
+        # navigating to a results page), fail fast instead of hanging 30 seconds
+        search_input.click(timeout=3000)
         search_input.fill("")
         if query:
             search_input.type(query, delay=100)
@@ -782,7 +795,7 @@ def try_form_search_query(page, search_input, submit_btn, query: str) -> int:
     Returns the visible result count on the results page, or -1 on failure.
     """
     try:
-        search_input.click()
+        search_input.click(timeout=3000)
         search_input.fill("")
         if query:
             search_input.type(query, delay=100)
@@ -845,13 +858,16 @@ def trigger_search(page, results_list: list) -> bool:
         submit_btn = form_submit
         is_form_search = True
         print("  Form-based search detected (Name/Company form with submit button)")
+        debug.log("SEARCH", "Form-based search detected")
     else:
         # No form found — try standard single-input search
         search_input = find_search_input(page)
         if search_input:
             print("Search input found...")
+            debug.log("SEARCH", "Standard search input found")
         else:
             print("No search input detected (standard or form-based)")
+            debug.log("SEARCH", "No search input found on page", level="warn")
             return False
 
     baseline_json = len(results_list)
@@ -912,22 +928,45 @@ def trigger_search(page, results_list: list) -> bool:
             return try_search_query(page, search_input, query, submit_btn=None)
 
     def go_back_to_form() -> bool:
-        """For form-based search: navigate back to the form page after a search.
-        Returns True if successful, False if failed."""
+        """Navigate back to the search page if a search navigated away.
+        Works for both form-based and standard search inputs.
+        Returns True if successful (or no navigation happened), False if failed."""
         nonlocal search_input, submit_btn
-        if not is_form_search or page.url == url_before:
+        if page.url == url_before:
             return True  # no navigation happened, nothing to do
+
+        # Check if the search input is still visible on the current page
+        try:
+            if search_input.is_visible(timeout=1000):
+                return True  # input still usable, no need to go back
+        except Exception:
+            pass
+
+        # Search input is hidden or gone — navigate back
+        debug.log("SEARCH", f"Search input not visible after navigation, going back to {url_before[:100]}")
         try:
             page.go_back()
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
             page.wait_for_timeout(1000)
-            search_input, submit_btn = find_form_search(page)
-            if not search_input or not submit_btn:
-                print(f"  Could not re-find form after navigating back")
-                return False
+
+            if is_form_search:
+                search_input, submit_btn = find_form_search(page)
+                if not search_input or not submit_btn:
+                    print(f"  Could not re-find form after navigating back")
+                    debug.log("SEARCH", "Failed to re-find form after go_back", level="error")
+                    return False
+            else:
+                search_input = find_search_input(page)
+                if not search_input:
+                    print(f"  Could not re-find search input after navigating back")
+                    debug.log("SEARCH", "Failed to re-find search input after go_back", level="error")
+                    return False
+
+            debug.log("SEARCH", "Successfully navigated back and re-found search input")
             return True
         except Exception as e:
             print(f"  Error navigating back: {e}")
+            debug.log("SEARCH", f"go_back failed: {e}", level="error")
             return False
 
     # Track the best query to re-execute at the end
@@ -1051,3 +1090,211 @@ def trigger_search(page, results_list: list) -> bool:
     # --- Done trying strategies ---
     print(f"  Best result count: {best_count}")
     return best_count > 0 or len(results_list) > baseline_json or visible_blank >= 3
+
+
+# --- VIEW ALL DETECTION ---
+
+def try_view_all(page) -> bool:
+    """Detect and click a 'View All' / 'Show All' link or button.
+
+    Only looks in the main content area (not nav/header/footer).
+    Returns True if found and clicked, False otherwise.
+    """
+    VIEW_ALL_SELECTORS = (
+        "a:has-text('View All'), a:has-text('view all'), "
+        "a:has-text('Show All'), a:has-text('show all'), "
+        "a:has-text('See All'), a:has-text('see all'), "
+        "a:has-text('All Members'), a:has-text('all members'), "
+        "a:has-text('View all members'), a:has-text('Show all members'), "
+        "a:has-text('View All Members'), a:has-text('Show All Members'), "
+        "button:has-text('View All'), button:has-text('Show All'), "
+        "button:has-text('See All'), button:has-text('All Members')"
+    )
+
+    try:
+        all_matches = page.locator(VIEW_ALL_SELECTORS)
+        match_count = all_matches.count()
+    except Exception:
+        return False
+
+    for i in range(match_count):
+        try:
+            el = all_matches.nth(i)
+            if not el.is_visible(timeout=500):
+                continue
+
+            # Must not be in nav/header/footer
+            in_nav = el.evaluate("""el => !!(
+                el.closest('nav') ||
+                el.closest('header') ||
+                el.closest('footer') ||
+                el.closest('[role="navigation"]') ||
+                el.closest('[role="banner"]')
+            )""")
+            if in_nav:
+                continue
+
+            # Text must be short — a real "View All" label, not a sentence
+            text = el.inner_text().strip()
+            if len(text) > 40:
+                continue
+
+            print(f"  Found 'View All' link: '{text}'")
+            el.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+            except Exception:
+                pass
+            page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+            return True
+        except Exception:
+            continue
+
+    return False
+
+
+# --- CATEGORY DETECTION ---
+
+def detect_category_links(page) -> list:
+    """Detect category/browse links on a directory landing page.
+
+    Looks for groups of content-area links that share a URL prefix template
+    and have short, descriptive text (typical of category labels like
+    "Plumbing", "Electrical", "Roofing").
+
+    Anti-false-positive rules:
+    - Skips links inside nav/header/footer/breadcrumbs
+    - Skips single characters (alphabet filters) and pure numbers (pagination)
+    - Skips external domains
+    - Requires 3-50 links with unique text in the same URL group
+    - Only triggers when members aren't already visible on page
+
+    Returns:
+        List of {"text": str, "href": str} dicts, or [] if none found.
+    """
+    # Check if members are already visible — if so, no need for categories
+    visible = count_visible_results(page)
+    if visible >= CATEGORY_SKIP_VISIBLE_THRESHOLD:
+        return []
+
+    try:
+        links = page.eval_on_selector_all("a[href]", """els => els.map(el => ({
+            text: el.innerText.trim(),
+            href: el.href,
+            inNav: !!(
+                el.closest('nav') ||
+                el.closest('header') ||
+                el.closest('footer') ||
+                el.closest('[role="navigation"]') ||
+                el.closest('[role="banner"]') ||
+                el.closest('[class*="menu"]') ||
+                el.closest('[class*="breadcrumb"]')
+            )
+        }))""")
+    except Exception:
+        return []
+
+    # Filter: content-area links, short text, not junk
+    site_domain = ""
+    try:
+        site_domain = urlparse(page.url).netloc.lower()
+    except Exception:
+        pass
+
+    filtered = []
+    seen = set()
+    for link in links:
+        if link.get("inNav"):
+            continue
+        text = link.get("text", "").strip()
+        href = link.get("href", "")
+        if not text or not href:
+            continue
+        # Skip alphabet filters and pagination numbers
+        if len(text) <= 2 and (text.isalpha() or text.isdigit()):
+            continue
+        if text.isdigit():
+            continue
+        # Category names are short labels
+        if len(text) > 60:
+            continue
+        if href in seen:
+            continue
+        if href.startswith(("mailto:", "tel:", "#", "javascript:")):
+            continue
+        # Skip external domains
+        try:
+            link_domain = urlparse(href).netloc.lower()
+            if link_domain and site_domain and link_domain != site_domain:
+                if any(d in link_domain for d in EXTERNAL_SKIP_DOMAINS):
+                    continue
+        except Exception:
+            pass
+        seen.add(href)
+        filtered.append({"text": text, "href": href})
+
+    if len(filtered) < 3:
+        return []
+
+    # Group links by URL prefix template
+    groups: dict[str, list] = {}
+    for link in filtered:
+        parsed = urlparse(link["href"])
+        path = parsed.path.rstrip("/")
+
+        if parsed.query:
+            # Query-param categories: /members?category=X → prefix = /members?category=
+            params = parse_qs(parsed.query)
+            param_keys = sorted(params.keys())
+            prefix = path + "?" + "&".join(f"{k}=" for k in param_keys)
+        elif "/" in path and len(path.split("/")) >= 3:
+            # Path-based categories: /directory/plumbing → prefix = /directory
+            prefix = path.rsplit("/", 1)[0]
+        else:
+            continue
+
+        groups.setdefault(prefix, []).append(link)
+
+    # Score and pick the best group
+    best_group = None
+    best_score = 0
+    for prefix, group_links in groups.items():
+        count = len(group_links)
+        if count < 3 or count > 50:
+            continue
+
+        # Category links must have mostly unique text (not duplicate labels)
+        texts = [l["text"].lower() for l in group_links]
+        unique_texts = set(texts)
+        if len(unique_texts) < count * 0.7:
+            continue
+
+        score = min(count, 30)
+
+        # Bonus if prefix contains category-related keywords
+        prefix_lower = prefix.lower()
+        if any(kw in prefix_lower for kw in CATEGORY_URL_KEYWORDS):
+            score += 20
+
+        # Bonus if link texts are short category-like labels
+        avg_len = sum(len(t) for t in texts) / count
+        if avg_len < 30:
+            score += 10
+
+        if score > best_score:
+            best_score = score
+            best_group = group_links
+
+    if not best_group:
+        return []
+
+    # Deduplicate by href, preserve order
+    seen_hrefs: set[str] = set()
+    result = []
+    for link in best_group:
+        if link["href"] not in seen_hrefs:
+            seen_hrefs.add(link["href"])
+            result.append(link)
+
+    print(f"  Detected {len(result)} category links (score={best_score})")
+    return result

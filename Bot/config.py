@@ -236,5 +236,36 @@ EXTRACTION_NULL_THRESHOLD = 0.70  # if more than 70% of fields are null, extract
 # Minimum cards needed before calling Haiku (avoids learning from tiny samples)
 MIN_CARDS_FOR_LEARNING = 3
 
+# --- REGEX FALLBACK ---
+# Domains to skip when extracting member websites (never a member's own site)
+EXTERNAL_SKIP_DOMAINS = [
+    "google.com", "facebook.com", "twitter.com", "linkedin.com",
+    "instagram.com", "youtube.com", "yelp.com", "maps.google",
+    "goo.gl", "bit.ly", "apple.com", "microsoft.com",
+    "x.com", "tiktok.com", "pinterest.com",
+]
+
+# Minimum regex extraction results to accept (anti-false-positive)
+MIN_REGEX_RESULTS = 3
+
+# Characters to search before a phone number for "fax" label
+FAX_CONTEXT_WINDOW = 50
+
+# --- ADAPTIVE SCROLL ---
+SCROLL_BATCH_SIZE = 5           # scrolls per batch before checking for new content
+SCROLL_STALE_THRESHOLD = 3     # consecutive batches with no growth before stopping
+
+# --- CATEGORY BROWSING ---
+# URL keywords that suggest a link group is category-based navigation
+CATEGORY_URL_KEYWORDS = [
+    "category", "categories", "browse", "type", "specialty",
+    "specialties", "trade", "service", "industry", "sector",
+    "classification", "division",
+]
+
+# Minimum visible results on page before skipping category iteration
+# (if members are already visible, no need to iterate categories)
+CATEGORY_SKIP_VISIBLE_THRESHOLD = 3
+
 # --- SELECTOR CACHE ---
 SELECTOR_CACHE_FILENAME = "selector_cache.json"
