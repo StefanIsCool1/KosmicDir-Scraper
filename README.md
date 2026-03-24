@@ -1,6 +1,6 @@
 # Kosomic Scraper 
 (a directory built scraper)
-
+**FEEL FREE TO PULL REQUEST OR GIVE ME ADVICE ON STUFF**
 A universal directory scraping tool that extracts data from directory website. Combines Playwright browser automation with AI-powered selector learning (Claude Haiku) to adapt to different website structuring.
 
 Built by **Stefan O'Leary**
