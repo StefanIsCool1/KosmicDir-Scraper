@@ -19,7 +19,7 @@ from html_parser import ( #type: ignore
 )
 from bs4 import BeautifulSoup
 
-from Phase2Bot.page_fetcher import fetch_page, discover_subpages
+from Phase2Bot.page_fetcher import fetch_page, discover_subpages, google_search_website
 
 
 # --- CONFIG ---
@@ -512,12 +512,14 @@ def _build_enriched_record(original, extracted):
 # --- MAIN ---
 
 def _needs_enrichment(member):
-    website = member.get("website")
-    if not website or not website.strip():
-        return False
+    """Check if a member needs enrichment. Includes entries with no website (Google search)."""
     has_desc = bool(member.get("description"))
     has_phone = bool(member.get("phone"))
     has_email = any(c.get("email") for c in member.get("contacts", []))
+    has_website = bool((member.get("website") or "").strip())
+    # Needs enrichment if: missing website, or has website but missing other data
+    if not has_website:
+        return True  # Will try Google search
     return not (has_desc and has_phone and has_email)
 
 
@@ -535,19 +537,60 @@ def enrich_from_websites(json_path, event_callback=None):
 
     enrichable = [m for m in members if _needs_enrichment(m)]
     complete = [m for m in members if not _needs_enrichment(m)]
-    log(f"  {len(enrichable)} need enrichment, {len(complete)} already complete")
+
+    # Separate entries: those with website vs those needing Google search
+    has_website = [m for m in enrichable if (m.get("website") or "").strip()]
+    no_website = [m for m in enrichable if not (m.get("website") or "").strip()]
+
+    log(f"  {len(has_website)} have website, {len(no_website)} need Google search, {len(complete)} already complete")
+
+    # --- Phase A: Google search for missing websites (sequential to avoid CAPTCHA) ---
+    # Extract source domain from filename (e.g. "business_hbagbr_org" → "business.hbagbr.org")
+    source_domain = os.path.basename(json_path).replace("_structured.json", "").replace("_", ".")
+
+    google_found_websites = {}
+    if no_website:
+        log(f"  Searching DuckDuckGo for {len(no_website)} missing websites...")
+        for i, m in enumerate(no_website):
+            name = m.get("company_name", "")
+            if not name or len(name) < 3:
+                continue
+            found_url, query = google_search_website(
+                company_name=name,
+                street_address=m.get("street_address"),
+                category=m.get("category"),
+                phone=m.get("phone"),
+                source_domain=source_domain,
+            )
+            if found_url:
+                m["website"] = found_url  # Update in-place for enrichment
+                google_found_websites[name] = found_url
+                log(f"    [{i+1}/{len(no_website)}] {name} → {found_url}")
+                has_website.append(m)  # Now it can be enriched normally
+            else:
+                log(f"    [{i+1}/{len(no_website)}] {name} → not found")
+        log(f"  Google search: found {len(google_found_websites)}/{len(no_website)} websites")
+
+    # Rebuild enrichable list (only entries that now have a website)
+    enrichable = has_website
 
     WORKERS = 8
-    log(f"  Enriching with {WORKERS} parallel workers...")
+    log(f"  Enriching {len(enrichable)} entries with {WORKERS} parallel workers...")
 
     def _enrich_one(idx, member):
         """Enrich a single member. Returns (idx, enriched_record, found_list_or_none)."""
         website = (member.get("website") or "").strip()
+        website_source = "google_search" if member.get("company_name") in google_found_websites else "original"
 
-        # Skip invalid/empty URLs
+        # Skip if still no website after Google search phase
         if not website or website == "/" or len(website) < 4:
             record = dict(member)
-            record["enrichment_status"] = "skipped"
+            record["enrichment_status"] = "no_website"
+            record.setdefault("social_media", {})
+            record.setdefault("hours", None)
+            record.setdefault("services", [])
+            record.setdefault("founded", None)
+            record.setdefault("team", [])
             return idx, record, None
 
         # Normalize URL
@@ -580,6 +623,13 @@ def enrich_from_websites(json_path, event_callback=None):
 
             merged = _merge_extractions(page_data)
             enriched = _build_enriched_record(member, merged)
+
+            # If website was found via Google, update the record
+            if website_source == "google_search":
+                enriched["website"] = website
+                enriched["website_source"] = "google_search"
+            else:
+                enriched["website_source"] = "original"
 
             found = []
             if merged["emails"]: found.append(f"{len(merged['emails'])} emails")
@@ -626,9 +676,22 @@ def enrich_from_websites(json_path, event_callback=None):
                 log(f"  [{done_count}/{len(enrichable)}] {name} — no new data")
                 failed += 1
 
+    # Add entries that still have no website (Google search didn't find them)
+    no_website_remaining = [m for m in no_website if m.get("company_name") not in google_found_websites]
+    for m in no_website_remaining:
+        record = dict(m)
+        record["enrichment_status"] = "no_website"
+        record["social_media"] = {}
+        record["hours"] = None
+        record["services"] = []
+        record["founded"] = None
+        record["team"] = []
+        results.append(record)
+
     for m in complete:
         record = dict(m)
         record["enrichment_status"] = "skipped"
+        record["enrichment_source"] = m.get("website")
         record["social_media"] = {}
         record["hours"] = None
         record["services"] = []
@@ -643,6 +706,28 @@ def enrich_from_websites(json_path, event_callback=None):
     with open(output_path, "w") as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
 
+    # Update original structured JSON with Google-discovered websites
+    if google_found_websites:
+        log(f"  Updating {len(google_found_websites)} websites in original JSON...")
+        try:
+            with open(json_path) as f:
+                original = json.load(f)
+            updated = 0
+            for m in original:
+                name = m.get("company_name", "")
+                if name in google_found_websites and not (m.get("website") or "").strip():
+                    m["website"] = google_found_websites[name]
+                    updated += 1
+            if updated > 0:
+                with open(json_path, "w") as f:
+                    json.dump(original, f, indent=4, ensure_ascii=False)
+                log(f"  Updated {updated} websites in {os.path.basename(json_path)}")
+        except Exception as e:
+            log(f"  Failed to update original JSON: {e}")
+
+    google_count = sum(1 for r in results if r.get("website_source") == "google_search")
     log(f"Done! {len(results)} records → {basename}")
     log(f"  Enriched: {success} | Failed: {failed} | Skipped: {len(complete)}")
+    if google_count:
+        log(f"  Google-discovered websites: {google_count}")
     return output_path

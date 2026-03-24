@@ -188,3 +188,142 @@ def _resolve_url(href: str, base_url: str) -> str | None:
         return resolved
     except Exception:
         return None
+
+
+# --- GOOGLE SEARCH FOR MISSING WEBSITES ---
+
+# Domains that are ABOUT companies but are NOT a company's own website
+_GOOGLE_SKIP_DOMAINS = {
+    "google.com", "google.co", "googleapis.com",
+    "facebook.com", "fb.com", "linkedin.com", "twitter.com", "x.com",
+    "instagram.com", "youtube.com", "tiktok.com", "pinterest.com",
+    "yelp.com", "yellowpages.com", "bbb.org", "mapquest.com",
+    "manta.com", "angi.com", "angieslist.com", "homeadvisor.com",
+    "thumbtack.com", "houzz.com", "buildzoom.com",
+    "dnb.com", "dandb.com", "zoominfo.com", "crunchbase.com",
+    "bloomberg.com", "indeed.com", "glassdoor.com",
+    "wikipedia.org", "wikimedia.org",
+    "amazon.com", "ebay.com", "etsy.com",
+    "nextdoor.com", "patch.com",
+}
+
+# Google search rate limiting (slower than normal fetching to avoid CAPTCHA)
+_google_search_stopped = False
+
+
+def google_search_website(
+    company_name: str,
+    street_address: str | None = None,
+    category: str | None = None,
+    phone: str | None = None,
+    source_domain: str | None = None,
+) -> tuple[str | None, str]:
+    """Search DuckDuckGo for a company's website using available data.
+
+    Returns (url_or_none, query_used).
+    Uses DuckDuckGo HTML search (no API key needed, less aggressive anti-bot).
+    """
+    global _google_search_stopped
+    if _google_search_stopped:
+        return None, ""
+
+    # Build search query from available data
+    parts = [f'"{company_name}"']
+
+    # Extract city/state from address if available
+    if street_address:
+        addr_parts = street_address.split(",")
+        if len(addr_parts) >= 2:
+            parts.append(addr_parts[-1].strip())
+        elif len(addr_parts) == 1 and len(street_address) < 50:
+            parts.append(street_address)
+
+    if category and len(category) < 40:
+        parts.append(category)
+
+    query = " ".join(parts)
+
+    # URL-encode the query
+    from urllib.parse import quote_plus
+    search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+
+    # Rate limit
+    time.sleep(random.uniform(1.5, 3.0))
+
+    browser = random.choice(_IMPERSONATE_TARGETS)
+    try:
+        session = _get_session(browser)
+        resp = session.get(search_url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+
+        if resp.status_code == 429 or resp.status_code == 403:
+            print("    Search blocked, stopping website discovery")
+            _google_search_stopped = True
+            return None, query
+
+        if resp.status_code != 200:
+            return None, query
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Build company name word set for matching
+        company_lower = company_name.lower()
+        company_words = set(
+            company_lower.replace(",", "").replace(".", "")
+            .replace("llc", "").replace("inc", "").replace("ltd", "")
+            .split()
+        )
+        company_words = {w for w in company_words if len(w) >= 3 and w not in {
+            "the", "and", "inc", "llc", "ltd", "corp", "company", "co",
+            "services", "service", "group", "construction",
+        }}
+
+        # DuckDuckGo results are in <a class="result__a"> tags
+        # The href contains a redirect: //duckduckgo.com/l/?uddg=ENCODED_URL&...
+        for a in soup.select("a.result__a"):
+            href = a.get("href", "")
+
+            # Extract actual URL from DDG redirect
+            if "uddg=" in href:
+                from urllib.parse import unquote
+                href = unquote(href.split("uddg=")[1].split("&")[0])
+            elif not href.startswith("http"):
+                continue
+
+            try:
+                parsed = urlparse(href)
+                domain = parsed.netloc.lower().replace("www.", "")
+            except Exception:
+                continue
+
+            # Skip known non-company domains
+            if any(skip in domain for skip in _GOOGLE_SKIP_DOMAINS):
+                continue
+
+            # Skip DDG's own domains
+            if "duckduckgo" in domain:
+                continue
+
+            # Skip the source directory domain (we're looking for the COMPANY's site)
+            if source_domain and source_domain.lower() in domain:
+                continue
+
+            # Skip PDFs and documents
+            if parsed.path.lower().endswith((".pdf", ".doc", ".docx", ".xls")):
+                continue
+
+            # Validate: domain MUST contain a significant word from company name
+            # (link text alone is not enough — directory listings mention many companies)
+            domain_clean = domain.replace("-", "").replace(".", "")
+            has_domain_match = any(word in domain_clean for word in company_words if len(word) >= 4)
+
+            if has_domain_match:
+                found_url = f"{parsed.scheme}://{parsed.netloc}"
+                return found_url, query
+
+        return None, query
+
+    except CurlError:
+        return None, query
+
+    except Exception:
+        return None, query
