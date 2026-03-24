@@ -137,7 +137,7 @@ Formally ***requests*** now switched to  curl_cffi  for better function(Phase 2)
 
 
 ## Installation
-
+YOU WILL NEED AN CLAUDE API KEY FOR THIS TO WORK (this bot doenst use much tokens)
 ```bash
 git clone https://github.com/StefanIsCool1/UnderDeckScraper.git
 cd UnderDeckScraper/UnderDeckScraper
