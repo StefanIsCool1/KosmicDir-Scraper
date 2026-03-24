@@ -1,6 +1,7 @@
-# UnderDeck Scraper
+# Kosomic Scraper 
+(a directory built scraper)
 
-A universal directory scraping tool that extracts member/business data from any directory website. Combines Playwright browser automation with AI-powered selector learning (Claude Haiku) to adapt to any directory structure — no per-site configuration needed.
+A universal directory scraping tool that extracts data from directory website. Combines Playwright browser automation with AI-powered selector learning (Claude Haiku) to adapt to different website structuring.
 
 Built by **Stefan O'Leary**
 
@@ -8,105 +9,29 @@ Built by **Stefan O'Leary**
 
 ## How It Works
 
-### Two-Phase System
+Two primary phases in the system:
 
-**Phase 1 — Directory Scraping**: Discovers directory pages, captures JSON APIs and HTML, learns CSS selectors via AI, extracts structured member data.
+**Phase 1 — Directory Scraping**: Discovers directory pages, listens to network or captures page html to learns CSS selectors via AI/regex, extracts structured member data into a structured json file
 
-**Phase 2 — Website Enrichment**: Takes Phase 1 output, visits each company's website, extracts additional contact info, descriptions, social media, hours, services, and more.
+**Phase 2 — Website Enrichment**: Takes the phase output website, then enriches the data by Fetching homepage or other important subpahes (curl_cffi with Chrome TLS fingerprint)
 
 ---
 
 ## Phase 1 Flow
 
 ```
-User provides URL
-        ↓
-1. NAVIGATE — AI finds the directory page (up to 3 clicks deep)
-        ↓
-2. SEARCH — Tries blank/"all"/"a"/"%"/"*" queries, detects starts-with sites
-        ↓
+User provides URL:
+
+1. NAVIGATE, AI and regex find apporaite direcory (up to 3 pages deep)
+2. SEARCH,  Tries blank/"all"/"a"/"%"/"*" queries, detects starts-with sites
 3. CAPTURE — Intercepts JSON API responses + captures page HTML
+4. PAGINATE — Clicks Next/Load More, numbered pages, handles infinite scroll (captues the html subsequntly after scrolling or paginating)
+5. EXTRACT: uses chache sleectors/learns them via AI or buetifulsoup
+6. DETAIL CRAWL (optional) — Visits individual profile pages for full contact info. for example example.com/member/{memberid}
         ↓
-4. PAGINATE — Clicks Next/Load More, numbered pages, handles infinite scroll
-        ↓
-5. EXTRACT — 3-tier: cached selectors → AI-learned selectors → regex fallback
-        ↓
-6. DETAIL CRAWL (optional) — Visits individual profile pages for full contact info
-        ↓
-7. OUTPUT — Cleaned, deduplicated JSON in Data-dump/
+7. OUTPUT the output is a cleaned json file
 ```
 
-### Step 1: Navigation (`navigator.py`)
-
-The bot uses **Claude Haiku** to analyze each page and decide: is this the directory page, or should I click a link to go deeper?
-
-- Sends the page's links + visible text to Haiku
-- Haiku responds: `STAY` (we're on the directory), `CLICK 7` (click link #7), or `NONE`
-- Navigates up to 3 pages deep (Homepage → Membership → Find a Member → Directory)
-- Detects both single search inputs and multi-field forms (Name/Company/City + Submit)
-
-### Step 2: Search Strategy (`navigator.py`)
-
-Smart search with escalating queries:
-
-1. **Blank search** — most sites return all results
-2. **"all"** — catches sites that need a keyword
-3. **"a"** — if results only start with 'A', detected as starts-with site → iterates full alphabet
-4. **"%"** — wildcard patterns some CMS platforms support
-
-After each query, reads the result count (regex first, Haiku fallback) and keeps the best result. Re-executes the winning query so the page shows maximum results for HTML capture.
-
-### Step 3: Network Capture (`browser.py`)
-
-A Playwright response listener intercepts every network request:
-
-- **JSON responses**: Inspected for directory keywords (`member`, `company`, `listing`), URL patterns (`/api/members`, `/GetDirectoryInfo`), and structural fields (objects with `name` + `phone` + `address`). Junk domains (analytics, ads, social) are silently skipped.
-- **HTML responses**: Queued for later parsing if they match directory URL patterns.
-
-### Step 4: Pagination (`browser.py`)
-
-Handles three pagination patterns:
-- **Numbered pages** — clicks 2, 3, 4, 5...
-- **Next/Arrow buttons** — clicks →, Next, ›, »
-- **Load More buttons** — clicks "Load More", "Show More"
-
-Detects stale clicks (URL + content unchanged after click = last page) and stops. Skips pagination entirely if JSON already captured 50+ records.
-
-### Step 5: HTML Extraction (`html_parser.py`)
-
-Three-tier strategy, each more expensive than the last:
-
-**Tier 1 — Cached Selectors** (zero cost):
-Previously learned CSS selectors are stored in `selector_cache.json`. If a domain was scraped before, selectors are reused instantly.
-
-**Tier 2 — AI Selector Learning** (one Haiku call, then cached forever):
-- Scores repeating HTML elements to find member cards (class-based grouping + schema.org detection)
-- Sends 4 sample cards to Claude Haiku with a prompt asking for CSS selectors
-- Haiku returns: `card_selector`, `company_name`, `phone`, `website`, `street_address`, etc.
-- Applied with BeautifulSoup — zero AI cost after initial learning
-
-**Tier 3 — Regex Fallback** (zero cost, no AI):
-When selectors fail:
-- **Layer A**: Uses the card container from Tier 2's scoring, runs regex within each card
-- **Layer B**: Scans the page for clusters of contact signals (phone + email near a heading)
-
-### Step 6: Detail Crawling (`detail_crawler.py`)
-
-When listing data is shallow (names only, no contact info):
-- Detects detail page links by URL templatizing (`/members/{ID}`, `/profile/{ID}`)
-- Prompts user: "Found 748 detail pages. Crawl them? (y/n)"
-- Learns selectors for detail pages (separate from listing selectors)
-- Adaptive throttle — speeds up when server responds fast, backs off on slow responses
-
-### Step 7: Normalization (`main.py`, `cleaner.py`)
-
-- **Field mapping**: Maps 20+ variant field names to a standard schema
-- **Platform support**: Unwraps Airtable (`fields:{}`), Procore (`addresses:[]`), GrowthZone, ChamberMaster formats
-- **Deduplication**: Case-insensitive company name matching
-- **Phone formatting**: Normalizes to `(XXX) XXX-XXXX`
-- **Website normalization**: Adds `https://` to bare domains
-
----
 
 ## Phase 2 Flow
 
@@ -127,30 +52,16 @@ Select a _structured.json from Phase 1
 4. Output → Phase2-Dump/{domain}_enriched.json
 ```
 
-### What Phase 2 Extracts
 
-| Field | Method |
-|-------|--------|
-| **Email** | `mailto:` links → regex on visible text |
-| **Phone** | `tel:` links → regex with fax context detection |
-| **Address** | Full street address regex (number + street type + city/state/zip) |
-| **Description** | JSON-LD → `<meta description>` → og:description → first substantial `<p>` |
-| **Social Media** | Links to Facebook, LinkedIn, Twitter, Instagram, YouTube, TikTok, Pinterest, Yelp |
-| **Hours** | Elements near "hours"/"schedule" keywords |
-| **Services** | List items under "Services"/"What We Do" headings |
-| **Team** | Name+title pairs from team/staff page structures |
-| **Founded Year** | Regex: "founded/established/since" + 4-digit year |
-| **JSON-LD** | Structured data from `<script type="application/ld+json">` — highest confidence source |
 
-### TLS Fingerprint Impersonation
+***TLS Fingerprint Impersonation***
 
-Phase 2 uses `curl_cffi` because many sites use TLS fingerprinting (JA3/JA4) to detect bots. `curl_cffi` impersonates real Chrome/Safari TLS handshakes — servers can't distinguish it from a real browser.
+So basically, Phase 2 uses `curl_cffi` because many sites use TLS fingerprinting (JA3/JA4) to detect bots. `curl_cffi` impersonates real Chrome/Safari TLS handshakes — servers can't distinguish it from a real browser.
 
-- Rotates between 7 browser fingerprints
+- Rotates between 7 browser fingerprints chrome and others
 - On 403: retries with a different fingerprint
 - Thread-local sessions for connection pooling + cookie persistence
 
----
 
 ## Output Schema
 
@@ -174,7 +85,7 @@ Phase 2 uses `curl_cffi` because many sites use TLS fingerprinting (JA3/JA4) to 
 
 ### Phase 2 (`Phase2-Dump/{domain}_enriched.json`)
 
-All Phase 1 fields preserved, plus:
+All Phase 1 fields preserved, plus: (basically data to build consumer profile)
 
 ```json
 {
@@ -193,25 +104,26 @@ All Phase 1 fields preserved, plus:
 
 ---
 
-## External APIs & Libraries
+***External APIs & Libraries***
 
 ### Anthropic Claude Haiku
-- **Page analysis**: "Is this a directory page?" — 1 call per navigation depth
-- **Selector learning**: "What CSS selectors extract member data?" — 1 call per domain, cached forever
-- **Cost**: ~$0.001 per new domain (subsequent scrapes are free)
+- **Page analysis**: "Is this a directory page?" — 1 call per navigation depth (uses basically no money)
+The average cost is alround ~$0.005 per new domain, basically zero if bot fins api or nicley structured data 
 
-### Playwright (Chromium)
-- Browser automation: navigation, form filling, clicking, scrolling
-- Network response interception for JSON API capture
-- `playwright-stealth` patches to bypass Cloudflare/DataDome bot detection
+PLAYWRIGHT:
 
-### curl_cffi (Phase 2)
+Browser automation: navigation, form filling, clicking, scrolling
+Network response catching
+In this project ***playwright-stealth*** is also utlized to  bypass Cloudflare/DataDome bot detection
+
+Formally ***requests*** now switched to  curl_cffi  for better function(Phase 2)
 - HTTP requests with Chrome/Safari TLS fingerprint impersonation
 - Bypasses JA3/JA4 fingerprint-based bot detection that blocks `requests` and `httpx`
 
-### BeautifulSoup
+***BeautifulSoup***
 - HTML parsing and CSS selector application
 - Junk container removal (nav, header, footer, sidebar, cookie banners)
+- used in mutiple scnearious as a fallback when ai fails to learn
 
 ### Flask + React
 - Flask backend with SSE (Server-Sent Events) for real-time progress streaming
@@ -222,13 +134,7 @@ All Phase 1 fields preserved, plus:
 ## Anti-Detection Stack
 
 | Layer | What | How |
-|-------|------|-----|
-| **TLS Fingerprint** | Browser-identical TLS handshake | `curl_cffi impersonate="chrome"` (Phase 2), `playwright-stealth` (Phase 1) |
-| **HTTP Headers** | Realistic Sec-Fetch-*, Accept headers | Randomized per request |
-| **Browser Fingerprint** | navigator.webdriver=false, real plugin list | `playwright-stealth` patches |
-| **Behavioral** | Human-like scrolling, random delays | `human_scroll()`, per-domain throttle |
 
----
 
 ## Installation
 
