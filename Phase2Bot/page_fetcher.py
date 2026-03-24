@@ -4,6 +4,7 @@ Uses curl_cffi with browser TLS fingerprint impersonation.
 """
 
 import random
+import re
 import time
 import threading
 from curl_cffi.requests import Session
@@ -190,10 +191,10 @@ def _resolve_url(href: str, base_url: str) -> str | None:
         return None
 
 
-# --- GOOGLE SEARCH FOR MISSING WEBSITES ---
+# --- DUCKDUCKGO SEARCH FOR MISSING WEBSITES ---
 
 # Domains that are ABOUT companies but are NOT a company's own website
-_GOOGLE_SKIP_DOMAINS = {
+_SKIP_DOMAINS = {
     "google.com", "google.co", "googleapis.com",
     "facebook.com", "fb.com", "linkedin.com", "twitter.com", "x.com",
     "instagram.com", "youtube.com", "tiktok.com", "pinterest.com",
@@ -205,13 +206,66 @@ _GOOGLE_SKIP_DOMAINS = {
     "wikipedia.org", "wikimedia.org",
     "amazon.com", "ebay.com", "etsy.com",
     "nextdoor.com", "patch.com",
+    "chamberofcommerce.com", "chambermaster.com",
+    "growthzone.com", "micronet.com",
 }
 
-# Google search rate limiting (slower than normal fetching to avoid CAPTCHA)
-_google_search_stopped = False
+# Business suffixes to strip when building company word set
+_BUSINESS_SUFFIXES = {
+    "the", "and", "of", "for",
+    "inc", "llc", "ltd", "corp", "co", "company", "corporation",
+    "incorporated", "limited", "enterprises", "holdings", "associates",
+    "international", "partners", "consulting", "group", "pllc", "lp",
+    "pc", "pa", "dba",
+}
+
+# Search rate limiting — reset per run, not global
+_search_stopped = False
 
 
-def google_search_website(
+def _build_company_words(company_name: str) -> set[str]:
+    """Build a set of significant words from a company name for domain matching.
+    Uses word-boundary splitting (not substring replace) to avoid mangling words."""
+    # Normalize: lowercase, replace punctuation with spaces
+    name = company_name.lower()
+    name = re.sub(r"[^\w\s]", " ", name)
+    words = name.split()
+    # Remove business suffixes as whole words
+    words = [w for w in words if w not in _BUSINESS_SUFFIXES]
+    # Keep words with 3+ chars (or digits like "84" in "84 Lumber")
+    words = [w for w in words if len(w) >= 3 or (w.isdigit() and len(w) >= 2)]
+    return set(words)
+
+
+def _extract_search_location(street_address: str) -> str:
+    """Extract city and state from address for search query context.
+    Returns string like 'St Cloud MN' or '' if can't parse."""
+    if not street_address:
+        return ""
+
+    parts = [p.strip() for p in street_address.split(",")]
+    location_parts = []
+
+    for part in parts:
+        # Skip parts that look like street addresses (start with number)
+        if re.match(r'^\d', part.strip()):
+            continue
+        # Skip PO Box lines
+        if re.match(r'^po\s+box', part.strip(), re.IGNORECASE):
+            continue
+        location_parts.append(part.strip())
+
+    # Return city + state parts (skip the street line)
+    return " ".join(location_parts) if location_parts else ""
+
+
+def reset_search_state():
+    """Reset the search-stopped flag. Call at the start of each Phase 2 run."""
+    global _search_stopped
+    _search_stopped = False
+
+
+def ddg_search_website(
     company_name: str,
     street_address: str | None = None,
     category: str | None = None,
@@ -223,31 +277,27 @@ def google_search_website(
     Returns (url_or_none, query_used).
     Uses DuckDuckGo HTML search (no API key needed, less aggressive anti-bot).
     """
-    global _google_search_stopped
-    if _google_search_stopped:
+    global _search_stopped
+    if _search_stopped:
         return None, ""
 
-    # Build search query from available data
+    # Build search query with all available context
     parts = [f'"{company_name}"']
 
-    # Extract city/state from address if available
-    if street_address:
-        addr_parts = street_address.split(",")
-        if len(addr_parts) >= 2:
-            parts.append(addr_parts[-1].strip())
-        elif len(addr_parts) == 1 and len(street_address) < 50:
-            parts.append(street_address)
+    # Add city + state from address (not just last part — include city name)
+    location = _extract_search_location(street_address)
+    if location:
+        parts.append(location)
 
     if category and len(category) < 40:
         parts.append(category)
 
     query = " ".join(parts)
 
-    # URL-encode the query
     from urllib.parse import quote_plus
     search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
 
-    # Rate limit
+    # Rate limit — randomized to avoid pattern detection
     time.sleep(random.uniform(1.5, 3.0))
 
     browser = random.choice(_IMPERSONATE_TARGETS)
@@ -255,9 +305,9 @@ def google_search_website(
         session = _get_session(browser)
         resp = session.get(search_url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
 
-        if resp.status_code == 429 or resp.status_code == 403:
+        if resp.status_code in (429, 403):
             print("    Search blocked, stopping website discovery")
-            _google_search_stopped = True
+            _search_stopped = True
             return None, query
 
         if resp.status_code != 200:
@@ -265,26 +315,17 @@ def google_search_website(
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Build company name word set for matching
-        company_lower = company_name.lower()
-        company_words = set(
-            company_lower.replace(",", "").replace(".", "")
-            .replace("llc", "").replace("inc", "").replace("ltd", "")
-            .split()
-        )
-        company_words = {w for w in company_words if len(w) >= 3 and w not in {
-            "the", "and", "inc", "llc", "ltd", "corp", "company", "co",
-            "services", "service", "group", "construction",
-        }}
+        # Build company name word set for domain matching
+        company_words = _build_company_words(company_name)
 
         # DuckDuckGo results are in <a class="result__a"> tags
         # The href contains a redirect: //duckduckgo.com/l/?uddg=ENCODED_URL&...
+        from urllib.parse import unquote
         for a in soup.select("a.result__a"):
             href = a.get("href", "")
 
             # Extract actual URL from DDG redirect
             if "uddg=" in href:
-                from urllib.parse import unquote
                 href = unquote(href.split("uddg=")[1].split("&")[0])
             elif not href.startswith("http"):
                 continue
@@ -296,7 +337,7 @@ def google_search_website(
                 continue
 
             # Skip known non-company domains
-            if any(skip in domain for skip in _GOOGLE_SKIP_DOMAINS):
+            if any(skip in domain for skip in _SKIP_DOMAINS):
                 continue
 
             # Skip DDG's own domains
@@ -313,8 +354,16 @@ def google_search_website(
 
             # Validate: domain MUST contain a significant word from company name
             # (link text alone is not enough — directory listings mention many companies)
+            # Strip hyphens and dots from domain for matching
             domain_clean = domain.replace("-", "").replace(".", "")
-            has_domain_match = any(word in domain_clean for word in company_words if len(word) >= 4)
+
+            # Check for ANY word match (3+ chars), not just 4+ chars
+            # This fixes "ABC Construction" where "abc" is only 3 chars
+            has_domain_match = any(
+                word in domain_clean
+                for word in company_words
+                if len(word) >= 3
+            )
 
             if has_domain_match:
                 found_url = f"{parsed.scheme}://{parsed.netloc}"
