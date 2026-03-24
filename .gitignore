@@ -4,3 +4,4 @@ __pycache__
 *.pyc
 testcode.py
 .env
+.env

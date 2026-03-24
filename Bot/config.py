@@ -4,9 +4,13 @@ All keywords, timeouts, selectors, and API settings live here.
 """
 
 import os
+from dotenv import load_dotenv
+
+# Load .env file from project root
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 # --- API KEYS ---
-os.environ["ANTHROPIC_API_KEY"] = "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"
+# Set in .env file: ANTHROPIC_API_KEY=sk-ant-api03-...
 
 # --- TIMEOUTS ---
 DEFAULT_IDLE_TIMEOUT = 4        # seconds of silence before closing browser
