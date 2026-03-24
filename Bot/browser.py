@@ -25,6 +25,13 @@ from playwright.sync_api import Playwright
 from detail_crawler import collect_page_links, detect_detail_links, is_shallow_data, html_has_contact_info, CONTACT_KEYS
 
 
+# Content keywords that indicate directory-related HTML (used in multiple checks)
+_DIRECTORY_CONTENT_KEYWORDS = [
+    "member", "directory", "listing", "result", "profile",
+    "load more", "company", "contact",
+    "doctor", "restaurant", "attorney", "clinic",
+]
+
 # --- IFRAME DETECTION ---
 
 # URL patterns that indicate an iframe contains directory/search results
@@ -32,6 +39,8 @@ IFRAME_CONTENT_URL_PATTERNS = [
     "searchserver", "people", "directory", "member",
     "searchresults", "search_results",
     "widget", "feeds", "membee",
+    "doctor", "restaurant", "attorney", "clinic",
+    "listing",
 ]
 
 # CSS selectors for known result iframes
@@ -120,8 +129,7 @@ def find_content_frame(page):
                         try:
                             frame_html = frame.content()
                             if any(kw in frame_html.lower() for kw in
-                                   ["member", "directory", "listing", "result",
-                                    "profile", "load more", "company"]):
+                                   _DIRECTORY_CONTENT_KEYWORDS):
                                 print(f"  Found results iframe: {selector}")
                                 return frame
                         except Exception:
@@ -250,8 +258,9 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
     Returns the number of extra pages loaded.
     """
     pages_loaded = 0
-    max_pages = 200
+    max_pages = 50
     current_page_num = 1
+    stale_clicks = 0  # how many times "next" didn't change the page
 
     # Record the starting URL path to detect accidental navigation away
     # (e.g. clicking a member detail link instead of a pagination button).
@@ -361,6 +370,16 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
                 continue
         return current_page_num
 
+    def _content_snapshot() -> str:
+        """Quick hash of visible text to detect if page actually changed."""
+        try:
+            text = page.inner_text("body")[:2000]
+            return str(hash(text))
+        except:
+            return ""
+
+    last_content_hash = _content_snapshot()
+
     while not done_event.is_set() and pages_loaded < max_pages:
         found_next = False
         next_num = current_page_num + 1
@@ -369,10 +388,22 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
         try:
             num_btn = _find_page_button(next_num)
             if num_btn:
+                before_hash = _content_snapshot()
+                before_url = page.url
                 num_btn.click()
                 _wait_for_page()
                 if _navigated_away():
                     break
+                if page.url == before_url and _content_snapshot() == before_hash:
+                    print(f"  Pagination: page {next_num} — URL and content unchanged, stopping")
+                    break
+                elif _content_snapshot() == before_hash:
+                    stale_clicks += 1
+                    if stale_clicks >= 2:
+                        print(f"  Pagination: content unchanged, stopping")
+                        break
+                else:
+                    stale_clicks = 0
                 pages_loaded += 1
                 current_page_num = next_num
                 print(f"  Pagination: page {current_page_num}")
@@ -391,17 +422,33 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
             if next_btn.is_visible(timeout=1000) and next_btn.is_enabled():
                 cls = (next_btn.get_attribute("class") or "").lower()
                 if "disabled" not in cls and "active" not in cls:
+                    before_hash = _content_snapshot()
+                    before_url = page.url
                     next_btn.click()
                     _wait_for_page()
                     if _navigated_away():
                         break
+                    # Check if page actually changed (URL or content)
+                    after_url = page.url
+                    after_hash = _content_snapshot()
+                    if after_url == before_url and after_hash == before_hash:
+                        stale_clicks += 1
+                        if stale_clicks >= 1:
+                            print(f"  Pagination: URL and content unchanged after click, stopping (last page)")
+                            break
+                    elif after_hash == before_hash:
+                        stale_clicks += 1
+                        if stale_clicks >= 2:
+                            print(f"  Pagination: content unchanged, stopping")
+                            break
+                    else:
+                        stale_clicks = 0
                     pages_loaded += 1
-                    # Read actual page number from the active button (numbered pagination)
                     detected_num = _read_active_page_num()
                     if detected_num > current_page_num:
                         current_page_num = detected_num
                     else:
-                        current_page_num += 1  # no numbered buttons — just increment
+                        current_page_num += 1
                     print(f"  Pagination: next/arrow → page {current_page_num}")
                     _collect_links()
                     _capture_html()
@@ -448,10 +495,13 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
     return pages_loaded
 
 
-def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
+def capture_responses(playwright: Playwright, link: str, mode: str = "auto") -> tuple[list, list]:
     """Main browser automation entry point.
 
     Launches browser, navigates to directory page, captures all responses.
+
+    mode: "auto" = find directory page + search (default)
+          "direct" = skip navigation/search, scrape the page as-is
 
     Returns:
         Tuple of (results, detail_urls):
@@ -479,6 +529,13 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
 
     browser = playwright.chromium.launch(headless=False)
     page = browser.new_page()
+
+    # Apply stealth patches to avoid bot detection (Cloudflare, DataDome, etc.)
+    try:
+        from playwright_stealth import Stealth
+        Stealth().apply_stealth_sync(page)
+    except ImportError:
+        pass
 
     def reset_idle_timer():
         """Reset the idle timer. Called each time a relevant response arrives.
@@ -558,40 +615,47 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     page.on("response", on_response)
 
     # --- Step 1: Find and navigate to directory page ---
-    directory_url = find_directory_url(page, link)
-    debug.log("NAV", f"Directory URL resolved: {directory_url}")
-    # Only navigate if we're not already on the directory page
-    # (find_directory_url may have already clicked a JS link to get there)
-    if page.url.rstrip("/") != directory_url.rstrip("/"):
-        page.goto(directory_url)
+    if mode == "direct":
+        # Direct mode: user already picked the page, just load it
+        print(f"  Direct mode: loading {link}")
+        page.goto(link)
         try:
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
         except:
             pass
+        directory_url = link
+        search_triggered = False
+        debug.log("NAV", f"Direct mode — skipping navigation and search")
+    else:
+        directory_url = find_directory_url(page, link)
+        debug.log("NAV", f"Directory URL resolved: {directory_url}")
+        if page.url.rstrip("/") != directory_url.rstrip("/"):
+            page.goto(directory_url)
+            try:
+                page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+            except:
+                pass
 
-    # --- Step 2: Try search strategies ---
-    pre_search_count = len(results)
-    debug.log("SEARCH", f"Starting search. JSON results so far: {pre_search_count}")
-    search_triggered = trigger_search(page, results)
-    debug.log("SEARCH", f"Search complete. triggered={search_triggered}, "
-              f"results before={pre_search_count} after={len(results)}")
-    if search_triggered and len(results) > pre_search_count:
-        # Only use longer timeout if search actually produced new responses
-        idle_timeout_value = SEARCH_IDLE_TIMEOUT
-        print(f"Idle timeout set to: {idle_timeout_value}s (search mode)")
+        # --- Step 2: Try search strategies ---
+        pre_search_count = len(results)
+        debug.log("SEARCH", f"Starting search. JSON results so far: {pre_search_count}")
+        search_triggered = trigger_search(page, results)
+        debug.log("SEARCH", f"Search complete. triggered={search_triggered}, "
+                  f"results before={pre_search_count} after={len(results)}")
+        if search_triggered and len(results) > pre_search_count:
+            idle_timeout_value = SEARCH_IDLE_TIMEOUT
+            print(f"Idle timeout set to: {idle_timeout_value}s (search mode)")
 
     # Enable and start the idle timer AFTER search/scroll decision.
-    # Before this point, on_response does NOT start timers — this prevents
-    # the browser from closing while trigger_search is still running.
     timer_enabled = True
     reset_idle_timer()
 
     # --- Step 3: If no search, try view-all / categories / scroll ---
-    # Priority order: View All > Categories > Adaptive Scroll
-    # Each step is gated by "do we already have data?" to avoid useless work.
+    # In direct mode, skip view-all/categories (user already chose the page).
+    # Still scroll for lazy-loaded content.
     categories_handled = False
     view_all_clicked = False
-    if not search_triggered:
+    if not search_triggered and mode != "direct":
         visible_count = count_visible_results(page)
         debug.log("SEARCH", f"No search triggered. visible_results={visible_count}, "
                   f"json_results={len(results)}")
@@ -625,7 +689,7 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
                             try:
                                 cat_html = page.content()
                                 if any(kw in cat_html.lower() for kw in
-                                       ["member", "directory", "contact", "listing"]):
+                                       _DIRECTORY_CONTENT_KEYWORDS):
                                     all_page_htmls.append(cat_html)
                             except Exception:
                                 pass
@@ -653,6 +717,11 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
                 # Nothing found yet — adaptive scroll for infinite scroll pages
                 human_scroll(page, scroll_target="body", done_event=done, adaptive=True)
 
+    # Direct mode: light scroll to trigger any lazy content
+    if mode == "direct" and not search_triggered:
+        print(f"  Direct mode: scrolling to load lazy content")
+        human_scroll(page, done, scroll_target="body", times=5)
+
     # --- Step 3.5: Detect if results are inside an iframe ---
     # Some platforms (YourMembership, etc.) load search results in an iframe.
     # If so, we need to collect links, paginate, and capture HTML from the
@@ -679,7 +748,7 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
     # Subsequent pages are captured inside handle_pagination via html_collector.
     try:
         initial_html = content_context.content()
-        if any(kw in initial_html.lower() for kw in ["member", "directory", "contact", "listing"]):
+        if any(kw in initial_html.lower() for kw in _DIRECTORY_CONTENT_KEYWORDS):
             all_page_htmls.append(initial_html)
             debug.log("CAPTURE", f"Captured initial HTML: {len(initial_html)} chars")
         else:
@@ -729,6 +798,10 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
                                         html_collector=all_page_htmls)
         if extra_pages > 0:
             reset_idle_timer()  # give time for last page's responses
+        else:
+            # No pagination found — no reason to wait 30s
+            idle_timeout_value = DEFAULT_IDLE_TIMEOUT
+            reset_idle_timer()
     else:
         # Already have enough results — just give a short window for any
         # remaining responses to arrive, then move on.
@@ -755,7 +828,7 @@ def capture_responses(playwright: Playwright, link: str) -> tuple[list, list]:
         # Fallback: capture whatever is on screen now
         try:
             html = content_context.content()
-            if any(kw in html.lower() for kw in ["member", "directory", "contact", "listing"]):
+            if any(kw in html.lower() for kw in _DIRECTORY_CONTENT_KEYWORDS):
                 source_url = content_frame.url if content_frame else page.url
                 print(f"Captured plain HTML from: {source_url}")
                 results.append({

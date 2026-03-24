@@ -26,6 +26,8 @@ DETAIL_URL_KEYWORDS = [
     "member", "profile", "company", "detail", "listing",
     "vendor", "supplier", "directory", "contact", "business",
     "organization", "firm", "provider",
+    "doctor", "physician", "dentist", "attorney", "lawyer",
+    "restaurant", "clinic", "specialist", "consultant", "therapist",
 ]
 
 # --- SEARCH INPUT DETECTION ---
@@ -38,6 +40,12 @@ SEARCH_INPUT_SELECTORS = (
     "input[placeholder*='filter' i], "
     "input[placeholder*='keyword' i], "
     "input[placeholder*='company' i], "
+    "input[placeholder*='doctor' i], "
+    "input[placeholder*='restaurant' i], "
+    "input[placeholder*='attorney' i], "
+    "input[placeholder*='provider' i], "
+    "input[placeholder*='business' i], "
+    "input[placeholder*='practice' i], "
     "input[id*='search' i], "
     "input[name*='search' i], "
     "input[id*='find' i], "
@@ -57,7 +65,12 @@ FORM_INPUT_SELECTORS = (
     "input[name*='employer' i][type='text'], "
     "input[name*='member' i][type='text'], "
     "input[name*='business' i][type='text'], "
-    "input[name*='organization' i][type='text']"
+    "input[name*='organization' i][type='text'], "
+    "input[name*='doctor' i][type='text'], "
+    "input[name*='provider' i][type='text'], "
+    "input[name*='practice' i][type='text'], "
+    "input[name*='restaurant' i][type='text'], "
+    "input[name*='attorney' i][type='text']"
 )
 
 # Labels / nearby-text patterns that indicate a "name" field (preferred for searching).
@@ -65,6 +78,9 @@ FORM_INPUT_SELECTORS = (
 PREFERRED_NAME_FIELD_LABELS = [
     "name", "member name", "company name", "business name",
     "organization name", "last name", "first name",
+    "practice name", "restaurant name", "firm name",
+    "provider name", "office name", "doctor name",
+    "attorney name", "clinic name", "professional name",
 ]
 
 # Submit button selectors for form-based directories.
@@ -95,6 +111,8 @@ JSON_JUNK_DOMAINS = [
     "twitter.com", "x.com",                             # social
     "linkedin.com",                                     # social
     "doubleclick.net", "googlesyndication.com",         # ads
+    "list-manage.com", "mailchimp.com", "mcsv.net",    # newsletter / Mailchimp
+    "youtube.com", "youtu.be", "ytimg.com",             # video
     "cloudflare.com", "cloudflareinsights.com",         # CDN / security
     "newrelic.com", "nr-data.net",                      # monitoring
     "sentry.io", "sentry-cdn.com",                      # error tracking
@@ -119,6 +137,8 @@ JSON_DIRECTORY_KEYWORDS = [
     "listing", "organization", "vendor", "supplier",
     "contractor", "provider", "business", "firm",
     "result", "roster",
+    "doctor", "physician", "dentist", "attorney", "lawyer",
+    "restaurant", "clinic", "specialist", "consultant", "therapist",
 ]
 
 # URL patterns that indicate a JSON response is directory-related
@@ -127,6 +147,8 @@ JSON_URL_KEYWORDS = [
     "directory", "member", "getdirectory", "company",
     "listing", "search", "roster", "find",
     "contact", "vendor", "supplier", "provider",
+    "doctor", "physician", "attorney", "lawyer",
+    "restaurant", "clinic", "practice", "professional",
 ]
 
 # URL patterns that EXCLUDE a JSON response from being treated as directory data
@@ -141,16 +163,21 @@ JSON_URL_EXCLUDE_PATTERNS = [
 # If a JSON object/array has 3+ of these keys, it's probably directory data
 JSON_STRUCTURE_FIELDS = [
     "name", "companyname", "company_name", "businessname",
+    "organizationname", "providername", "practicename",
+    "restaurantname", "firmname", "doctorname", "displayname",
     "phone", "mainphone", "phonenumber", "telephone",
     "website", "url", "web", "homepage",
     "address", "city", "state", "zipcode", "zip", "postalcode",
     "email", "fax", "specialties", "category", "type",
+    "specialty", "cuisine", "practicearea", "services",
 ]
 
 # URL patterns that indicate a response is directory-related (for HTML responses)
 DIRECTORY_URL_KEYWORDS = [
     "member", "directory", "search", "contact", "listing",
     "result", "roster", "find", "company",
+    "doctor", "provider", "attorney", "restaurant",
+    "clinic", "practice", "professional",
 ]
 
 # --- PAGINATION ---
@@ -197,13 +224,17 @@ RESULT_COUNT_SELECTORS = [
     "[class*='card']",
     "[class*='company']",
     "[class*='vendor']",
+    "[class*='doctor']",
+    "[class*='restaurant']",
+    "[class*='attorney']",
     "table tbody tr",
 ]
 
 RESULT_LINK_SELECTORS = (
     "a[href*='member'], a[href*='profile'], "
     "a[href*='company'], a[href*='detail'], "
-    "a[href*='listing']"
+    "a[href*='listing'], a[href*='doctor'], "
+    "a[href*='restaurant'], a[href*='attorney']"
 )
 
 # --- HTML PARSING ---
@@ -250,6 +281,8 @@ CARD_CLASS_HINTS = [
     "company", "directory", "profile", "vendor",
     "supplier", "contractor", "provider", "business",
     "entry", "item", "record", "row",
+    "doctor", "physician", "attorney", "lawyer",
+    "restaurant", "clinic", "specialist", "consultant",
 ]
 
 # Contact-like content signals inside cards
@@ -289,7 +322,8 @@ SCROLL_STALE_THRESHOLD = 3     # consecutive batches with no growth before stopp
 CATEGORY_URL_KEYWORDS = [
     "category", "categories", "browse", "type", "specialty",
     "specialties", "trade", "service", "industry", "sector",
-    "classification", "division",
+    "classification", "division", "cuisine", "practice-area",
+    "discipline",
 ]
 
 # Minimum visible results on page before skipping category iteration

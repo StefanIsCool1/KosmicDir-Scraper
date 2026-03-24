@@ -114,13 +114,13 @@ def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool,
         max_tokens=100,
         messages=[{
             "role": "user",
-            "content": f"""I'm on {page_url} trying to find the member directory/company search page.
+            "content": f"""I'm on {page_url} trying to find the directory or search/listing page (for businesses, members, doctors, restaurants, attorneys, providers, or any directory).
 {search_hint}{content_hint}
 Here are the links on this page:
 {link_list}
 
-Is this already the member directory or search page where I can find member companies?
-- If YES (this page has a search form for members, shows member listings, or shows member categories to browse), respond with ONLY: STAY
+Is this already a directory, search, or listing page where I can find entries (companies, people, providers, restaurants, etc.)?
+- If YES (this page has a search form, shows listings, or shows categories to browse), respond with ONLY: STAY
 - If NO but a link leads there, respond with ONLY: CLICK followed by the link number (e.g. CLICK 7)
 - If no directory exists, respond with ONLY: NONE
 
@@ -325,6 +325,22 @@ def find_search_input(page):
         except:
             continue
 
+        # Skip honeypot inputs
+        try:
+            is_honeypot = inp.evaluate("""el => {
+                if (el.tabIndex === -1) return true;
+                const rect = el.getBoundingClientRect();
+                if (rect.left < -100 || rect.top < -100) return true;
+                if (rect.width === 0 || rect.height === 0) return true;
+                const name = (el.name || '').toLowerCase();
+                if (name.startsWith('b_') || name.includes('honeypot') || name.includes('hp_')) return true;
+                return false;
+            }""")
+            if is_honeypot:
+                continue
+        except:
+            pass
+
         # Grab context about this input for AI
         try:
             info = inp.evaluate("""el => {
@@ -379,7 +395,7 @@ def find_search_input(page):
             max_tokens=20,
             messages=[{
                 "role": "user",
-                "content": f"""This page has multiple search inputs. Which one is the member directory search (to search for member companies)?
+                "content": f"""This page has multiple search inputs. Which one is the directory search (to search for listings — companies, people, providers, restaurants, etc.)?
 
 {input_descriptions}
 
@@ -436,6 +452,45 @@ def find_form_search(page):
                 continue
         except:
             continue
+
+        # Skip honeypot inputs (tabindex=-1, off-viewport, or hidden bot-traps)
+        try:
+            is_honeypot = inp.evaluate("""el => {
+                // tabindex=-1 is a classic honeypot signal
+                if (el.tabIndex === -1) return true;
+                // Check if element is positioned off-screen
+                const rect = el.getBoundingClientRect();
+                if (rect.left < -100 || rect.top < -100) return true;
+                if (rect.width === 0 || rect.height === 0) return true;
+                // Honeypot names: b_name, b_email, hp_field, etc.
+                const name = (el.name || '').toLowerCase();
+                if (name.startsWith('b_') || name.includes('honeypot') || name.includes('hp_')) return true;
+                return false;
+            }""")
+            if is_honeypot:
+                continue
+        except:
+            pass
+
+        # Skip inputs inside forms that submit to external/non-directory domains
+        # (newsletter signups via Mailchimp, Constant Contact, etc.)
+        try:
+            is_external_form = inp.evaluate("""el => {
+                const form = el.closest('form');
+                if (!form) return false;
+                const action = (form.action || '').toLowerCase();
+                const junkDomains = [
+                    'list-manage.com', 'mailchimp.com', 'constantcontact.com',
+                    'campaignmonitor.com', 'sendgrid.com', 'mailerlite.com',
+                    'convertkit.com', 'aweber.com', 'getresponse.com',
+                    'hubspot.com', 'salesforce.com', 'pardot.com',
+                ];
+                return junkDomains.some(d => action.includes(d));
+            }""")
+            if is_external_form:
+                continue
+        except:
+            pass
 
         # Skip inputs inside nav/header — they're site-wide search, not directory forms
         try:
@@ -676,18 +731,25 @@ def read_result_count(page, query: str = "") -> dict:
 
     # --- Regex pre-check: catch common "X results" patterns ---
     # This avoids an AI call when the count is in a standard format.
+    # Shared entity words for all count patterns
+    _E = (
+        r'results?|members?|companies?|listings?|records?|'
+        r'builders?|vendors?|providers?|businesses?|organizations?|'
+        r'doctors?|physicians?|attorneys?|lawyers?|restaurants?|'
+        r'clinics?|specialists?|consultants?|therapists?|'
+        r'firms?|dentists?'
+    )
     result_patterns = [
         # "Results Found: 48", "Results: 48"
         r'results?\s*(?:found)?\s*:\s*(\d[\d,]*)',
-        # "48 results found", "48 results", "48 members found"
-        r'(\d[\d,]*)\s+(?:results?|members?|companies?|listings?|records?|builders?|vendors?|providers?|businesses?|organizations?)\s*(?:found)?',
+        # "48 results found", "48 members found"
+        rf'(\d[\d,]*)\s+(?:{_E})\s*(?:found)?',
         # "Showing 48 results", "Displaying 48 members"
-        r'(?:showing|displaying)\s+(\d[\d,]*)\s+(?:results?|members?|companies?|listings?|records?|builders?|vendors?|providers?|businesses?|organizations?)',
+        rf'(?:showing|displaying)\s+(\d[\d,]*)\s+(?:{_E})',
         # "1-20 of 48 results", "Showing 1-20 of 48"
-        r'of\s+(\d[\d,]*)\s+(?:results?|members?|companies?|listings?|records?|builders?|vendors?|providers?|businesses?|organizations?|total)',
-        # "Page 1 of 26" (total pages, not results — skip)
+        rf'of\s+(\d[\d,]*)\s+(?:{_E}|total)',
         # "Total: 48", "Total Members: 48"
-        r'total\s*(?:members?|results?|companies?|listings?|builders?|vendors?|providers?)?\s*:\s*(\d[\d,]*)',
+        rf'total\s*(?:{_E})?\s*:\s*(\d[\d,]*)',
     ]
 
     for pattern in result_patterns:
@@ -700,8 +762,8 @@ def read_result_count(page, query: str = "") -> dict:
 
     # Check for "all results" / "showing all" phrases
     all_patterns = [
-        r'showing\s+all\s+(?:results?|members?|records?)',
-        r'all\s+(?:\d[\d,]*\s+)?(?:results?|members?|records?)',
+        rf'showing\s+all\s+(?:{_E})',
+        rf'all\s+(?:\d[\d,]*\s+)?(?:{_E})',
         r'your\s+search\s+results?\s+include\s+all',
     ]
     for pattern in all_patterns:
@@ -883,10 +945,19 @@ def trigger_search(page, results_list: list) -> bool:
             if isinstance(sample, dict):
                 keys_lower = {k.lower() for k in sample.keys()}
                 name_fields = {"name", "companyname", "company_name", "businessname",
-                               "organizationname", "title", "nam"}
+                               "organizationname", "title", "nam", "displayname",
+                               "providername", "practicename", "firmname",
+                               "restaurantname", "doctorname", "fullname",
+                               "entityname", "officename", "attorneyname"}
                 if keys_lower & name_fields:
                     has_member_data = True
                     break
+                # Airtable format: name is inside "fields" dict
+                if "fields" in keys_lower and isinstance(sample.get("fields"), dict):
+                    field_keys = {k.lower() for k in sample["fields"].keys()}
+                    if field_keys & name_fields:
+                        has_member_data = True
+                        break
 
         # Check nested list inside dict (e.g. {"Status":"OK", "Members":[...]})
         elif isinstance(data, dict):
@@ -896,10 +967,19 @@ def trigger_search(page, results_list: list) -> bool:
                     if isinstance(sample, dict):
                         keys_lower = {k.lower() for k in sample.keys()}
                         name_fields = {"name", "companyname", "company_name", "businessname",
-                                       "organizationname", "title", "nam"}
+                                       "organizationname", "title", "nam", "displayname",
+                                       "providername", "practicename", "firmname",
+                                       "restaurantname", "doctorname", "fullname",
+                                       "entityname", "officename", "attorneyname"}
                         if keys_lower & name_fields and len(sample.keys()) >= 5:
                             has_member_data = True
                             break
+                        # Airtable format
+                        if "fields" in keys_lower and isinstance(sample.get("fields"), dict):
+                            field_keys = {k.lower() for k in sample["fields"].keys()}
+                            if field_keys & name_fields and len(sample["fields"]) >= 5:
+                                has_member_data = True
+                                break
             if has_member_data:
                 break
 
@@ -937,7 +1017,7 @@ def trigger_search(page, results_list: list) -> bool:
 
         # Check if the search input is still visible on the current page
         try:
-            if search_input.is_visible(timeout=1000):
+            if search_input.is_visible(timeout=1000): #type: ignore
                 return True  # input still usable, no need to go back
         except Exception:
             pass
@@ -1025,7 +1105,6 @@ def trigger_search(page, results_list: list) -> bool:
         ("all", "all"),
         ("a", "a"),
         ("wildcard_percent", "%"),
-        ("wildcard_star", "*"),
     ]
 
     for strat_name, strat_query in remaining:

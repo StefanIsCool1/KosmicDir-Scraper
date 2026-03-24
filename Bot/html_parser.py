@@ -596,13 +596,14 @@ def learn_selectors(raw_html: str, domain: str) -> dict:
         max_tokens=1000,
         messages=[{
             "role": "user",
-            "content": f"""Analyze this member directory HTML sample and return CSS selectors for extracting data.
+            "content": f"""Analyze this directory listing HTML sample and return CSS selectors for extracting data.
+This could be any type of directory (businesses, doctors, restaurants, attorneys, providers, etc.).
 
 Return ONLY a JSON object (no markdown) with these keys:
-- card_selector: CSS selector for each member card (the repeating container element)
-- company_name: selector for company name (relative to card)
+- card_selector: CSS selector for each listing card (the repeating container element)
+- company_name: selector for the primary name (company, person, practice, restaurant, etc.)
 - description: selector for description/about text
-- category: selector for category or classification
+- category: selector for category, specialty, or classification
 - website: selector for website link or text
 - phone: selector for phone number
 - fax: selector for fax number
@@ -613,7 +614,7 @@ Return ONLY a JSON object (no markdown) with these keys:
 - contact_email: selector for contact email (relative to contact_card)
 
 Rules:
-- Use class-based selectors where possible e.g. "div.memberBox"
+- Use class-based selectors where possible e.g. "div.listingBox"
 - Selectors for fields inside a card should be relative to the card element
 - If a field doesn't exist in the sample, use null
 - card_selector must be an absolute selector (not relative)
@@ -660,7 +661,7 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
         return []
 
     for card in cards:
-        def get_text(sel):
+        def get_text(sel, separator=""):
             """Extract text from a sub-selector within the card."""
             if not sel or not str(sel).strip():
                 return None
@@ -668,10 +669,15 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
                 el = card.select_one(sel)
                 if not el:
                     return None
-                text = el.get_text(strip=True)
+                text = el.get_text(separator=separator, strip=True)
+                # Collapse multiple separators and whitespace
+                if separator:
+                    text = re.sub(r'(\s*' + re.escape(separator) + r'\s*)+', separator + ' ', text)
                 # Strip common label prefixes like "Phone:" or "Website:"
                 text = re.sub(r'^[\w\s]+:\s*', '', text)
-                return text or None
+                # Replace non-breaking spaces with regular spaces
+                text = text.replace('\u00a0', ' ')
+                return text.strip() or None
             except Exception:
                 return None
 
@@ -690,11 +696,13 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
         # Extract contacts sub-blocks
         contacts = []
         contact_sel = selectors.get("contact_card")
+        name_sel = selectors.get("contact_name")
+        email_sel = selectors.get("contact_email")
+
         if contact_sel:
+            # Multiple contact blocks within each card
             try:
                 for cc in card.select(contact_sel):
-                    name_sel = selectors.get("contact_name")
-                    email_sel = selectors.get("contact_email")
                     name_el = cc.select_one(name_sel) if name_sel else None
                     email_el = cc.select_one(email_sel) if email_sel else None
                     contacts.append({
@@ -706,6 +714,22 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
                     })
             except Exception:
                 pass
+        elif name_sel or email_sel:
+            # No contact_card but name/email selectors exist — apply directly to card
+            try:
+                name_el = card.select_one(name_sel) if name_sel else None
+                email_el = card.select_one(email_sel) if email_sel else None
+                if name_el or email_el:
+                    email_val = None
+                    if email_el:
+                        href = str(email_el.get("href") or "")
+                        email_val = href.replace("mailto:", "").split("?")[0].strip() or email_el.get_text(strip=True)
+                    contacts.append({
+                        "name": name_el.get_text(strip=True) if name_el else None,
+                        "email": email_val,
+                    })
+            except Exception:
+                pass
 
         members.append({
             "company_name":    get_text(selectors.get("company_name")),
@@ -714,8 +738,8 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
             "website":         get_href(selectors.get("website")),
             "phone":           get_text(selectors.get("phone")),
             "fax":             get_text(selectors.get("fax")),
-            "street_address":  get_text(selectors.get("street_address")),
-            "mailing_address": get_text(selectors.get("mailing_address")),
+            "street_address":  get_text(selectors.get("street_address"), separator=", "),
+            "mailing_address": get_text(selectors.get("mailing_address"), separator=", "),
             "contacts":        contacts,
         })
 

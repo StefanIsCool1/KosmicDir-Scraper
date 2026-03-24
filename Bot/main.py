@@ -39,6 +39,17 @@ def normalize_json_member(raw: dict) -> dict:
 
     This normalizes them all so clean_members() works correctly.
     """
+    # Handle Airtable format: {"id": "recXYZ", "fields": {"Name": "...", "Phone": "..."}}
+    # Unwrap the "fields" dict so the rest of the function can find the real data.
+    if "fields" in raw and isinstance(raw["fields"], dict) and "id" in raw:
+        raw = raw["fields"]
+
+    # Handle Procore format: addresses is a list of address objects
+    if "addresses" in raw and isinstance(raw.get("addresses"), list) and raw["addresses"]:
+        addr = raw["addresses"][0]
+        if isinstance(addr, dict):
+            raw = {**raw, **{k: v for k, v in addr.items() if k not in raw}}
+
     # Flatten nested address/location dicts into top-level for field lookup
     # e.g. {"adr": {"ad1": "123 Main", "cit": "NYC"}} → {"ad1": "123 Main", "cit": "NYC", ...}
     flat = dict(raw)
@@ -49,6 +60,21 @@ def normalize_json_member(raw: dict) -> dict:
                 if nk not in flat:  # don't overwrite top-level keys
                     flat[nk] = nv
             break  # only flatten one address object
+
+    # Handle address arrays (e.g. Procore: "addresses": [{"address1": "...", "city": "...", ...}])
+    # Flatten the primary (or first) address dict into top-level
+    for key in ["addresses", "Addresses", "locations", "Locations"]:
+        nested_list = raw.get(key)
+        if isinstance(nested_list, list) and nested_list:
+            # Prefer the primary address, fall back to first
+            addr = next((a for a in nested_list if isinstance(a, dict) and a.get("primary")), None)
+            if not addr:
+                addr = nested_list[0] if isinstance(nested_list[0], dict) else None
+            if addr:
+                for nk, nv in addr.items():
+                    if nk not in flat:
+                        flat[nk] = nv
+            break
 
     def find_field(candidates: list, data: dict):
         """Return the value of the first matching key (case-insensitive)."""
@@ -76,11 +102,12 @@ def normalize_json_member(raw: dict) -> dict:
 
     # Address: try to build from parts or use full string
     street = find_field(["Address", "StreetAddress", "street_address", "Address1", "AddressLine1",
-                         "ShippingAddress1", "ad1"], flat)
-    city = find_field(["City", "city", "ShippingCity", "cit"], flat)
-    state = find_field(["State", "state", "StateProvince", "Province", "ShippingState", "sta"], flat)
+                         "ShippingAddress1", "ad1", "address1"], flat)
+    city = find_field(["City", "city", "ShippingCity", "cit", "locality"], flat)
+    state = find_field(["State", "state", "StateProvince", "Province", "ShippingState", "sta",
+                        "province", "countryCode"], flat)
     zipcode = find_field(["ZipCode", "Zip", "zip", "PostalCode", "postal_code", "zipcode",
-                          "ShippingZip"], flat)
+                          "ShippingZip", "postalCode1", "postalcode1"], flat)
 
     # Build a combined street address if we have parts
     address_parts = [p for p in [street, city, state, zipcode] if p]
@@ -94,12 +121,20 @@ def normalize_json_member(raw: dict) -> dict:
 
     return {
         "company_name":    find_field(["Name", "CompanyName", "company_name", "BusinessName",
-                                       "OrganizationName", "name", "Title", "title", "nam"], flat),
+                                       "OrganizationName", "name", "Title", "title", "nam",
+                                       "DisplayName", "ProviderName", "PracticeName",
+                                       "FirmName", "RestaurantName", "DoctorName",
+                                       "AttorneyName", "OfficeName", "FullName",
+                                       "EntityName", "displayName", "fullName"], flat),
         "description":     find_field(["Description", "description", "About", "about",
-                                       "Bio", "bio", "Summary", "summary", "cnm"], flat),
+                                       "Bio", "bio", "Summary", "summary", "cnm",
+                                       "Overview", "overview", "Details", "details"], flat),
         "category":        find_field(["Specialties", "Category", "category", "Type",
                                        "type", "Classification", "Industry",
-                                       "specialty", "specialties"], flat),
+                                       "specialty", "specialties",
+                                       "Cuisine", "cuisine", "CuisineType",
+                                       "PracticeArea", "practiceArea", "Discipline",
+                                       "Department", "ServiceArea", "Services"], flat),
         "website":         find_field(["WebSite", "Website", "website", "URL", "url",
                                        "Web", "web", "Homepage", "homepage"], flat),
         "phone":           phone,
@@ -119,19 +154,33 @@ def is_member_list(data: list) -> bool:
         return False
     # Check first few items for name-like keys
     name_keys = {"name", "companyname", "company_name", "businessname",
-                 "organizationname", "title", "nam"}
+                 "organizationname", "title", "nam", "displayname",
+                 "providername", "practicename", "firmname",
+                 "restaurantname", "doctorname", "fullname",
+                 "entityname", "officename", "attorneyname"}
     sample = data[:5]
     matches = 0
     for item in sample:
         item_keys = {k.lower() for k in item.keys()}
+        # Direct match — name key at top level
         if item_keys & name_keys:
             matches += 1
+        # Airtable format — name key inside "fields" dict
+        elif "fields" in item_keys and isinstance(item.get("fields"), dict):
+            field_keys = {k.lower() for k in item["fields"].keys()}
+            if field_keys & name_keys:
+                matches += 1
     if matches < len(sample) * 0.5:
         return False
 
     # Reject simple option/filter lists (e.g. {"Name":"Accounting","Value":405810})
-    # Real member records have 5+ fields, not just name+value pairs
-    avg_keys = sum(len(item.keys()) for item in sample) / len(sample)
+    # Real member records have 5+ fields, not just name+value pairs.
+    # For Airtable format, count keys inside "fields" instead of top-level.
+    def _effective_key_count(item):
+        if isinstance(item.get("fields"), dict):
+            return len(item["fields"])
+        return len(item)
+    avg_keys = sum(_effective_key_count(item) for item in sample) / len(sample)
     if avg_keys < 5:
         return False
 
@@ -189,7 +238,10 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
                 has_json_members = True
             else:
                 # Check if it looks like a single member record
-                name_keys = {"name", "companyname", "company_name", "businessname"}
+                name_keys = {"name", "companyname", "company_name", "businessname",
+                             "displayname", "providername", "practicename",
+                             "firmname", "restaurantname", "doctorname",
+                             "fullname", "entityname", "officename"}
                 data_keys_lower = {k.lower() for k in data.keys()}
                 if data_keys_lower & name_keys:
                     normalized = normalize_json_member(data)
@@ -235,6 +287,48 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
     return all_members
 
 
+def _detect_login_wall(results: list) -> bool:
+    """Check if the captured HTML contains a login/authentication wall.
+
+    Only called when 0 members were extracted — this is the key guard
+    against false positives. Sites with public directories that ALSO have
+    a login portal will have already returned member data by this point.
+
+    Requires MULTIPLE login signals to trigger (not just one "login" link
+    in the nav). A real login wall has password fields + login-specific text
+    concentrated together.
+    """
+    for result in results:
+        data = result.get("data", {})
+        if not isinstance(data, dict) or "raw_html" not in data:
+            continue
+
+        html_lower = data["raw_html"].lower()
+
+        # Must have a password field — strongest single signal
+        has_password = 'type="password"' in html_lower or "type='password'" in html_lower
+        if not has_password:
+            continue
+
+        # Count additional login signals (need 2+ besides password field)
+        signals = 0
+        login_phrases = [
+            "sign in", "log in", "login", "username",
+            "members only", "member login", "member sign in",
+            "forgot password", "forgot your password",
+            "click here for login", "portal login",
+        ]
+        for phrase in login_phrases:
+            if phrase in html_lower:
+                signals += 1
+
+        # Require password field + at least 2 login phrases
+        if signals >= 2:
+            return True
+
+    return False
+
+
 def prompt_detail_crawl(detail_url_count: int) -> bool:
     """Ask the user whether to crawl nested detail pages.
 
@@ -261,13 +355,15 @@ def prompt_detail_crawl(detail_url_count: int) -> bool:
         print("  Please enter 'y' or 'n'.")
 
 
-def scrape_directory(url: str, prompt_callback=None) -> list:
+def scrape_directory(url: str, prompt_callback=None, mode: str = "auto") -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
         url: The directory URL to scrape.
         prompt_callback: Optional callback for interactive prompts (e.g. detail crawl y/n).
                          If None, falls back to terminal input() for CLI usage.
+        mode: "auto" = find directory page + search (default)
+              "direct" = skip navigation/search, scrape the page as-is
     """
     domain = urlparse(url).netloc.replace(".", "_")
 
@@ -279,7 +375,7 @@ def scrape_directory(url: str, prompt_callback=None) -> list:
 
     # --- Step 1: Browser automation — capture all responses ---
     with sync_playwright() as playwright:
-        results, detail_urls = capture_responses(playwright, url)
+        results, detail_urls = capture_responses(playwright, url, mode=mode)
 
     # --- Step 2: Save raw responses ---
     raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
@@ -308,6 +404,14 @@ def scrape_directory(url: str, prompt_callback=None) -> list:
     # --- Step 4: Parse, clean, and save structured data ---
     members = parse_and_save_results(results, data_dump_dir, domain,
                                      detail_members=detail_members)
+
+    # --- Step 5: If zero results, check for login wall ---
+    if len(members) == 0:
+        login_detected = _detect_login_wall(results)
+        if login_detected:
+            print("LOGIN WALL DETECTED — this directory likely requires authentication")
+            print("  The page contains login/password fields but no public member data.")
+            print("  To scrape gated directories, log in manually and use the direct URL.")
 
     return members
 

@@ -18,6 +18,7 @@ Strategy:
 import re
 import json
 import time
+from urllib.parse import urlparse
 import random
 import ssl
 import urllib.request
@@ -58,7 +59,8 @@ def detect_detail_links(collected_links: list) -> list:
     content_links = [l for l in collected_links if not l.get("inNav")]
 
     def templatize(url: str) -> str:
-        """Replace numeric IDs in URL with {ID} to find repeating patterns."""
+        """Replace varying parts of URL with {ID} to find repeating patterns.
+        Handles numeric IDs, UUIDs, and slug-based paths."""
         t = url
         # Query param IDs: ?id=12345 → ?id={ID}
         t = re.sub(r'([?&]\w*id\w*=)\d+', r'\1{ID}', t, flags=re.IGNORECASE)
@@ -71,6 +73,16 @@ def detect_detail_links(collected_links: list) -> list:
             r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
             '/{ID}', t, flags=re.IGNORECASE
         )
+        # Slug-based last segment: /p/company-name-here → /p/{ID}
+        # Only applies when no numeric/UUID replacement happened above,
+        # the last segment contains a hyphen (slug-like), and is 4+ chars.
+        if t == url:
+            parsed = urlparse(url)
+            path = parsed.path.rstrip("/")
+            if "/" in path:
+                parent, slug = path.rsplit("/", 1)
+                if slug and "-" in slug and len(slug) >= 4:
+                    t = url.replace(path, parent + "/{ID}")
         return t
 
     # Group links by their URL template
@@ -110,6 +122,20 @@ def detect_detail_links(collected_links: list) -> list:
         keyword_matches = sum(1 for kw in DETAIL_URL_KEYWORDS if kw in template_lower)
         score += keyword_matches * 10
 
+        # Penalty for non-directory URL patterns (blog posts, events, classes, etc.)
+        non_directory_keywords = [
+            "blog", "news", "article", "post", "press",
+            "event", "class", "course", "training", "workshop",
+            "seminar", "webinar", "calendar", "schedule",
+            "job", "career", "faq", "help", "support",
+            "about", "team", "staff", "board", "committee",
+            "gallery", "photo", "video", "podcast",
+            "product", "shop", "store", "cart",
+            "page", "tag", "archive",
+        ]
+        penalty = sum(1 for kw in non_directory_keywords if kw in template_lower)
+        score -= penalty * 15
+
         if score > best_score:
             best_score = score
             best_template = template
@@ -144,7 +170,7 @@ def detect_detail_links(collected_links: list) -> list:
 # ───────────────────────────────────────────
 
 CONTACT_KEYS = {
-    "phone", "email", "website", "address",
+    "phone", "email", "website", "address", "addresses",
     "mainphone", "phonenumber", "telephone",
     "url", "web", "homepage", "fax",
 }
@@ -212,8 +238,16 @@ def html_has_contact_info(results: list) -> bool:
         if not html:
             continue
 
-        # Take first 50K chars to avoid scanning massive HTML
-        sample = html[:50000].lower()
+        # Sample from multiple positions in the HTML to catch contact info
+        # regardless of where member cards start (some sites have 100K+ of
+        # header/nav before the first card)
+        html_lower = html.lower()
+        chunks = [
+            html_lower[:50000],                    # beginning
+            html_lower[len(html)//3:len(html)//3 + 50000],  # middle third
+            html_lower[len(html)//2:len(html)//2 + 50000],  # midpoint
+        ]
+        sample = " ".join(chunks)
 
         # Count phone number patterns:
         # (206) 555-1234, 206-555-1234, 206.555.1234, 2065551234
@@ -375,11 +409,11 @@ def learn_detail_selectors(sample_htmls: list, domain: str) -> dict:
         max_tokens=1000,
         messages=[{
             "role": "user",
-            "content": f"""Analyze these {len(samples)} member detail page HTML samples from the same website.
-Each page shows info about ONE member/company. Return CSS selectors to extract data from any detail page on this site.
+            "content": f"""Analyze these {len(samples)} detail page HTML samples from the same directory website.
+Each page shows info about ONE listing (a company, person, provider, restaurant, practice, etc.). Return CSS selectors to extract data from any detail page on this site.
 
 Return ONLY a JSON object (no markdown) with these keys:
-- company_name: CSS selector for the company/member name (usually in an h1, h2, or b.big)
+- company_name: CSS selector for the primary name (company, person, practice, restaurant — usually in an h1, h2, or b.big)
 - description: selector for description/about text
 - category: selector for category or classification
 - website: selector for website link (the <a> tag with the URL)
@@ -621,6 +655,11 @@ def _detect_detail_api(sample_urls: list) -> dict | None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=False)
         page = browser.new_page()
+        try:
+            from playwright_stealth import Stealth
+            Stealth().apply_stealth_sync(page)
+        except ImportError:
+            pass
         page.on("response", on_response)
 
         try:
@@ -659,7 +698,10 @@ def _detect_detail_api(sample_urls: list) -> dict | None:
             return None
         # Must have name-like field
         has_name = any(k.lower() in ("nam", "name", "companyname", "company_name",
-                                      "businessname", "title")
+                                      "businessname", "title", "displayname",
+                                      "providername", "practicename", "firmname",
+                                      "restaurantname", "doctorname", "fullname",
+                                      "entityname", "officename", "attorneyname")
                        for k in data.keys())
         if not has_name:
             return None
@@ -791,6 +833,11 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=False)
         page = browser.new_page()
+        try:
+            from playwright_stealth import Stealth
+            Stealth().apply_stealth_sync(page)
+        except ImportError:
+            pass
 
         def _navigate_detail(url):
             """Navigate to a detail page URL — handles both regular and hash-fragment URLs.
@@ -895,11 +942,43 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
             print(f"  Phase 2: Crawling {remaining_count} remaining detail pages...")
 
         failed = 0
+        consecutive_429s = 0
+
+        # Adaptive throttle: tracks last N response times to adjust delay
+        recent_times = []
+        current_delay = DETAIL_CRAWL_DELAY_MAX  # start conservative
+
         for i, url in enumerate(remaining_urls):
             try:
+                t_start = time.time()
                 _navigate_detail(url)
+                response_time = time.time() - t_start
 
+                # Check for rate limiting (page might load but show a 429/403 message)
+                # If navigation itself threw, we'd be in the except block
                 html = page.content()
+
+                # Track response times (rolling window of last 10)
+                recent_times.append(response_time)
+                if len(recent_times) > 10:
+                    recent_times.pop(0)
+
+                # Adjust delay based on server speed
+                avg_time = sum(recent_times) / len(recent_times)
+                if consecutive_429s > 0:
+                    # Back off: double delay for each consecutive 429, cap at 5s
+                    current_delay = min(5.0, DETAIL_CRAWL_DELAY_MAX * (2 ** consecutive_429s))
+                elif avg_time < 0.3 and len(recent_times) >= 5:
+                    # Server is fast — reduce delay (floor 0.15s)
+                    current_delay = max(0.15, avg_time * 0.5)
+                elif avg_time < 0.8 and len(recent_times) >= 5:
+                    # Server is moderate — use shorter delay
+                    current_delay = max(0.3, avg_time * 0.6)
+                else:
+                    # Server is slow or we don't have enough data yet — stay conservative
+                    current_delay = DETAIL_CRAWL_DELAY_MAX
+
+                consecutive_429s = 0  # reset on success
 
                 if use_regex_fallback:
                     member = regex_extract_from_detail_html(html, domain)
@@ -917,13 +996,19 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
                 done = i + 1
                 if done % 25 == 0 or done == remaining_count:
                     print(f"    Progress: {done}/{remaining_count} pages crawled "
-                          f"({len(all_members)} members extracted)")
+                          f"({len(all_members)} members extracted, delay={current_delay:.2f}s)")
 
-                time.sleep(random.uniform(DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX))
+                time.sleep(current_delay + random.uniform(0, 0.15))
 
             except Exception as e:
                 failed += 1
-                if failed <= 5:
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str or "too many" in err_str:
+                    consecutive_429s += 1
+                    current_delay = min(5.0, DETAIL_CRAWL_DELAY_MAX * (2 ** consecutive_429s))
+                    print(f"    Rate limited! Backing off to {current_delay:.1f}s delay")
+                    time.sleep(current_delay)
+                elif failed <= 5:
                     print(f"    Error crawling page {i + 1}: {e}")
                 elif failed == 6:
                     print(f"    (suppressing further error messages)")

@@ -13,80 +13,90 @@ const LinkedInIcon = ({ size = 16, color = "currentColor" }) => (
   </svg>
 );
 
-/* ── Bouncing Ball Component ── */
+/* ── Bouncing Ball — sucked into the black hole with spaghettification ── */
 function BouncingBall({ type, onDone }) {
   const ballRef = useRef(null);
   const animRef = useRef(null);
   const state = useRef({
     x: Math.random() * (window.innerWidth - 60) + 30,
-    y: window.innerHeight * 0.7,
-    vx: (Math.random() > 0.5 ? 1 : -1) * (3 + Math.random() * 4),
-    vy: -(8 + Math.random() * 4),
-    gravity: 0.35,
-    dampening: 0.75,
-    friction: 0.995,
+    y: window.innerHeight * 0.8,
+    vx: (Math.random() > 0.5 ? 1 : -1) * (2 + Math.random() * 3),
+    vy: -(6 + Math.random() * 4),
     radius: 20,
   });
 
   useEffect(() => {
     const s = state.current;
-    let ticks = 0;
-    const maxTicks = 600; // ~10 seconds at 60fps
+    const cx = window.innerWidth / 2;
+    const cy = window.innerHeight / 2;
+    let consumed = false;
 
     const animate = () => {
-      s.vy += s.gravity;
-      s.vx *= s.friction;
+      // Gravitational pull — inverse square, violent near center
+      const dx = cx - s.x;
+      const dy = cy - s.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const force = 18000 / (dist * dist);
+      s.vx += (dx / dist) * force;
+      s.vy += (dy / dist) * force;
+      s.vx *= 0.997;
+      s.vy *= 0.997;
       s.x += s.vx;
       s.y += s.vy;
 
-      // Bounce off walls
-      if (s.x - s.radius < 0) { s.x = s.radius; s.vx = Math.abs(s.vx) * s.dampening; }
-      if (s.x + s.radius > window.innerWidth) { s.x = window.innerWidth - s.radius; s.vx = -Math.abs(s.vx) * s.dampening; }
-      // Bounce off ceiling
-      if (s.y - s.radius < 0) { s.y = s.radius; s.vy = Math.abs(s.vy) * s.dampening; }
-      // Bounce off floor
-      if (s.y + s.radius > window.innerHeight) {
-        s.y = window.innerHeight - s.radius;
-        s.vy = -Math.abs(s.vy) * s.dampening;
-        // Stop micro-bouncing
-        if (Math.abs(s.vy) < 1) s.vy = 0;
-      }
+      // Weak wall bounces — gravity wins eventually
+      const d = 0.7;
+      if (s.x - s.radius < 0) { s.x = s.radius; s.vx = Math.abs(s.vx) * d; }
+      if (s.x + s.radius > window.innerWidth) { s.x = window.innerWidth - s.radius; s.vx = -Math.abs(s.vx) * d; }
+      if (s.y - s.radius < 0) { s.y = s.radius; s.vy = Math.abs(s.vy) * d; }
+      if (s.y + s.radius > window.innerHeight) { s.y = window.innerHeight - s.radius; s.vy = -Math.abs(s.vy) * d; }
+
+      // Spaghettification — stretch toward center, shrink, fade
+      const pull = Math.max(0, 1 - dist / 400);
+      const scale = Math.max(0.05, 1 - pull * 0.95);
+      const opacity = Math.max(0.05, 1 - pull * 1.1);
+      const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+      const stretch = 1 + pull * 1.5;
+      const squash = Math.max(0.3, scale / (stretch * 0.7));
 
       if (ballRef.current) {
-        ballRef.current.style.transform = `translate(${s.x - s.radius}px, ${s.y - s.radius}px)`;
+        ballRef.current.style.transform =
+          `translate(${s.x - s.radius}px, ${s.y - s.radius}px) ` +
+          `rotate(${angle}deg) scale(${scale * stretch}, ${squash}) rotate(${-angle}deg)`;
+        ballRef.current.style.opacity = String(opacity);
       }
 
-      ticks++;
-      if (ticks < maxTicks && (Math.abs(s.vx) > 0.1 || Math.abs(s.vy) > 0.1 || s.y < window.innerHeight - s.radius - 1)) {
-        animRef.current = requestAnimationFrame(animate);
-      } else {
-        // Fade out then remove
+      // Consumed by the void
+      if (dist < 25 && !consumed) {
+        consumed = true;
         if (ballRef.current) ballRef.current.style.opacity = "0";
-        setTimeout(() => onDone(), 500);
+        setTimeout(() => onDone(), 200);
+        return;
       }
+
+      animRef.current = requestAnimationFrame(animate);
     };
 
     animRef.current = requestAnimationFrame(animate);
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
   }, [onDone]);
 
-  const color = type === "github" ? "#4a6b1a" : "#2a4a7a";
-  const iconColor = type === "github" ? "#7a9b3a" : "#5a8aba";
+  const color = type === "github" ? "#2a2a30" : "#2a2a3a";
+  const iconColor = type === "github" ? "#888" : "#999";
 
   return (
     <div ref={ballRef} style={{
       position: "fixed",
-      top: 0,
-      left: 0,
+      top: 0, left: 0,
       width: state.current.radius * 2,
       height: state.current.radius * 2,
       zIndex: 1,
       pointerEvents: "none",
-      transition: "opacity 0.5s",
+      willChange: "transform, opacity",
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
-      filter: `drop-shadow(0 0 4px ${color}40)`,
+      filter: `drop-shadow(0 0 6px ${color}60)`,
     }}>
       <div style={{
         width: "100%",
@@ -1012,10 +1022,183 @@ function RainbowMode({ onClose }) {
 }
 
 /* ───────────────────────────────────────────
+   KOCMOC Particle System — Spiral Decay
+   ─────────────────────────────────────────── */
+function ParticleCanvas() {
+  const canvasRef = useRef(null);
+  const particles = useRef(null);
+
+  useEffect(() => {
+    const cvs = canvasRef.current;
+    if (!cvs) return;
+    const ctx = cvs.getContext("2d");
+    let w = window.innerWidth, h = window.innerHeight;
+    cvs.width = w; cvs.height = h;
+
+    const cx = w / 2, cy = h / 2;
+    const N = 60;
+
+    // init particles in polar coords
+    if (!particles.current) {
+      particles.current = Array.from({ length: N }, () => {
+        const dist = 200 + Math.random() * Math.max(w, h) * 0.6;
+        return {
+          angle: Math.random() * Math.PI * 2,
+          dist,
+          speed: 0.005 + Math.random() * 0.015,
+          decay: 0.08 + Math.random() * 0.15,
+          size: Math.pow(Math.floor(Math.random() * 2) + 1, 3),
+          hasTrail: Math.random() < 0.3,
+        };
+      });
+    }
+
+    let raf;
+    const draw = () => {
+      ctx.clearRect(0, 0, w, h);
+      const ps = particles.current;
+      for (let i = 0; i < ps.length; i++) {
+        const p = ps[i];
+        // angular velocity increases as it gets closer (Kepler-like)
+        const angularSpeed = p.speed * (400 / Math.max(p.dist, 20));
+        p.angle += angularSpeed;
+        p.dist -= p.decay;
+
+        // respawn if consumed
+        if (p.dist < 10) {
+          p.dist = 200 + Math.random() * Math.max(w, h) * 0.5;
+          p.angle = Math.random() * Math.PI * 2;
+        }
+
+        const x = cx + Math.cos(p.angle) * p.dist;
+        const y = cy + Math.sin(p.angle) * p.dist;
+
+        // color: dim gray far → brighter white close
+        const t = Math.max(0, 1 - p.dist / 500);
+        const v = Math.round(100 + t * 120);
+        const r = v, g = v, b = v;
+        const a = 0.08 + t * 0.35;
+
+        // trail
+        if (p.hasTrail && p.dist < 300) {
+          const tx = cx + Math.cos(p.angle - angularSpeed * 8) * (p.dist + 6);
+          const ty = cy + Math.sin(p.angle - angularSpeed * 8) * (p.dist + 6);
+          ctx.beginPath();
+          ctx.moveTo(x, y);
+          ctx.lineTo(tx, ty);
+          ctx.strokeStyle = `rgba(${r},${g},${b},${a * 0.3})`;
+          ctx.lineWidth = 0.5;
+          ctx.stroke();
+        }
+
+        ctx.beginPath();
+        ctx.arc(x, y, p.size, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
+        ctx.fill();
+      }
+      raf = requestAnimationFrame(draw);
+    };
+
+    draw();
+
+    const onResize = () => {
+      w = window.innerWidth; h = window.innerHeight;
+      cvs.width = w; cvs.height = h;
+    };
+    window.addEventListener("resize", onResize);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", onResize); };
+  }, []);
+
+  return <canvas ref={canvasRef} style={{ position: "fixed", inset: 0, zIndex: 1, pointerEvents: "none" }} />;
+}
+
+
+/* ───────────────────────────────────────────
+   Glitch Text — Chromatic Aberration
+   ─────────────────────────────────────────── */
+function GlitchText({ children, style }) {
+  const [glitch, setGlitch] = useState(false);
+  const [clipA, setClipA] = useState("inset(0 0 100% 0)");
+  const [clipB, setClipB] = useState("inset(100% 0 0 0)");
+
+  useEffect(() => {
+    const trigger = () => {
+      const y1 = Math.random() * 80;
+      const y2 = y1 + 5 + Math.random() * 20;
+      setClipA(`inset(${y1}% 0 ${100 - y2}% 0)`);
+      setClipB(`inset(${y2}% 0 ${100 - y1 - 30}% 0)`);
+      setGlitch(true);
+      setTimeout(() => setGlitch(false), 100 + Math.random() * 100);
+    };
+    const interval = setInterval(trigger, 2000 + Math.random() * 4000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <span style={{ position: "relative", display: "inline-block", ...style }}>
+      {children}
+      {glitch && (
+        <>
+          <span style={{
+            position: "absolute", top: 0, left: -2,
+            color: "rgba(255,255,255,0.15)", clipPath: clipA,
+            pointerEvents: "none",
+          }}>{children}</span>
+          <span style={{
+            position: "absolute", top: 0, left: 2,
+            color: "rgba(160,160,160,0.1)", clipPath: clipB,
+            pointerEvents: "none",
+          }}>{children}</span>
+        </>
+      )}
+    </span>
+  );
+}
+
+
+/* ───────────────────────────────────────────
+   Status Bar — Bottom HUD
+   ─────────────────────────────────────────── */
+function StatusBar() {
+  const [time, setTime] = useState("");
+  const [entropy, setEntropy] = useState(99.7);
+
+  useEffect(() => {
+    const tick = () => {
+      const now = new Date();
+      setTime(`${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`);
+      setEntropy(99.7 + Math.sin(Date.now() / 3000) * 0.25);
+    };
+    tick();
+    const i = setInterval(tick, 1000);
+    return () => clearInterval(i);
+  }, []);
+
+  const mono = { fontFamily: "'Courier New', monospace", fontSize: 9, letterSpacing: 3, textTransform: "uppercase" };
+
+  return (
+    <div style={{
+      position: "fixed", bottom: 0, left: 0, right: 0,
+      height: 28, display: "flex", alignItems: "center",
+      justifyContent: "space-between", padding: "0 20px",
+      background: "#050505", borderTop: "1px solid #111",
+      zIndex: 20,
+    }}>
+      <span style={{ ...mono, color: "rgba(80,80,80,0.4)" }}>SYS.TIME: {time}</span>
+      <span style={{ ...mono, color: "rgba(120,120,120,0.2)" }}>◉ ACTIVE</span>
+      <span style={{ ...mono, color: "rgba(80,80,80,0.4)" }}>ENTROPY: {entropy.toFixed(1)}%</span>
+    </div>
+  );
+}
+
+
+/* ───────────────────────────────────────────
    Main App
    ─────────────────────────────────────────── */
 export default function App() {
-  const [mode, setMode] = useState("link");
+  const [mode, setMode] = useState("auto"); // "auto" | "direct" | "csv" | "enrich"
+  const [enrichFiles, setEnrichFiles] = useState([]);
+  const [enrichFile, setEnrichFile] = useState("");
   const [link, setLink] = useState("");
   const [fileName, setFileName] = useState(null);
   const [status, setStatus] = useState(null);
@@ -1070,6 +1253,16 @@ export default function App() {
     } catch { /* keep existing data on failure */ }
   }, []);
 
+  // Fetch available files when switching to enrich mode
+  useEffect(() => {
+    if (mode === "enrich") {
+      fetch("http://localhost:5000/phase2/files")
+        .then(r => r.ok ? r.json() : [])
+        .then(data => { if (data.length > 0) setEnrichFiles(data); })
+        .catch(() => {});
+    }
+  }, [mode]);
+
   const handleFile = (e) => {
     const f = e.target.files[0];
     if (f) setFileName(f.name);
@@ -1083,11 +1276,11 @@ export default function App() {
     setSessionId(null);
 
     try {
-      if (mode === "link") {
+      if (mode === "auto" || mode === "direct") {
         const res = await fetch("http://localhost:5000/scrape/single", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ link, debug: debugMode }),
+          body: JSON.stringify({ link, debug: debugMode, mode }),
         });
 
         const reader = res.body.getReader();
@@ -1147,6 +1340,50 @@ export default function App() {
         // If status wasn't set by an event (stream ended without complete/error)
         setStatus(prev => prev === "running" ? "done" : prev);
 
+      } else if (mode === "enrich") {
+        setTerminalLines([{ text: "Starting Phase 2 enrichment...", category: "SYSTEM" }]);
+        const res = await fetch("http://localhost:5000/phase2/enrich", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ json_file: enrichFile }),
+        });
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const chunks = buffer.split("\n\n");
+          buffer = chunks.pop();
+
+          for (const chunk of chunks) {
+            if (!chunk.startsWith("data: ")) continue;
+            try {
+              const event = JSON.parse(chunk.slice(6));
+              if (event.type === "session") {
+                setSessionId(event.session_id);
+              } else if (event.type === "log") {
+                setTerminalLines(prev => [...prev, { text: event.message, category: event.category }]);
+              } else if (event.type === "complete") {
+                setStatus(event.success ? "done" : "error");
+                setTerminalLines(prev => [...prev, {
+                  text: event.success
+                    ? `Done! Enriched ${event.enriched}/${event.records} records → ${event.output_file}`
+                    : "Enrichment completed with 0 results.",
+                  category: "SYSTEM",
+                }]);
+              } else if (event.type === "error") {
+                setStatus("error");
+                setTerminalLines(prev => [...prev, { text: `Error: ${event.message}`, category: "ERROR" }]);
+              }
+            } catch { /* ignore malformed chunks */ }
+          }
+        }
+        setStatus(prev => prev === "running" ? "done" : prev);
+
       } else if (mode === "csv") {
         const form = new FormData();
         form.append("file", fileRef.current.files[0]);
@@ -1187,27 +1424,28 @@ export default function App() {
     }
   };
 
-  const ready = mode === "link" ? link.trim().length > 0 : fileName !== null;
+  const ready = (mode === "auto" || mode === "direct") ? link.trim().length > 0
+    : mode === "enrich" ? enrichFile !== ""
+    : fileName !== null;
 
   return (
     <div style={{
       minHeight: "100vh",
-      background: "#0f0f0f",
+      background: "#050505",
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
-      fontFamily: "'Hacked', monospace",
+      fontFamily: "'Courier New', Courier, monospace",
+      overflow: "hidden",
+      position: "relative",
+      cursor: "crosshair",
     }}>
       <style>{`
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::placeholder { color: #555; }
+        ::placeholder { color: rgba(80,80,80,0.4); }
         input[type=file] { display: none; }
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
-        @keyframes blink {
-          50% { opacity: 0; }
-        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes blink { 50% { opacity: 0; } }
         @keyframes fadeIn {
           from { opacity: 0; transform: translateY(4px); }
           to { opacity: 1; transform: translateY(0); }
@@ -1224,154 +1462,379 @@ export default function App() {
           80% { transform: translateX(1px); }
           90% { transform: translateX(0); }
         }
-        .name-hover {
-          transition: color 0.15s, text-shadow 0.15s;
-          cursor: default;
+        @keyframes photonFlicker {
+          0%, 100% { opacity: 0.5; box-shadow: 0 0 30px 8px rgba(255,255,255,0.06), 0 0 60px 20px rgba(255,255,255,0.03); }
+          30% { opacity: 0.7; box-shadow: 0 0 40px 12px rgba(255,255,255,0.08), 0 0 80px 30px rgba(255,255,255,0.04); }
+          70% { opacity: 0.35; box-shadow: 0 0 25px 6px rgba(255,255,255,0.04); }
         }
+        @keyframes masterPulse {
+          0%, 100% { transform: translate(-50%, -50%) scale(1.0); }
+          50% { transform: translate(-50%, -50%) scale(1.03); }
+        }
+        @keyframes lensingPulse {
+          0%, 100% { transform: translate(-50%, -50%) scale(1.0); opacity: 0.7; }
+          50% { transform: translate(-50%, -50%) scale(1.08); opacity: 1; }
+        }
+        /* Accretion disk spins — each ring at different tilt and speed */
+        @keyframes diskSpin1 { to { transform: translate(-50%,-50%) rotateX(72deg) rotate(360deg); } }
+        @keyframes diskSpin2 { to { transform: translate(-50%,-50%) rotateX(74deg) rotate(-360deg); } }
+        @keyframes diskSpin3 { to { transform: translate(-50%,-50%) rotateX(70deg) rotate(360deg); } }
+        @keyframes diskSpin4 { to { transform: translate(-50%,-50%) rotateX(76deg) rotate(-360deg); } }
+        @keyframes diskSpin5 { to { transform: translate(-50%,-50%) rotateX(73deg) rotate(360deg); } }
+        @keyframes diskSpin6 { to { transform: translate(-50%,-50%) rotateX(71deg) rotate(-360deg); } }
+        /* Doppler beaming — one side brighter as matter approaches observer */
+        @keyframes dopplerGlow {
+          0%   { box-shadow: 8px 0 25px 4px rgba(255,255,255,0.08), -8px 0 15px 2px rgba(255,255,255,0.01); }
+          25%  { box-shadow: 0 8px 25px 4px rgba(255,255,255,0.08), 0 -8px 15px 2px rgba(255,255,255,0.01); }
+          50%  { box-shadow: -8px 0 25px 4px rgba(255,255,255,0.08), 8px 0 15px 2px rgba(255,255,255,0.01); }
+          75%  { box-shadow: 0 -8px 25px 4px rgba(255,255,255,0.08), 0 8px 15px 2px rgba(255,255,255,0.01); }
+          100% { box-shadow: 8px 0 25px 4px rgba(255,255,255,0.08), -8px 0 15px 2px rgba(255,255,255,0.01); }
+        }
+        @keyframes scanDrift {
+          0% { background-position: 0 0; }
+          100% { background-position: 0 4px; }
+        }
+        .name-hover { transition: color 0.15s, text-shadow 0.15s; cursor: default; }
         .name-hover:hover {
-          color: #f87171 !important;
-          text-shadow: 0 0 8px #f8717140;
+          color: rgba(255,255,255,0.6) !important;
+          text-shadow: 0 0 6px rgba(255,255,255,0.1);
           animation: shake 0.4s ease-in-out;
         }
         .social-link {
           transition: transform 0.2s ease, color 0.2s ease;
-          display: inline-flex;
-          align-items: center;
-          gap: 6px;
+          display: inline-flex; align-items: center; gap: 6px;
         }
-        .social-link:hover {
-          transform: scale(1.15);
-        }
-        .rainbow-wrapper {
-          position: relative;
-          width: 520px;
-          border-radius: 10px;
-          padding: 3px;
-          overflow: hidden;
-        }
-        .rainbow-wrapper::before {
-          content: '';
-          position: absolute;
-          inset: -50%;
-          background: conic-gradient(red, orange, yellow, green, blue, violet, red);
-          animation: spin 3s linear infinite;
-        }
-        /* Scrollbar styling for terminal */
-        ::-webkit-scrollbar { width: 4px; }
+        .social-link:hover { transform: scale(1.15); }
+        ::-webkit-scrollbar { width: 3px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+        ::-webkit-scrollbar-thumb { background:rgb(75, 75, 75); border-radius: 2px; }
       `}</style>
 
-      {/* ── Card ── */}
-      <div className="rainbow-wrapper">
+      {/* ── BLACK HOLE ── */}
+      <div style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none" }}>
+
+        {/* Gravitational Lensing Glow (outermost) */}
         <div style={{
-          position: "relative",
-          width: "100%",
-          background: "#1a1a1a",
-          borderRadius: 8,
-          padding: 40,
+          position: "absolute", top: "50%", left: "50%",
+          width: "80vmin", height: "80vmin", borderRadius: "50%",
+          background: "radial-gradient(circle, transparent 35%, rgba(255,255,255,0.02) 50%, rgba(200,200,200,0.015) 65%, transparent 85%)",
+          animation: "lensingPulse 4s ease-in-out infinite",
+        }} />
+
+        {/* Master pulse container — heartbeat */}
+        <div style={{
+          position: "absolute", top: "50%", left: "50%",
+          width: 0, height: 0,
+          animation: "masterPulse 5.5s ease-in-out infinite",
+        }}>
+
+          {/* === ACCRETION DISK — layered for depth === */}
+
+          {/* Outer glow haze — soft wide disk halo */}
+          <div style={{
+            position: "absolute", top: "50%", left: "50%",
+            width: 600, height: 600, borderRadius: "50%",
+            transform: "translate(-50%, -50%) rotateX(73deg)",
+            background: "radial-gradient(ellipse, transparent 30%, rgba(255,255,255,0.015) 50%, rgba(200,200,220,0.01) 65%, transparent 80%)",
+            filter: "blur(8px)",
+          }} />
+
+          {/* Disk rings — static, no spinning. Subtle concentric halos */}
+          {[
+            { size: 520, w: 1, color: "rgba(180,180,200,0.015)", blur: 6 },
+            { size: 460, w: 1, color: "rgba(200,200,220,0.025)", blur: 4 },
+            { size: 400, w: 1, color: "rgba(210,210,230,0.035)", blur: 3 },
+            { size: 340, w: 1.5, color: "rgba(230,230,240,0.05)", blur: 1 },
+            { size: 290, w: 1.5, color: "rgba(240,240,250,0.07)", blur: 0 },
+            { size: 250, w: 1.5, color: "rgba(255,255,255,0.09)", blur: 0 },
+          ].map((ring, i) => (
+            <div key={i} style={{
+              position: "absolute", top: "50%", left: "50%",
+              width: ring.size, height: ring.size, borderRadius: "50%",
+              border: `${ring.w}px solid ${ring.color}`,
+              background: "transparent",
+              transform: "translate(-50%, -50%) rotateX(73deg)",
+              filter: ring.blur ? `blur(${ring.blur}px)` : "none",
+            }} />
+          ))}
+
+          {/* === PHOTON RING — last light orbit === */}
+          <div style={{
+            position: "absolute", top: "50%", left: "50%",
+            transform: "translate(-50%, -50%)",
+            width: 185, height: 185, borderRadius: "50%",
+            border: "1.5px solid rgba(255,255,255,0.12)",
+            background: "transparent",
+            animation: "photonFlicker 2.5s ease-in-out infinite",
+          }} />
+
+          {/* === BLACK HOLE SHADOW — dark region that occludes the back half of the disk === */}
+          <div style={{
+            position: "absolute", top: "50%", left: "50%",
+            transform: "translate(-50%, -50%)",
+            width: 175, height: 175, borderRadius: "50%",
+            background: "radial-gradient(circle, #000 55%, rgba(0,0,0,0.95) 70%, rgba(0,0,0,0.6) 85%, transparent 100%)",
+            boxShadow: "0 0 60px 25px #000, 0 0 100px 40px rgba(0,0,0,0.7), 0 0 150px 60px rgba(0,0,0,0.3)",
+            zIndex: 1,
+          }} />
+
+          {/* === EVENT HORIZON — true black, nothing escapes === */}
+          <div style={{
+            position: "absolute", top: "50%", left: "50%",
+            transform: "translate(-50%, -50%)",
+            width: 140, height: 140, borderRadius: "50%",
+            background: "#000000",
+            boxShadow: "0 0 30px 10px #000, 0 0 60px 25px rgba(0,0,0,0.9)",
+            zIndex: 2,
+          }} />
+        </div>
+      </div>
+
+      {/* ── Particle System ── */}
+      <ParticleCanvas />
+
+      {/* ── Atmospheric Overlays ── */}
+      {/* Vignette */}
+      <div style={{
+        position: "fixed", inset: 0, zIndex: 15, pointerEvents: "none",
+        background: "radial-gradient(circle at center, transparent 30%, rgba(0,0,0,0.6) 100%)",
+      }} />
+      {/* Scan lines */}
+      <div style={{
+        position: "fixed", inset: 0, zIndex: 16, pointerEvents: "none",
+        backgroundImage: "repeating-linear-gradient(0deg, transparent 0px, transparent 2px, rgba(0,0,0,0.06) 2px, rgba(0,0,0,0.06) 4px)",
+        animation: "scanDrift 0.5s steps(2) infinite",
+      }} />
+      {/* (no red pulse — pure void) */}
+
+      {/* ── Main Card ── */}
+      <div style={{
+        position: "relative", zIndex: 10,
+        width: 460, maxWidth: "88vw",
+      }}>
+        <div style={{
+          background: "rgba(10,10,14,0.88)",
+          border: "1px solid rgba(200,200,200,0.18)",
+          borderRadius: 2,
+          padding: "32px 28px 28px",
+          backdropFilter: "blur(12px)",
+          boxShadow: "0 0 80px rgba(0,0,0,0.5), inset 0 1px 0 rgba(200,200,200,0.02)",
         }}>
 
           {/* Title */}
-          <div style={{ marginBottom: 32, fontFamily: "'Hacked'" }}>
-            <div style={{ fontSize: 11, color: "#555", letterSpacing: 3, textTransform: "uppercase", marginBottom: 6 }}>
+          <div style={{ marginBottom: 24 }}>
+            <div style={{
+              fontSize: 9, color: "rgba(200,200,200,0.45)", letterSpacing: 6,
+              textTransform: "uppercase", marginBottom: 6,
+            }}>
               UnderDeck
             </div>
-            <div style={{ fontSize: 28, color: "#fff", fontWeight: "bold", letterSpacing: 1 }}>
-              Scraper Bot
-            </div>
-            <div style={{ fontSize: 28, color: "#fff", fontWeight: "bold", letterSpacing: 1, marginBottom: 10 }}>
-              Created BY STEFAN :)
-            </div>
+            <GlitchText style={{
+              fontSize: 14, color: "rgba(220,220,220,0.75)", fontWeight: "bold",
+              letterSpacing: 10, textTransform: "uppercase",
+            }}>
+              SCRAPER BOT
+            </GlitchText>
           </div>
 
-          {/* Toggle */}
-          <div style={{ display: "flex", marginBottom: 28, border: "1px solid #2a2a2a", borderRadius: 6, overflow: "hidden" }}>
-            {["link", "csv"].map((m) => (
-              <button key={m} onClick={() => setMode(m)} style={{
-                flex: 1, padding: "10px 0",
-                background: mode === m ? "#fff" : "transparent",
-                color: mode === m ? "#0f0f0f" : "#555",
-                border: "none", fontFamily: "monospace", fontSize: 11,
-                letterSpacing: 2, textTransform: "uppercase",
-                cursor: "pointer", transition: "all 0.15s",
+          {/* Mode Tabs */}
+          <div style={{
+            display: "flex", marginBottom: 20,
+            borderBottom: "1px solid rgba(200,200,200,0.04)",
+          }}>
+            {[
+              { key: "auto", label: "Auto Discover" },
+              { key: "direct", label: "Direct Scrape" },
+              { key: "csv", label: "CSV" },
+              { key: "enrich", label: "Phase 2" },
+            ].map((tab) => (
+              <button key={tab.key} onClick={() => setMode(tab.key)} style={{
+                flex: 1, padding: "9px 0", border: "none",
+                fontFamily: "'Courier New', monospace", fontSize: 9,
+                letterSpacing: 3, textTransform: "uppercase",
+                cursor: "pointer", transition: "all 0.2s",
+                background: "transparent",
+                color: mode === tab.key ? "rgba(220,220,220,0.8)" : "rgba(150,150,150,0.4)",
+                position: "relative",
+                borderBottom: mode === tab.key ? "1px solid rgba(220,220,220,0.5)" : "1px solid transparent",
+                marginBottom: -1,
               }}>
-                {m === "link" ? "Single Link" : "CSV File"}
+                {tab.label}
               </button>
             ))}
           </div>
 
-          {/* Single Link Input */}
-          {mode === "link" && (
+          {/* Auto Discover Input */}
+          {mode === "auto" && (
             <div>
-              <div style={{ fontSize: 10, color: "#555", letterSpacing: 2, textTransform: "uppercase", marginBottom: 10 }}>
+              <div style={{ fontSize: 9, color: "rgba(180,180,180,0.7)", letterSpacing: 3, textTransform: "uppercase", marginBottom: 8 }}>
                 Target URL
               </div>
               <input
                 value={link}
                 onChange={(e) => setLink(e.target.value)}
-                placeholder="https://www.WeHaveTheBestUnderDeckTeamEver.com"
+                placeholder="https://example-association.org"
                 autoFocus
                 style={{
-                  width: "100%", background: "#111", border: "1px solid #2a2a2a",
-                  borderRadius: 4, color: "#fff", fontFamily: "monospace",
-                  fontSize: 13, padding: "12px 14px", outline: "none",
+                  width: "100%", background: "rgba(0,0,0,0.4)", border: "1px solid rgba(200,200,200,0.05)",
+                  borderRadius: 2, color: "rgba(220,220,220,0.85)", fontFamily: "'Courier New', monospace",
+                  fontSize: 11, padding: "11px 12px", outline: "none",
+                  transition: "border-color 0.3s",
                 }}
+                onFocus={e => e.target.style.borderColor = "rgba(200,200,200,0.2)"}
+                onBlur={e => e.target.style.borderColor = "rgba(200,200,200,0.05)"}
               />
+              <div style={{ fontSize: 8, color: "rgba(140,140,140,0.5)", marginTop: 5, letterSpacing: 2, textTransform: "uppercase" }}>
+                bot navigates to find the directory page
+              </div>
+            </div>
+          )}
+
+          {/* Direct Scrape Input */}
+          {mode === "direct" && (
+            <div>
+              <div style={{ fontSize: 9, color: "rgba(180,180,180,0.7)", letterSpacing: 3, textTransform: "uppercase", marginBottom: 8 }}>
+                Directory Page URL
+              </div>
+              <input
+                value={link}
+                onChange={(e) => setLink(e.target.value)}
+                placeholder="https://members.example.org/directory?search=all"
+                autoFocus
+                style={{
+                  width: "100%", background: "rgba(0,0,0,0.4)", border: "1px solid rgba(200,200,200,0.05)",
+                  borderRadius: 2, color: "rgba(220,220,220,0.85)", fontFamily: "'Courier New', monospace",
+                  fontSize: 11, padding: "11px 12px", outline: "none",
+                  transition: "border-color 0.3s",
+                }}
+                onFocus={e => e.target.style.borderColor = "rgba(200,200,200,0.2)"}
+                onBlur={e => e.target.style.borderColor = "rgba(200,200,200,0.05)"}
+              />
+              <div style={{ fontSize: 8, color: "rgba(140,140,140,0.5)", marginTop: 5, letterSpacing: 2, textTransform: "uppercase" }}>
+                skips navigation — scrapes page as-is
+              </div>
             </div>
           )}
 
           {/* CSV Upload */}
           {mode === "csv" && (
             <div>
-              <div style={{ fontSize: 10, color: "#555", letterSpacing: 2, textTransform: "uppercase", marginBottom: 10 }}>
+              <div style={{ fontSize: 9, color: "rgba(180,180,180,0.7)", letterSpacing: 3, textTransform: "uppercase", marginBottom: 8 }}>
                 Upload CSV
               </div>
               <div onClick={() => fileRef.current.click()} style={{
-                border: "1px dashed #2a2a2a", borderRadius: 4, padding: "28px",
-                textAlign: "center", cursor: "pointer", transition: "border-color 0.2s",
+                border: "1px dashed rgba(200,200,200,0.06)", borderRadius: 2, padding: "22px",
+                textAlign: "center", cursor: "pointer",
+                transition: "border-color 0.2s",
               }}>
                 <input type="file" accept=".csv" ref={fileRef} onChange={handleFile} />
                 {fileName
-                  ? <div style={{ color: "#a3e635", fontSize: 12 }}>📄 {fileName}</div>
-                  : <div style={{ color: "#555", fontSize: 11, letterSpacing: 1 }}>PLS UPLOAD .csv {">"}:) </div>
+                  ? <div style={{ color: "rgba(200,200,200,0.6)", fontSize: 10, letterSpacing: 2 }}>{fileName}</div>
+                  : <div style={{ color: "rgba(80,80,80,0.3)", fontSize: 9, letterSpacing: 2 }}>SELECT .CSV FILE</div>
                 }
               </div>
             </div>
           )}
 
-          {/* Debug Mode Toggle */}
-          <label style={{
-            display: "flex", alignItems: "center", gap: 8,
-            marginTop: 16, cursor: "pointer", userSelect: "none",
-          }}>
-            <div onClick={() => setDebugMode(!debugMode)} style={{
-              width: 16, height: 16,
-              border: `1px solid ${debugMode ? "#a3e635" : "#2a2a2a"}`,
-              borderRadius: 3, background: debugMode ? "#a3e635" : "transparent",
-              display: "flex", alignItems: "center", justifyContent: "center",
-              transition: "all 0.15s", cursor: "pointer",
-            }}>
-              {debugMode && <span style={{ color: "#0f0f0f", fontSize: 11, fontWeight: "bold", lineHeight: 1 }}>✓</span>}
-            </div>
-            <span style={{ color: "#555", fontSize: 10, letterSpacing: 2, textTransform: "uppercase" }}>
-              Debug Mode
-            </span>
-          </label>
+          {/* Phase 2 Enrich */}
+          {mode === "enrich" && (
+            <div>
+              <div style={{ fontSize: 9, color: "rgba(180,180,180,0.7)", letterSpacing: 3, textTransform: "uppercase", marginBottom: 8 }}>
+                Select Structured JSON
+              </div>
+              <select
+                value={enrichFile}
+                onChange={(e) => setEnrichFile(e.target.value)}
+                style={{
+                  width: "100%",
+                  background: "rgba(255,255,255,0.02)",
+                  border: "1px solid rgba(200,200,200,0.06)",
+                  borderRadius: 2, color: "rgba(200,200,200,0.6)",
+                  fontFamily: "'Courier New', monospace", fontSize: 10,
+                  padding: "10px 8px", outline: "none",
+                  letterSpacing: 1,
+                }}
+              >
+                <option value="" style={{ background: "#0a0a0a" }}>— select file —</option>
+                {enrichFiles.map((f) => (
+                  <option key={f.file} value={f.file} style={{ background: "#0a0a0a" }}>
+                    {f.file.replace("_structured.json", "")} — {f.count} records, {f.with_website} with website
+                  </option>
+                ))}
+              </select>
 
-          {/* Run Button */}
-          <button onClick={handleRun} disabled={!ready || status === "running"} style={{
-            width: "100%", marginTop: 20, padding: "14px",
-            background: ready && status !== "running" ? "#a3e635" : "#1a1a1a",
-            color: ready && status !== "running" ? "#0f0f0f" : "#333",
-            border: "1px solid #2a2a2a", borderRadius: 4,
-            fontFamily: "monospace", fontSize: 11, letterSpacing: 3,
-            textTransform: "uppercase", fontWeight: "bold",
-            cursor: ready && status !== "running" ? "pointer" : "not-allowed",
-            transition: "all 0.15s",
-          }}>
-            {status === "running" ? "Running..." : "run scrap →"}
-          </button>
+              {/* Stats for selected file */}
+              {enrichFile && (() => {
+                const sel = enrichFiles.find(f => f.file === enrichFile);
+                if (!sel) return null;
+                const stats = [
+                  { label: "HAVE WEBSITE", val: sel.with_website, total: sel.count, good: true },
+                  { label: "MISSING DESC", val: sel.missing_desc, total: sel.with_website },
+                  { label: "MISSING PHONE", val: sel.missing_phone, total: sel.with_website },
+                  { label: "MISSING EMAIL", val: sel.missing_email, total: sel.with_website },
+                  { label: "MISSING ADDR", val: sel.missing_addr, total: sel.with_website },
+                ];
+                return (
+                  <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(255,255,255,0.015)", border: "1px solid rgba(200,200,200,0.04)", borderRadius: 2 }}>
+                    <div style={{ fontSize: 8, color: "rgba(180,180,180,0.5)", letterSpacing: 3, textTransform: "uppercase", marginBottom: 8 }}>
+                      Enrichment Potential
+                    </div>
+                    {stats.map((s, i) => (
+                      <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                        <span style={{ fontSize: 9, color: "rgba(180,180,180,0.5)", letterSpacing: 2, fontFamily: "'Courier New', monospace" }}>
+                          {s.label}
+                        </span>
+                        <span style={{
+                          fontSize: 9, letterSpacing: 1, fontFamily: "'Courier New', monospace",
+                          color: s.good ? "rgba(160,230,120,0.7)" : s.val > 0 ? "rgba(220,180,100,0.7)" : "rgba(100,100,100,0.3)",
+                        }}>
+                          {s.val}/{s.total}
+                        </span>
+                      </div>
+                    ))}
+                    <div style={{ fontSize: 8, color: "rgba(120,120,120,0.35)", letterSpacing: 1, marginTop: 8, fontFamily: "'Courier New', monospace", lineHeight: 1.5 }}>
+                      Phase 2 visits each website to find: description, phone, email, address, social media, hours, services, team, founding year
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {/* Debug + Run Row */}
+          <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 18 }}>
+            <label style={{
+              display: "flex", alignItems: "center", gap: 6,
+              cursor: "pointer", userSelect: "none", flexShrink: 0,
+            }}>
+              <div onClick={() => setDebugMode(!debugMode)} style={{
+                width: 12, height: 12,
+                border: `1px solid ${debugMode ? "rgba(200,200,200,0.5)" : "rgba(200,200,200,0.08)"}`,
+                borderRadius: 1, background: debugMode ? "rgba(200,200,200,0.15)" : "transparent",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                transition: "all 0.15s", cursor: "pointer",
+              }}>
+                {debugMode && <span style={{ color: "rgba(200,200,200,0.8)", fontSize: 9, fontWeight: "bold", lineHeight: 1 }}>✓</span>}
+              </div>
+              <span style={{ color: "rgba(150,150,150,0.6)", fontSize: 8, letterSpacing: 3, textTransform: "uppercase" }}>
+                Debug
+              </span>
+            </label>
+
+            <button onClick={handleRun} disabled={!ready || status === "running"} style={{
+              flex: 1, padding: "10px",
+              background: ready && status !== "running" ? "rgba(220,220,220,0.12)" : "transparent",
+              color: ready && status !== "running" ? "rgba(220,220,220,0.75)" : "rgba(100,100,100,0.3)",
+              border: `1px solid ${ready && status !== "running" ? "rgba(220,220,220,0.25)" : "rgba(200,200,200,0.06)"}`,
+              borderRadius: 2,
+              fontFamily: "'Courier New', monospace", fontSize: 9, letterSpacing: 4,
+              textTransform: "uppercase", fontWeight: "bold",
+              cursor: ready && status !== "running" ? "pointer" : "not-allowed",
+              transition: "all 0.3s",
+            }}>
+              {status === "running" ? "TRANSMITTING..." : mode === "enrich" ? "ENRICH" : mode === "direct" ? "EXTRACT" : "INITIATE"}
+            </button>
+          </div>
 
           {/* ── Live Terminal ── */}
           {terminalLines.length > 0 && (
@@ -1385,14 +1848,14 @@ export default function App() {
           {/* Status bar */}
           {status && status !== "running" && (
             <div style={{
-              marginTop: 12, padding: "10px 14px", borderRadius: 4,
-              fontSize: 11, letterSpacing: 1,
-              background: status === "done" ? "#0a1a0a" : "#1a0a0a",
-              color: status === "done" ? "#a3e635" : "#f87171",
-              border: `1px solid ${status === "done" ? "#a3e63530" : "#f8717130"}`,
+              marginTop: 12, padding: "8px 12px", borderRadius: 2,
+              fontSize: 9, letterSpacing: 2, textTransform: "uppercase",
+              background: status === "done" ? "rgba(200,200,200,0.05)" : "rgba(200,200,200,0.07)",
+              color: status === "done" ? "rgba(200,200,200,0.65)" : "rgba(220,180,180,0.7)",
+              border: `1px solid ${status === "done" ? "rgba(200,200,200,0.1)" : "rgba(200,200,200,0.15)"}`,
             }}>
-              {status === "done" && "YAY :)))))). DONE!, check the Data-dump folder"}
-              {status === "error" && "Something went wrong, or unable to scrap."}
+              {status === "done" && "TRANSMISSION COMPLETE — CHECK DATA-DUMP"}
+              {status === "error" && "██████ SIGNAL LOST ██████"}
             </div>
           )}
 
@@ -1407,88 +1870,63 @@ export default function App() {
         <BouncingBall key={b.id} type={b.type} onDone={() => removeBall(b.id)} />
       ))}
 
-      {/* readme.md button */}
       {/* Scraped Sites button */}
       <div onClick={() => { setShowScraped(s => !s); if (!showScraped) fetchScrapedSites(); }} style={{
-        position: "fixed",
-        top: 20,
-        right: 130,
-        padding: "6px 14px",
-        background: "#0a0a0a",
-        border: "1px solid #222",
-        borderRadius: 4,
-        color: "#555",
-        fontFamily: "'Hacked', monospace",
-        fontSize: 10,
-        letterSpacing: 2,
-        cursor: "pointer",
-        transition: "all 0.2s",
+        position: "fixed", top: 16, right: 110,
+        padding: "4px 10px",
+        background: "rgba(8,8,10,0.8)",
+        border: "1px solid rgba(200,200,200,0.04)",
+        borderRadius: 1,
+        color: "rgba(80,80,80,0.4)",
+        fontFamily: "'Courier New', monospace",
+        fontSize: 8, letterSpacing: 3, textTransform: "uppercase",
+        cursor: "pointer", transition: "all 0.3s",
         zIndex: 50,
       }}
-        onMouseEnter={e => { e.currentTarget.style.color = "#a3e635"; e.currentTarget.style.borderColor = "#333"; }}
-        onMouseLeave={e => { e.currentTarget.style.color = "#555"; e.currentTarget.style.borderColor = "#222"; }}
+        onMouseEnter={e => { e.currentTarget.style.color = "rgba(200,200,200,0.5)"; e.currentTarget.style.borderColor = "rgba(200,200,200,0.15)"; }}
+        onMouseLeave={e => { e.currentTarget.style.color = "rgba(80,80,80,0.4)"; e.currentTarget.style.borderColor = "rgba(200,200,200,0.04)"; }}
       >
-        scraped [{scrapedSites.length || "·"}]
+        LOG [{scrapedSites.length || "·"}]
       </div>
 
       {/* Scraped Sites panel */}
       {showScraped && (
         <div style={{
-          position: "fixed",
-          top: 54,
-          right: 130,
-          width: 320,
-          maxHeight: "60vh",
-          background: "#111",
-          border: "1px solid #222",
-          borderRadius: 6,
-          overflow: "hidden",
-          zIndex: 100,
-          fontFamily: "'Hacked', monospace",
+          position: "fixed", top: 38, right: 110,
+          width: 280, maxHeight: "55vh",
+          background: "rgba(8,8,10,0.95)", border: "1px solid rgba(200,200,200,0.04)",
+          borderRadius: 2, overflow: "hidden",
+          zIndex: 100, fontFamily: "'Courier New', monospace",
         }}>
           <div style={{
-            padding: "10px 14px",
-            borderBottom: "1px solid #1a1a1a",
-            fontSize: 10,
-            letterSpacing: 2,
-            color: "#555",
+            padding: "8px 12px", borderBottom: "1px solid rgba(200,200,200,0.03)",
+            fontSize: 8, letterSpacing: 3, color: "rgba(80,80,80,0.4)",
             textTransform: "uppercase",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
+            display: "flex", justifyContent: "space-between", alignItems: "center",
           }}>
-            <span>scraped sites</span>
-            <span onClick={() => setShowScraped(false)} style={{ cursor: "pointer", color: "#333", fontSize: 14 }}>×</span>
+            <span>TRANSMISSION LOG</span>
+            <span onClick={() => setShowScraped(false)} style={{ cursor: "pointer", color: "rgba(80,80,80,0.3)", fontSize: 12 }}>×</span>
           </div>
-          <div style={{ overflowY: "auto", maxHeight: "calc(60vh - 40px)", padding: "6px 0" }}>
+          <div style={{ overflowY: "auto", maxHeight: "calc(55vh - 32px)", padding: "2px 0" }}>
             {scrapedSites.length === 0 && (
-              <div style={{ padding: "20px 14px", color: "#333", fontSize: 10, textAlign: "center", letterSpacing: 1 }}>
-                no sites scraped yet
+              <div style={{ padding: "16px 12px", color: "rgba(80,80,80,0.2)", fontSize: 8, textAlign: "center", letterSpacing: 2 }}>
+                NO TRANSMISSIONS RECORDED
               </div>
             )}
             {scrapedSites.map((site, i) => (
               <div key={i} style={{
-                padding: "8px 14px",
-                borderBottom: "1px solid #1a1a1a",
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                transition: "background 0.15s",
-                cursor: "default",
+                padding: "6px 12px", borderBottom: "1px solid rgba(200,200,200,0.02)",
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+                transition: "background 0.15s", cursor: "default",
               }}
-                onMouseEnter={e => e.currentTarget.style.background = "#1a1a1a"}
+                onMouseEnter={e => e.currentTarget.style.background = "rgba(200,200,200,0.02)"}
                 onMouseLeave={e => e.currentTarget.style.background = "transparent"}
               >
-                <span style={{ color: "#888", fontSize: 10, letterSpacing: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>
+                <span style={{ color: "rgba(140,140,140,0.3)", fontSize: 8, letterSpacing: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 190 }}>
                   {site.domain}
                 </span>
-                <span style={{
-                  color: site.count > 0 ? "#a3e635" : "#f87171",
-                  fontSize: 9,
-                  letterSpacing: 1,
-                  flexShrink: 0,
-                }}>
-                  {site.count > 0 ? `${site.count}` : "0"}
+                <span style={{ color: site.count > 0 ? "rgba(200,200,200,0.4)" : "rgba(200,200,200,0.2)", fontSize: 8, letterSpacing: 1, flexShrink: 0 }}>
+                  {site.count > 0 ? site.count : "NULL"}
                 </span>
               </div>
             ))}
@@ -1497,23 +1935,19 @@ export default function App() {
       )}
 
       <div onClick={() => setShowReadme(true)} style={{
-        position: "fixed",
-        top: 20,
-        right: 20,
-        padding: "6px 14px",
-        background: "rgb(0, 82, 3)",
-        border: "2px solidrgb(240, 0, 0)",
-        borderRadius: 4,
-        color: "#fff",
-        fontFamily: "'Hacked', monospace",
-        fontSize: 10,
-        letterSpacing: 2,
-        cursor: "pointer",
-        transition: "all 0.2s",
+        position: "fixed", top: 16, right: 16,
+        padding: "4px 10px",  
+        background: "rgba(8,8,10,0.8)",
+        border: "1px solid rgba(200,200,200,0.04)",
+        borderRadius: 1,
+        color: "rgba(80,80,80,0.4)",
+        fontFamily: "'Courier New', monospace",
+        fontSize: 8, letterSpacing: 3, textTransform: "uppercase",
+        cursor: "pointer", transition: "all 0.3s",
         zIndex: 50,
       }}
-        onMouseEnter={e => { e.currentTarget.style.color = "#888"; e.currentTarget.style.borderColor = "#333"; }}
-        onMouseLeave={e => { e.currentTarget.style.color = "#fff"; e.currentTarget.style.borderColor = "#1a1a1a"; }}
+        onMouseEnter={e => { e.currentTarget.style.color = "rgba(200,200,200,0.5)"; e.currentTarget.style.borderColor = "rgba(200,200,200,0.15)"; }}
+        onMouseLeave={e => { e.currentTarget.style.color = "rgba(80,80,80,0.4)"; e.currentTarget.style.borderColor = "rgba(200,200,200,0.04)"; }}
       >
         readme.md
       </div>
@@ -1524,44 +1958,39 @@ export default function App() {
       {/* Rainbow mode overlay */}
       {rainbowActive && <RainbowMode onClose={() => setRainbowActive(false)} />}
 
-      {/* Footer */}
+      {/* Status Bar */}
+      <StatusBar />
+
+      {/* Credits — above status bar */}
       <div style={{
-        position: "fixed",
-        bottom: 0,
-        left: 0,
-        right: 0,
-        padding: "16px 0",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 8,
-        fontFamily: "'Hacked', monospace",
-        zIndex: 10,
+        position: "fixed", bottom: 32, left: 0, right: 0,
+        display: "flex", flexDirection: "column", alignItems: "center", gap: 5,
+        fontFamily: "'Courier New', monospace", zIndex: 18, pointerEvents: "none",
       }}>
-        <div style={{ fontSize: 10, letterSpacing: 3, color: "#2a2a2a" }}>
+        <div style={{ fontSize: 8, letterSpacing: 4, color: "rgba(80,80,80,0.2)", textTransform: "uppercase" }}>
           built by{" "}
-          <span className="name-hover" style={{ color: "#444" }}>
+          <span className="name-hover" style={{ color: "rgba(140,140,140,0.25)", pointerEvents: "auto" }}>
             Stefan O'Leary
           </span>
         </div>
-        <div style={{ display: "flex", gap: 20, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 14, alignItems: "center", pointerEvents: "auto" }}>
           <a href="https://github.com/StefanIsCool1/UnderDeckScraper" target="_blank" rel="noopener noreferrer"
             className="social-link"
-            style={{ color: "#333", fontSize: 9, letterSpacing: 2, textDecoration: "none", textTransform: "uppercase" }}
-            onMouseEnter={e => { e.currentTarget.style.color = "#a3e635"; spawnBall("github"); }}
-            onMouseLeave={e => { e.currentTarget.style.color = "#333"; }}
+            style={{ color: "rgba(80,80,80,0.25)", fontSize: 8, letterSpacing: 3, textDecoration: "none", textTransform: "uppercase" }}
+            onMouseEnter={e => { e.currentTarget.style.color = "rgba(200,200,200,0.5)"; spawnBall("github"); }}
+            onMouseLeave={e => { e.currentTarget.style.color = "rgba(80,80,80,0.25)"; }}
           >
-            <GitHubIcon size={14} color="currentColor" />
+            <GitHubIcon size={11} color="currentColor" />
             GitHub
           </a>
-          <span style={{ color: "#1a1a1a" }}>|</span>
+          <span style={{ color: "rgba(80,80,80,0.1)" }}>·</span>
           <a href="https://www.linkedin.com/in/stefan-o%27leary-b94079361" target="_blank" rel="noopener noreferrer"
             className="social-link"
-            style={{ color: "#333", fontSize: 9, letterSpacing: 2, textDecoration: "none", textTransform: "uppercase" }}
-            onMouseEnter={e => { e.currentTarget.style.color = "#60a5fa"; spawnBall("linkedin"); }}
-            onMouseLeave={e => { e.currentTarget.style.color = "#333"; }}
+            style={{ color: "rgba(80,80,80,0.25)", fontSize: 8, letterSpacing: 3, textDecoration: "none", textTransform: "uppercase" }}
+            onMouseEnter={e => { e.currentTarget.style.color = "rgba(200,200,200,0.4)"; spawnBall("linkedin"); }}
+            onMouseLeave={e => { e.currentTarget.style.color = "rgba(80,80,80,0.25)"; }}
           >
-            <LinkedInIcon size={14} color="currentColor" />
+            <LinkedInIcon size={11} color="currentColor" />
             LinkedIn
           </a>
         </div>

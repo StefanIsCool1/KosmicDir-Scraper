@@ -9,6 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "Bot"))
 
 from Bot.main import scrape_directory
 from Bot.debug import debug
+from Phase2Bot.email_extractor import enrich_from_websites
 
 app = Flask(__name__)
 CORS(app,
@@ -72,10 +73,15 @@ def is_important_message(msg: str) -> bool:
 @app.route("/scrape/single", methods=["POST"])
 def scrape_single():
     """Stream scrape progress as SSE events. Supports interactive prompts."""
-    link = request.json.get("link")
+    link = request.json.get("link", "").strip()
     debug_mode = request.json.get("debug", False)
+    scrape_mode = request.json.get("mode", "auto")  # "auto" or "direct"
     if not link:
         return jsonify({"error": "No link"}), 400
+
+    # Normalize URL — add https:// if missing
+    if not link.startswith(("http://", "https://")):
+        link = "https://" + link
 
     session_id = str(uuid.uuid4())
     event_queue = queue.Queue()
@@ -119,7 +125,7 @@ def scrape_single():
 
         builtins.print = captured_print
         try:
-            members = scrape_directory(link, prompt_callback=prompt_via_frontend)
+            members = scrape_directory(link, prompt_callback=prompt_via_frontend, mode=scrape_mode)
             result = {
                 "type": "complete",
                 "success": len(members) > 0,
@@ -223,6 +229,109 @@ def scraped_sites():
                     count = 0
                 sites.append({"domain": domain, "file": f, "count": count})
     return jsonify(sites)
+
+
+@app.route("/phase2/files", methods=["GET"])
+def phase2_files():
+    """Return list of structured JSON files with enrichment potential stats."""
+    files = []
+    if os.path.isdir(DATA_DUMP):
+        for f in sorted(os.listdir(DATA_DUMP)):
+            if f.endswith("_structured.json") and not f.endswith("_detail_structured.json"):
+                try:
+                    with open(os.path.join(DATA_DUMP, f)) as fh:
+                        data = json.load(fh)
+                        if not isinstance(data, list):
+                            continue
+                        count = len(data)
+                        with_website = sum(1 for m in data if m.get("website"))
+                        missing_desc = sum(1 for m in data if m.get("website") and not m.get("description"))
+                        missing_phone = sum(1 for m in data if m.get("website") and not m.get("phone"))
+                        missing_email = sum(1 for m in data if m.get("website") and not any(c.get("email") for c in m.get("contacts", [])))
+                        missing_addr = sum(1 for m in data if m.get("website") and not m.get("street_address"))
+                except Exception:
+                    continue
+                files.append({
+                    "file": f,
+                    "count": count,
+                    "with_website": with_website,
+                    "missing_desc": missing_desc,
+                    "missing_phone": missing_phone,
+                    "missing_email": missing_email,
+                    "missing_addr": missing_addr,
+                })
+    return jsonify(files)
+
+
+@app.route("/phase2/enrich", methods=["POST"])
+def phase2_enrich():
+    """Run Phase 2 enrichment on a structured JSON file. Streams SSE progress."""
+    json_file = request.json.get("json_file", "").strip()
+    if not json_file:
+        return jsonify({"error": "No file specified"}), 400
+
+    json_path = os.path.join(DATA_DUMP, json_file)
+    if not os.path.isfile(json_path):
+        return jsonify({"error": f"File not found: {json_file}"}), 404
+
+    session_id = str(uuid.uuid4())
+    event_queue = queue.Queue()
+
+    active_sessions[session_id] = {
+        "queue": event_queue,
+        "response_event": threading.Event(),
+        "response_value": None,
+    }
+
+    def enrich_thread():
+        original_print = builtins.print
+
+        def captured_print(*args, **kwargs):
+            msg = " ".join(str(a) for a in args)
+            original_print(*args, **kwargs)
+            if is_important_message(msg):
+                event_queue.put({
+                    "type": "log",
+                    "message": msg.strip(),
+                    "category": classify_message(msg),
+                })
+
+        builtins.print = captured_print
+        try:
+            output_path = enrich_from_websites(json_path)
+            with open(output_path) as f:
+                results = json.load(f)
+            enriched_count = sum(1 for r in results if r.get("enrichment_status") == "enriched")
+            event_queue.put({
+                "type": "complete",
+                "success": enriched_count > 0,
+                "records": len(results),
+                "enriched": enriched_count,
+                "output_file": os.path.basename(output_path),
+            })
+        except Exception as e:
+            original_print(f"ERROR: {e}")
+            event_queue.put({"type": "error", "message": str(e)})
+        finally:
+            builtins.print = original_print
+            event_queue.put(None)
+            active_sessions.pop(session_id, None)
+
+    thread = threading.Thread(target=enrich_thread, daemon=True)
+    thread.start()
+
+    def stream():
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
+        while True:
+            try:
+                event = event_queue.get(timeout=600)
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+            except queue.Empty:
+                break
+
+    return Response(stream(), mimetype="text/event-stream")
 
 
 if __name__ == "__main__":
