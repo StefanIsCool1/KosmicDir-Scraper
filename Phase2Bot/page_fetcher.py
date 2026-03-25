@@ -10,13 +10,21 @@ import threading
 from curl_cffi.requests import Session
 from curl_cffi import CurlError
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote_plus, unquote
 
 REQUEST_TIMEOUT = 10
 RATE_LIMIT_DELAY = 0.5
 
 # Rotate browser fingerprints — each has a unique TLS/HTTP2 signature
-_IMPERSONATE_TARGETS = ["chrome", "chrome124", "chrome120", "chrome116", "chrome110", "safari", "safari15_5"]
+# curl_cffi v0.14: "chrome"/"safari"/"firefox" auto-select latest available version
+_IMPERSONATE_TARGETS = [
+    "chrome",       # auto-latest (currently chrome136)
+    "chrome136",    # explicit latest Chrome
+    "chrome124",    # slightly older — diversity helps avoid pattern detection
+    "safari",       # auto-latest (currently safari184)
+    "safari184",    # explicit latest Safari
+    "firefox",      # Firefox support added in v0.11+
+]
 
 # Headers that match a real browser navigation (do NOT set User-Agent — curl_cffi does that)
 _BROWSER_HEADERS = {
@@ -62,22 +70,41 @@ def _get_session(browser: str) -> Session:
     key = f"session_{browser}"
     session = getattr(_thread_local, key, None)
     if session is None:
-        session = Session(impersonate=browser, timeout=REQUEST_TIMEOUT)
+        session = Session(impersonate=browser, timeout=REQUEST_TIMEOUT)  # type: ignore[arg-type]
         setattr(_thread_local, key, session)
     return session
 
 
-def _make_request(url: str, browser: str, verify: bool = True):
-    """Single request attempt with a specific browser fingerprint."""
+def _make_request(url: str, browser: str, verify: bool = True,
+                   extra_fp: dict[str, bool] | None = None):
+    """Single request attempt with a specific browser fingerprint.
+    Optional extra_fp tweaks the TLS fingerprint (e.g. GREASE, extension permutation)."""
     session = _get_session(browser)
-    resp = session.get(url, headers=_BROWSER_HEADERS, allow_redirects=True,
-                       timeout=REQUEST_TIMEOUT, verify=verify)
-    return resp, resp.url
+    resp = session.get(
+        url,
+        headers=_BROWSER_HEADERS,
+        allow_redirects=True,
+        timeout=REQUEST_TIMEOUT,
+        verify=verify,
+        extra_fp=extra_fp,  # type: ignore[arg-type]
+    )
+    return resp, str(resp.url)
+
+# TLS tweaks that make the fingerprint look more like a real browser.
+# GREASE = Generate Random Extensions And Sustain Extensibility (Chrome does this).
+# Permuting extensions shuffles their order — defeats static JA3 blocklists.
+_EXTRA_FP_TWEAKS = {
+    "tls_permute_extensions": True,
+    "tls_grease": True,
+}
 
 
 def fetch_page(url: str) -> tuple[BeautifulSoup | None, str | None]:
     """Fetch a URL with browser TLS fingerprint impersonation.
-    Retries with a different fingerprint on 403.
+
+    Retry strategy on 403:
+      1. Different browser fingerprint
+      2. Same browser + TLS tweaks (GREASE + extension permutation)
     Returns (soup, final_url) or (None, None) on failure."""
     domain = urlparse(url).netloc
     now = time.time()
@@ -86,7 +113,7 @@ def fetch_page(url: str) -> tuple[BeautifulSoup | None, str | None]:
     if wait > 0:
         time.sleep(wait)
 
-    # Pick a random browser, keep a second one ready for retry
+    # Pick two random browsers for fingerprint diversity
     browsers = random.sample(_IMPERSONATE_TARGETS, min(2, len(_IMPERSONATE_TARGETS)))
 
     for attempt, browser in enumerate(browsers):
@@ -98,6 +125,24 @@ def fetch_page(url: str) -> tuple[BeautifulSoup | None, str | None]:
                 # Retry with different fingerprint
                 time.sleep(1)
                 continue
+
+            if resp.status_code == 403 and attempt == 1:
+                # Both fingerprints got 403 — try TLS tweaks as last resort
+                time.sleep(1)
+                try:
+                    resp, final_url = _make_request(url, browsers[0], extra_fp=_EXTRA_FP_TWEAKS)
+                    _last_request_time[domain] = time.time()
+                    if resp.status_code >= 400:
+                        print(f"    [403] {url[:60]}")
+                        return None, None
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "text/html" not in content_type and "application/xhtml" not in content_type:
+                        return None, None
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    return soup, final_url
+                except Exception:
+                    print(f"    [403] {url[:60]}")
+                    return None, None
 
             if resp.status_code in (403, 429, 503):
                 print(f"    [{resp.status_code}] {url[:60]}")
@@ -147,7 +192,7 @@ def discover_subpages(soup: BeautifulSoup, base_url: str) -> dict[str, str]:
 
     all_links = []
     for a in soup.find_all("a", href=True):
-        href = a["href"]
+        href = str(a["href"])
         text = a.get_text(strip=True).lower()
         resolved = _resolve_url(href, base_url)
         if not resolved:
@@ -193,6 +238,10 @@ def _resolve_url(href: str, base_url: str) -> str | None:
 
 # --- DUCKDUCKGO SEARCH FOR MISSING WEBSITES ---
 
+# --- DUCKDUCKGO SEARCH FOR MISSING WEBSITES ---
+# Uses curl_cffi with browser TLS impersonation to scrape DDG HTML results.
+# The duckduckgo-search library gets blocked because it lacks TLS fingerprinting.
+
 # Domains that are ABOUT companies but are NOT a company's own website
 _SKIP_DOMAINS = {
     "google.com", "google.co", "googleapis.com",
@@ -208,6 +257,10 @@ _SKIP_DOMAINS = {
     "nextdoor.com", "patch.com",
     "chamberofcommerce.com", "chambermaster.com",
     "growthzone.com", "micronet.com",
+    "apple.com", "microsoft.com", "reddit.com",
+    "tripadvisor.com", "healthgrades.com", "vitals.com",
+    "npidb.org", "opencorporates.com", "sec.gov",
+    "bizapedia.com", "buzzfile.com", "spoke.com",
 }
 
 # Business suffixes to strip when building company word set
@@ -219,6 +272,27 @@ _BUSINESS_SUFFIXES = {
     "pc", "pa", "dba",
 }
 
+# Generic industry words that appear in too many unrelated domains.
+# These should NOT be used for domain matching (too many false positives)
+# but ARE kept in the search query for context.
+_GENERIC_INDUSTRY_WORDS = {
+    "construction", "building", "builders", "electric", "electrical",
+    "plumbing", "roofing", "painting", "heating", "cooling", "hvac",
+    "landscaping", "cleaning", "concrete", "drywall", "flooring",
+    "remodeling", "renovation", "restoration", "demolition", "excavating",
+    "contracting", "contractor", "services", "solutions", "supply",
+    "industries", "industrial", "mechanical", "environmental",
+    "design", "designs", "homes", "home", "house", "properties",
+    "real", "estate", "realty", "mortgage", "insurance", "financial",
+    "management", "development", "systems", "technology", "technologies",
+    "engineering", "fabrication", "fabricators", "manufacturing",
+    "cabinets", "cabinetry", "windows", "doors", "fencing",
+    "paving", "welding", "steel", "iron", "wood", "lumber",
+    "pest", "defense", "quality", "custom", "premier", "advanced",
+    "national", "american", "western", "eastern", "northern", "southern",
+    "pro", "plus", "first", "best", "elite", "superior", "precision",
+}
+
 # Search rate limiting — reset per run, not global
 _search_stopped = False
 
@@ -226,20 +300,17 @@ _search_stopped = False
 def _build_company_words(company_name: str) -> set[str]:
     """Build a set of significant words from a company name for domain matching.
     Uses word-boundary splitting (not substring replace) to avoid mangling words."""
-    # Normalize: lowercase, replace punctuation with spaces
     name = company_name.lower()
     name = re.sub(r"[^\w\s]", " ", name)
     words = name.split()
-    # Remove business suffixes as whole words
     words = [w for w in words if w not in _BUSINESS_SUFFIXES]
-    # Keep words with 3+ chars (or digits like "84" in "84 Lumber")
     words = [w for w in words if len(w) >= 3 or (w.isdigit() and len(w) >= 2)]
     return set(words)
 
 
-def _extract_search_location(street_address: str) -> str:
-    """Extract city and state from address for search query context.
-    Returns string like 'St Cloud MN' or '' if can't parse."""
+def _extract_search_location(street_address: str | None) -> str:
+    """Extract city/state from address for search context.
+    Handles comma-separated, multi-line, and minimal address formats."""
     if not street_address:
         return ""
 
@@ -247,22 +318,172 @@ def _extract_search_location(street_address: str) -> str:
     location_parts = []
 
     for part in parts:
-        # Skip parts that look like street addresses (start with number)
-        if re.match(r'^\d', part.strip()):
+        stripped = part.strip()
+        # Skip street address lines (start with number)
+        if re.match(r'^\d', stripped):
             continue
-        # Skip PO Box lines
-        if re.match(r'^po\s+box', part.strip(), re.IGNORECASE):
+        # Skip PO Box lines (handles "PO Box", "P.O. Box", "P.O BOX", etc.)
+        if re.match(r'^p\.?o\.?\s*box', stripped, re.IGNORECASE):
             continue
-        location_parts.append(part.strip())
+        # Skip if it's just a zip code
+        if re.match(r'^\d{5}(-\d{4})?$', stripped):
+            continue
+        location_parts.append(stripped)
 
-    # Return city + state parts (skip the street line)
+    # Try to extract state abbreviation from remaining text
+    # Handles "Kalispell MT 59901" → "Kalispell MT"
+    if not location_parts:
+        # Last resort: look for a 2-letter state code anywhere in the address
+        _NOT_STATES = {"PO", "US", "ST", "DR", "RD", "CT", "LN", "PL", "SW", "NW", "NE", "SE"}
+        for m in re.finditer(r'\b([A-Z]{2})\b', street_address):
+            if m.group(1) not in _NOT_STATES:
+                return m.group(1)
+
     return " ".join(location_parts) if location_parts else ""
+
+
+def _extract_source_root(source_domain: str | None) -> str | None:
+    """Get root domain from source (e.g. 'members.buildingflathead.com' → 'buildingflathead.com')."""
+    if not source_domain:
+        return None
+    src = source_domain.lower()
+    return ".".join(src.rsplit(".", 2)[-2:]) if src.count(".") >= 2 else src
 
 
 def reset_search_state():
     """Reset the search-stopped flag. Call at the start of each Phase 2 run."""
     global _search_stopped
     _search_stopped = False
+
+
+def _ddg_fetch_results(query: str) -> list[dict[str, str]]:
+    """Execute a DDG HTML search via curl_cffi (TLS-impersonated).
+
+    Returns list of result dicts with 'href' and 'title' keys.
+    The duckduckgo-search library gets blocked; curl_cffi doesn't.
+    """
+    global _search_stopped
+    if _search_stopped:
+        return []
+
+    search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+
+    # Rate limit — randomized to avoid pattern detection
+    time.sleep(random.uniform(1.5, 3.0))
+
+    browser = random.choice(_IMPERSONATE_TARGETS)
+    try:
+        session = _get_session(browser)
+        search_headers = {
+            **_BROWSER_HEADERS,
+            "Referer": "https://duckduckgo.com/",
+        }
+        resp = session.get(search_url, headers=search_headers,
+                           allow_redirects=True, timeout=REQUEST_TIMEOUT)
+
+        if resp.status_code in (429, 403):
+            print("    Search blocked, stopping website discovery")
+            _search_stopped = True
+            return []
+
+        if resp.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        results = []
+        for a in soup.select("a.result__a"):
+            href = str(a.get("href", ""))
+            title = a.get_text(strip=True)
+
+            # Extract actual URL from DDG redirect
+            if "uddg=" in href:
+                href = unquote(href.split("uddg=")[1].split("&")[0])
+            elif not href.startswith("http"):
+                continue
+
+            results.append({"href": href, "title": title})
+
+        return results
+
+    except (CurlError, Exception):
+        return []
+
+
+def _match_from_results(
+    results: list[dict[str, str]],
+    company_words: set[str],
+    source_root: str | None,
+) -> str | None:
+    """Find the best matching company website from search results."""
+    # Split words into distinctive vs generic to avoid false positives
+    # like "construction" matching "constructiondive.com"
+    distinctive = {w for w in company_words if w not in _GENERIC_INDUSTRY_WORDS and len(w) >= 3}
+    generic = {w for w in company_words if w in _GENERIC_INDUSTRY_WORDS and len(w) >= 3}
+
+    for r in results:
+        href = r.get("href", "")
+        if not href or not href.startswith("http"):
+            continue
+
+        try:
+            parsed = urlparse(href)
+            domain = parsed.netloc.lower().replace("www.", "")
+        except Exception:
+            continue
+
+        # Skip known non-company domains
+        if any(domain == skip or domain.endswith("." + skip) for skip in _SKIP_DOMAINS):
+            continue
+
+        if "duckduckgo" in domain:
+            continue
+
+        # Skip the source directory domain (compare root domains)
+        if source_root:
+            dom_root = ".".join(domain.rsplit(".", 2)[-2:]) if domain.count(".") >= 2 else domain
+            if source_root == dom_root:
+                continue
+
+        # Skip documents
+        if parsed.path.lower().endswith((".pdf", ".doc", ".docx", ".xls")):
+            continue
+
+        # Domain must contain a significant word from company name
+        domain_clean = domain.replace("-", "").replace(".", "")
+
+        def _word_matches_domain(word: str, dom: str) -> bool:
+            """Check if word matches in domain. Short words (< 5 chars) must appear
+            at the start of the domain or right after a digit — prevents 'star'
+            matching 'northstar' but allows '5starbuilders'."""
+            if word not in dom:
+                return False
+            if len(word) >= 5:
+                return True
+            # Short word — check position
+            idx = dom.find(word)
+            # At the very start of domain
+            if idx == 0:
+                return True
+            # After a digit (e.g. "5star", "84lumber")
+            if idx > 0 and dom[idx - 1].isdigit():
+                return True
+            return False
+
+        distinctive_matches = sum(1 for w in distinctive if _word_matches_domain(w, domain_clean))
+        generic_matches = sum(1 for w in generic if _word_matches_domain(w, domain_clean))
+
+        if distinctive:
+            # Has distinctive words — require at least ONE distinctive match
+            if distinctive_matches >= 1:
+                return f"{parsed.scheme}://{parsed.netloc}"
+        else:
+            # ALL words are generic (e.g. "Custom Homes LLC") —
+            # require at least TWO generic words to match in domain
+            if generic_matches >= 2:
+                return f"{parsed.scheme}://{parsed.netloc}"
+
+    return None
 
 
 def ddg_search_website(
@@ -274,105 +495,58 @@ def ddg_search_website(
 ) -> tuple[str | None, str]:
     """Search DuckDuckGo for a company's website using available data.
 
-    Returns (url_or_none, query_used).
-    Uses DuckDuckGo HTML search (no API key needed, less aggressive anti-bot).
+    Strategy:
+      1. Exact quoted company name + location + category (precise)
+      2. If no match: unquoted significant words + location (broader)
+
+    Returns (url_or_none, best_query_used).
     """
     global _search_stopped
     if _search_stopped:
         return None, ""
 
-    # Build search query with all available context
-    parts = [f'"{company_name}"']
+    company_words = _build_company_words(company_name)
+    if not company_words:
+        return None, ""
 
-    # Add city + state from address (not just last part — include city name)
+    source_root = _extract_source_root(source_domain)
     location = _extract_search_location(street_address)
+
+    # --- Attempt 1: Full company name + all context (no quotes) ---
+    parts = [company_name]
     if location:
         parts.append(location)
-
     if category and len(category) < 40:
         parts.append(category)
+    query1 = " ".join(parts)
 
-    query = " ".join(parts)
+    results1 = _ddg_fetch_results(query1)
+    if results1:
+        match = _match_from_results(results1, company_words, source_root)
+        if match:
+            return match, query1
 
-    from urllib.parse import quote_plus
-    search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    # --- Attempt 2: Cleaned name (no suffixes) + all context ---
+    # Strips "INC", "LLC", "OF WPB" etc. but keeps location + category
+    if _search_stopped:
+        return None, query1
 
-    # Rate limit — randomized to avoid pattern detection
-    time.sleep(random.uniform(1.5, 3.0))
+    broad_words = sorted(company_words, key=len, reverse=True)[:4]
+    parts2 = broad_words[:]
+    if location:
+        parts2.append(location)
+    if category and len(category) < 40:
+        parts2.append(category)
+    query2 = " ".join(parts2)
 
-    browser = random.choice(_IMPERSONATE_TARGETS)
-    try:
-        session = _get_session(browser)
-        resp = session.get(search_url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+    # Don't repeat if cleaning didn't change anything
+    if query2 == query1:
+        return None, query1
 
-        if resp.status_code in (429, 403):
-            print("    Search blocked, stopping website discovery")
-            _search_stopped = True
-            return None, query
+    results2 = _ddg_fetch_results(query2)
+    if results2:
+        match = _match_from_results(results2, company_words, source_root)
+        if match:
+            return match, query2
 
-        if resp.status_code != 200:
-            return None, query
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Build company name word set for domain matching
-        company_words = _build_company_words(company_name)
-
-        # DuckDuckGo results are in <a class="result__a"> tags
-        # The href contains a redirect: //duckduckgo.com/l/?uddg=ENCODED_URL&...
-        from urllib.parse import unquote
-        for a in soup.select("a.result__a"):
-            href = a.get("href", "")
-
-            # Extract actual URL from DDG redirect
-            if "uddg=" in href:
-                href = unquote(href.split("uddg=")[1].split("&")[0])
-            elif not href.startswith("http"):
-                continue
-
-            try:
-                parsed = urlparse(href)
-                domain = parsed.netloc.lower().replace("www.", "")
-            except Exception:
-                continue
-
-            # Skip known non-company domains
-            if any(skip in domain for skip in _SKIP_DOMAINS):
-                continue
-
-            # Skip DDG's own domains
-            if "duckduckgo" in domain:
-                continue
-
-            # Skip the source directory domain (we're looking for the COMPANY's site)
-            if source_domain and source_domain.lower() in domain:
-                continue
-
-            # Skip PDFs and documents
-            if parsed.path.lower().endswith((".pdf", ".doc", ".docx", ".xls")):
-                continue
-
-            # Validate: domain MUST contain a significant word from company name
-            # (link text alone is not enough — directory listings mention many companies)
-            # Strip hyphens and dots from domain for matching
-            domain_clean = domain.replace("-", "").replace(".", "")
-
-            # Check for ANY word match (3+ chars), not just 4+ chars
-            # This fixes "ABC Construction" where "abc" is only 3 chars
-            has_domain_match = any(
-                word in domain_clean
-                for word in company_words
-                if len(word) >= 3
-            )
-
-            if has_domain_match:
-                found_url = f"{parsed.scheme}://{parsed.netloc}"
-                return found_url, query
-
-        return None, query
-
-    except CurlError:
-        return None, query
-
-    except Exception:
-        return None, query
+    return None, query1

@@ -1102,9 +1102,9 @@ def trigger_search(page, results_list: list) -> bool:
     site_has_counter = count_type != "unknown"
 
     remaining = [
-        ("all", "all"),
-        ("a", "a"),
         ("wildcard_percent", "%"),
+        ("all", "all"),
+        ("a", "a"),             # always last — many sites default-show "A" entries
     ]
 
     for strat_name, strat_query in remaining:

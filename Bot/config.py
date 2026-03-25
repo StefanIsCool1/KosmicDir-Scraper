@@ -334,5 +334,28 @@ CATEGORY_URL_KEYWORDS = [
 # (if members are already visible, no need to iterate categories)
 CATEGORY_SKIP_VISIBLE_THRESHOLD = 3
 
+# --- RESOURCE BLOCKING ---
+# Block these resource types — the bot only uses JSON and HTML responses.
+# CSS is kept (needed for is_visible() checks and element positioning).
+# JS is kept (needed for SPAs, AJAX, form submission).
+# We ONLY block by resource type, not by domain — some sites detect
+# blocked analytics (anti-adblock) and refuse to show content.
+_BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
+
+
+def block_unnecessary_resources(page):
+    """Block images, fonts, and media to speed up page loads.
+    Call AFTER stealth setup, BEFORE navigation.
+    Only blocks by resource type — no domain blocking to avoid
+    triggering anti-adblock walls on directory sites."""
+    def _route_handler(route):
+        if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+            route.abort()
+        else:
+            route.continue_()
+
+    page.route("**/*", _route_handler)
+
+
 # --- SELECTOR CACHE ---
 SELECTOR_CACHE_FILENAME = "selector_cache.json"

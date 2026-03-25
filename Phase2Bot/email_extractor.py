@@ -60,12 +60,56 @@ FOUNDED_RE = re.compile(
 
 # --- EXTRACTION FUNCTIONS ---
 
+# Email prefixes ranked by contact relevance (lower = better)
+_EMAIL_PRIORITY = {
+    "info": 0, "contact": 0, "hello": 0, "inquiries": 0, "inquiry": 0,
+    "office": 1, "sales": 1, "general": 1,
+    "admin": 2, "support": 2, "help": 2,
+}
+# Prefixes that are never useful — hard-filtered (can't contact anyone through these)
+_EMAIL_JUNK_PREFIXES = {
+    "noreply", "no-reply", "donotreply", "do-not-reply",
+    "mailer-daemon", "postmaster", "root",
+    "unsubscribe", "bounce",
+}
+
+# Low-priority prefixes — kept but ranked last (tier 8)
+_EMAIL_LOW_PRIORITY_PREFIXES = {
+    "webmaster", "jobs", "careers", "recruiting", "hr",
+    "billing", "invoices", "payments",
+    "marketing", "newsletter", "news", "alerts", "feedback",
+}
+
+MAX_EMAILS = 10  # Keep top 10 most relevant
+
+
+def _email_sort_key(email: str) -> tuple[int, int, str]:
+    """Sort key: (priority_tier, is_generic, email).
+    Tier 0 = best contact emails, tier 3 = personal names, tier 8 = low-priority, tier 9 = unknown."""
+    prefix = email.split("@")[0].lower()
+    # Check known good prefixes
+    if prefix in _EMAIL_PRIORITY:
+        return (_EMAIL_PRIORITY[prefix], 0, email)
+    # Low-priority but still contactable (marketing@, billing@, etc.)
+    # Check BEFORE generic name check so "marketing" doesn't rank as a person's name
+    if prefix in _EMAIL_LOW_PRIORITY_PREFIXES:
+        return (8, 0, email)
+    # Personal name emails (john.smith@) — good, but rank below general inboxes
+    if "." in prefix or "_" in prefix:
+        return (3, 0, email)
+    # Single first-name emails (john@) — decent
+    if prefix.isalpha() and len(prefix) >= 3:
+        return (4, 0, email)
+    # Everything else
+    return (9, 0, email)
+
+
 def _extract_emails(soup):
-    """Extract unique emails from mailto: links and visible text."""
+    """Extract emails, ranked by contact relevance. Returns top 3."""
     emails = set()
 
     for a in soup.find_all("a", href=True):
-        href = a["href"]
+        href = str(a["href"])
         if href.lower().startswith("mailto:"):
             email = href[7:].split("?")[0].strip()
             if _EMAIL_RE.match(email):
@@ -75,27 +119,48 @@ def _extract_emails(soup):
     for m in _EMAIL_RE.finditer(text):
         emails.add(m.group().lower())
 
-    return [
-        e for e in sorted(emails)
+    # Filter blacklisted domains and junk prefixes
+    filtered = [
+        e for e in emails
         if not any(bl in e for bl in EMAIL_BLACKLIST)
+        and e.split("@")[0] not in _EMAIL_JUNK_PREFIXES
     ]
 
+    # Sort by relevance and return top results
+    filtered.sort(key=_email_sort_key)
+    return filtered[:MAX_EMAILS]
+
+
+MAX_PHONES_PER_PAGE = 5  # Cap to avoid scraping 50+ branch office numbers
 
 def _extract_phones(soup):
-    """Extract phones and fax. Returns (phones_list, fax_or_none)."""
+    """Extract phones and fax. Returns (phones_list, fax_or_none).
+    Prioritizes tel: links over regex matches. Capped to avoid location-list spam."""
     phones = []
     fax = None
+    seen_digits: set[str] = set()  # Track by digits-only to avoid dupes like "(555) 123-4567" vs "555-123-4567"
 
+    def _add_phone(number: str) -> bool:
+        digits = re.sub(r'\D', '', number)
+        if digits in seen_digits or len(digits) < 10:
+            return False
+        seen_digits.add(digits)
+        phones.append(number)
+        return True
+
+    # Priority 1: tel: links (intentionally marked as callable = primary numbers)
     for a in soup.find_all("a", href=True):
-        href = a["href"]
+        href = str(a["href"])
         if href.lower().startswith("tel:"):
             number = href[4:].strip()
             number = re.sub(r'[^\d+()-.\s]', '', number)
-            if len(re.sub(r'\D', '', number)) >= 10:
-                phones.append(number)
+            _add_phone(number)
 
+    # Priority 2: regex matches from page text (but capped)
     text = soup.get_text(separator="\n")
     for match in _PHONE_RE.finditer(text):
+        if len(phones) >= MAX_PHONES_PER_PAGE:
+            break
         start = max(0, match.start() - FAX_CONTEXT_WINDOW)
         context = text[start:match.start()].lower()
         number = match.group().strip()
@@ -103,10 +168,9 @@ def _extract_phones(soup):
             if not fax:
                 fax = number
         else:
-            if number not in phones:
-                phones.append(number)
+            _add_phone(number)
 
-    return phones, fax
+    return phones[:MAX_PHONES_PER_PAGE], fax
 
 
 def _extract_address(soup):
@@ -651,7 +715,7 @@ def enrich_from_websites(json_path, event_callback=None):
             record["enrichment_status"] = "error"
             return idx, record, None
 
-    results = [None] * len(enrichable)
+    results: list[dict | None] = [None] * len(enrichable)
     success = 0
     failed = 0
 
@@ -726,7 +790,7 @@ def enrich_from_websites(json_path, event_callback=None):
         except Exception as e:
             log(f"  Failed to update original JSON: {e}")
 
-    ddg_count = sum(1 for r in results if r.get("website_source") == "ddg_search")
+    ddg_count = sum(1 for r in results if r and r.get("website_source") == "ddg_search")
     log(f"Done! {len(results)} records → {basename}")
     log(f"  Enriched: {success} | Failed: {failed} | Skipped: {len(complete)}")
     if ddg_count:

@@ -30,6 +30,7 @@ from config import (
     DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX,
     DETAIL_SAMPLE_COUNT, DETAIL_URL_KEYWORDS,
     NETWORK_IDLE_TIMEOUT, EXTERNAL_SKIP_DOMAINS,
+    block_unnecessary_resources,
 )
 from html_parser import strip_junk, regex_extract_from_card, _merge_member_data
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
@@ -657,9 +658,16 @@ def _detect_detail_api(sample_urls: list) -> dict | None:
         page = browser.new_page()
         try:
             from playwright_stealth import Stealth
-            Stealth().apply_stealth_sync(page)
+            Stealth(
+                webgl_vendor=True,
+                webgl_renderer_override="Intel Iris OpenGL Engine",
+                webgl_vendor_override="Intel Inc.",
+                navigator_hardware_concurrency=True,
+                sec_ch_ua=True,
+            ).apply_stealth_sync(page)
         except ImportError:
             pass
+        block_unnecessary_resources(page)
         page.on("response", on_response)
 
         try:
@@ -835,9 +843,16 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
         page = browser.new_page()
         try:
             from playwright_stealth import Stealth
-            Stealth().apply_stealth_sync(page)
+            Stealth(
+                webgl_vendor=True,
+                webgl_renderer_override="Intel Iris OpenGL Engine",
+                webgl_vendor_override="Intel Inc.",
+                navigator_hardware_concurrency=True,
+                sec_ch_ua=True,
+            ).apply_stealth_sync(page)
         except ImportError:
             pass
+        block_unnecessary_resources(page)
 
         def _navigate_detail(url):
             """Navigate to a detail page URL — handles both regular and hash-fragment URLs.

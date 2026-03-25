@@ -24,6 +24,9 @@ from html_parser import parse_member_html
 from cleaner import clean_members
 from detail_crawler import crawl_detail_pages
 
+# Fields that can only be found via Phase 2 (website enrichment), not detail pages.
+PHASE2_ONLY_FIELDS = {"social_media"}
+
 
 def normalize_json_member(raw: dict) -> dict:
     """Map common API field names to our standard schema.
@@ -355,16 +358,77 @@ def prompt_detail_crawl(detail_url_count: int) -> bool:
         print("  Please enter 'y' or 'n'.")
 
 
-def scrape_directory(url: str, prompt_callback=None, mode: str = "auto") -> list:
+def _check_fields_from_raw(results: list) -> set:
+    """Quick-check which fields exist in raw captured JSON responses.
+    Looks at the first few JSON member records without full parsing."""
+    fields = {"name"}
+    found_keys = set()
+
+    for result in results:
+        data = result.get("data", {})
+        records = []
+        if isinstance(data, list) and len(data) >= 3:
+            records = data[:10]
+        elif isinstance(data, dict):
+            for val in data.values():
+                if isinstance(val, list) and len(val) >= 3:
+                    records = val[:10]
+                    break
+        for record in records:
+            if isinstance(record, dict):
+                found_keys.update(k.lower().replace("_", "") for k in record.keys())
+
+    # Map raw JSON keys to our priority field names
+    if found_keys & {"phone", "mainphone", "phonenumber", "telephone"}:
+        fields.add("phone")
+    if found_keys & {"email", "emailaddress", "contactemail"}:
+        fields.add("email")
+    if found_keys & {"streetaddress", "address", "mailingaddress", "street", "city"}:
+        fields.add("address")
+    if found_keys & {"description", "about", "bio", "summary"}:
+        fields.add("description")
+    if found_keys & {"website", "url", "web", "homepage", "websiteurl"}:
+        fields.add("website")
+
+    return fields
+
+
+def _check_fields(members: list) -> set:
+    """Check which data fields are present across the member list (sample of first 20)."""
+    fields = {"name"}
+    if not members:
+        return fields
+    sample = members[:20]
+    if any(m.get("phone") for m in sample):
+        fields.add("phone")
+    if any(c.get("email") for m in sample for c in m.get("contacts", [])):
+        fields.add("email")
+    if any(m.get("street_address") or m.get("mailing_address") for m in sample):
+        fields.add("address")
+    if any(m.get("description") for m in sample):
+        fields.add("description")
+    if any(m.get("website") for m in sample):
+        fields.add("website")
+    return fields
+
+
+def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
+                     priority_fields: list | None = None) -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
         url: The directory URL to scrape.
         prompt_callback: Optional callback for interactive prompts (e.g. detail crawl y/n).
                          If None, falls back to terminal input() for CLI usage.
+                         Signature: prompt_callback(detail_url_count, message=None) -> bool
         mode: "auto" = find directory page + search (default)
               "direct" = skip navigation/search, scrape the page as-is
+        priority_fields: List of field names the user wants (e.g. ["email", "phone", "address"]).
+                         Used to make smarter detail crawl decisions.
     """
+    if priority_fields is None:
+        priority_fields = []
+
     domain = urlparse(url).netloc.replace(".", "_")
 
     # Set up output directory
@@ -375,7 +439,8 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto") -> list
 
     # --- Step 1: Browser automation — capture all responses ---
     with sync_playwright() as playwright:
-        results, detail_urls = capture_responses(playwright, url, mode=mode)
+        results, detail_urls = capture_responses(playwright, url, mode=mode,
+                                                  priority_fields=priority_fields)
 
     # --- Step 2: Save raw responses ---
     raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
@@ -384,17 +449,38 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto") -> list
         json.dump(results, f, indent=4)
 
     # --- Step 3: (Optional) Crawl nested detail pages ---
+    # Quick-check what fields are available in captured JSON (without full parse)
+    found_fields = _check_fields_from_raw(results)
+    # Exclude phase2-only fields from detail crawl decisions — detail pages can't provide them
+    crawl_relevant = set(priority_fields) - PHASE2_ONLY_FIELDS if priority_fields else set()
+    missing_for_crawl = crawl_relevant - found_fields if crawl_relevant else set()
+
     detail_members = []
     if detail_urls:
         should_crawl = False
-        if prompt_callback:
-            should_crawl = prompt_callback(len(detail_urls))
+
+        if priority_fields and not crawl_relevant:
+            # All selected priorities are phase2-only (e.g. social_media) — detail pages can't help
+            print(f"  Priority fields ({', '.join(priority_fields)}) require Phase 2 enrichment, skipping detail crawl")
+        elif crawl_relevant and not missing_for_crawl:
+            # All crawl-relevant priority fields already captured — skip detail crawl
+            print(f"  All priority fields already found ({', '.join(found_fields)}), skipping detail crawl")
+        elif prompt_callback:
+            # Build smart prompt with found/missing info
+            if crawl_relevant and missing_for_crawl:
+                msg = (
+                    f"Found: {', '.join(sorted(found_fields))}. "
+                    f"Missing: {', '.join(sorted(missing_for_crawl))}. "
+                    f"Found {len(detail_urls)} detail pages — crawl for missing fields? (y/n)"
+                )
+            else:
+                msg = None  # use default message
+            should_crawl = prompt_callback(len(detail_urls), msg)
         else:
             should_crawl = prompt_detail_crawl(len(detail_urls))
+
         if should_crawl:
             detail_members = crawl_detail_pages(detail_urls, domain)
-
-            # Save detail crawl results separately for debugging
             if detail_members:
                 detail_path = os.path.join(data_dump_dir, f"{domain}_detail_raw.json")
                 with open(detail_path, "w") as f:

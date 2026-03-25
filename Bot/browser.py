@@ -18,6 +18,7 @@ from config import (
     NEXT_BUTTON_SELECTORS, LOAD_MORE_SELECTORS,
     SCROLL_BATCH_SIZE, SCROLL_STALE_THRESHOLD,
     CATEGORY_SKIP_VISIBLE_THRESHOLD,
+    block_unnecessary_resources,
 )
 from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all
 from debug import debug
@@ -495,7 +496,8 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
     return pages_loaded
 
 
-def capture_responses(playwright: Playwright, link: str, mode: str = "auto") -> tuple[list, list]:
+def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
+                      priority_fields: list | None = None) -> tuple[list, list]:
     """Main browser automation entry point.
 
     Launches browser, navigates to directory page, captures all responses.
@@ -533,9 +535,18 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto") -> 
     # Apply stealth patches to avoid bot detection (Cloudflare, DataDome, etc.)
     try:
         from playwright_stealth import Stealth
-        Stealth().apply_stealth_sync(page)
+        Stealth(
+            webgl_vendor=True,
+            webgl_renderer_override="Intel Iris OpenGL Engine",
+            webgl_vendor_override="Intel Inc.",
+            navigator_hardware_concurrency=True,
+            sec_ch_ua=True,
+        ).apply_stealth_sync(page)
     except ImportError:
         pass
+
+    # Block images, fonts, media, analytics — bot only needs JSON + HTML
+    block_unnecessary_resources(page)
 
     def reset_idle_timer():
         """Reset the idle timer. Called each time a relevant response arrives.
@@ -873,7 +884,13 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto") -> 
                 for r in results
             )
 
-            if has_structured_json:
+            # If priority fields are set, always pass detail URLs through
+            # and let main.py decide based on what fields are actually missing.
+            # Without priorities, use the original heuristic checks.
+            if priority_fields:
+                detail_urls = detected
+                print(f"\n  Found {len(detail_urls)} member detail page links (priority fields requested)")
+            elif has_structured_json:
                 # JSON data exists — check if it has contact info
                 if is_shallow_data(results):
                     detail_urls = detected
@@ -883,9 +900,6 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto") -> 
                     print(f"  Detail links found but JSON data already has contact info — skipping")
             else:
                 # No JSON data — HTML only. Check if HTML has contact info.
-                # Sites like agcwa put full details (phone, email, address) right
-                # in the listing page HTML. Only trigger detail crawl if the HTML
-                # lacks contact signals.
                 if html_has_contact_info(results):
                     print(f"  Detail links found but HTML already has contact info — skipping")
                 else:
