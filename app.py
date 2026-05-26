@@ -10,6 +10,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "Bot"))
 from Bot.main import scrape_directory, PHASE2_ONLY_FIELDS
 from Bot.debug import debug
 from Phase2Bot.email_extractor import enrich_from_websites
+from DiscoveryBot import run_discovery
 
 app = Flask(__name__)
 CORS(app,
@@ -72,7 +73,14 @@ def is_important_message(msg: str) -> bool:
 
 
 def _check_fields_from_file(json_path):
-    """Check which data fields are present in a structured JSON file."""
+    """Check which data fields are *meaningfully* present in a structured
+    JSON file.
+
+    A field is considered "found" only when at least HALF the sampled
+    records have it — otherwise the Phase 2 enrichment trigger silently
+    skips even when ~90% of records are missing the field (which was the
+    pre-fix behavior of the `any(...)` check).
+    """
     fields = {"name"}
     try:
         with open(json_path) as f:
@@ -80,15 +88,21 @@ def _check_fields_from_file(json_path):
         if not isinstance(members, list) or not members:
             return fields
         sample = members[:20]
-        if any(m.get("phone") for m in sample):
+        n = len(sample)
+        threshold = max(1, n // 2)  # ≥50% of the sample must have it
+
+        def _count(predicate):
+            return sum(1 for m in sample if predicate(m))
+
+        if _count(lambda m: bool(m.get("phone"))) >= threshold:
             fields.add("phone")
-        if any(c.get("email") for m in sample for c in m.get("contacts", [])):
+        if _count(lambda m: any(c.get("email") for c in m.get("contacts", []))) >= threshold:
             fields.add("email")
-        if any(m.get("street_address") or m.get("mailing_address") for m in sample):
+        if _count(lambda m: bool(m.get("street_address") or m.get("mailing_address"))) >= threshold:
             fields.add("address")
-        if any(m.get("description") for m in sample):
+        if _count(lambda m: bool(m.get("description"))) >= threshold:
             fields.add("description")
-        if any(m.get("website") for m in sample):
+        if _count(lambda m: bool(m.get("website"))) >= threshold:
             fields.add("website")
     except Exception:
         pass
@@ -422,6 +436,321 @@ def phase2_enrich():
             active_sessions.pop(session_id, None)
 
     thread = threading.Thread(target=enrich_thread, daemon=True)
+    thread.start()
+
+    def stream():
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
+        while True:
+            try:
+                event = event_queue.get(timeout=600)
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+            except queue.Empty:
+                break
+
+    return Response(stream(), mimetype="text/event-stream")
+
+
+# --- PHASE 0: DISCOVERY → AUTO-SCRAPE ---
+
+
+@app.route("/discover", methods=["POST"])
+def discover():
+    """Phase 0 source discovery → auto-scrape via Phase 1.
+
+    Takes {"goal": "<free-form text>", "priority_fields": [...]}.
+    Streams SSE events:
+      - Phase 0 progress: stage / intent_parsed / discovery_query /
+        preflight_result / classified / discovery_complete
+      - Phase 1 progress (per directory): scrape_started / log / scrape_done
+      - Final: complete
+    """
+    goal = (request.json.get("goal") or "").strip()
+    priority_fields = request.json.get("priority_fields") or ["email", "phone"]
+    if not goal:
+        return jsonify({"error": "No goal provided"}), 400
+
+    session_id = str(uuid.uuid4())
+    event_queue = queue.Queue()
+
+    active_sessions[session_id] = {
+        "queue": event_queue,
+        "response_event": threading.Event(),
+        "response_value": None,
+    }
+
+    def discover_thread():
+        original_print = builtins.print
+
+        def captured_print(*args, **kwargs):
+            msg = " ".join(str(a) for a in args)
+            original_print(*args, **kwargs)
+            if is_important_message(msg):
+                event_queue.put({
+                    "type": "log",
+                    "message": msg.strip(),
+                    "category": classify_message(msg),
+                })
+
+        builtins.print = captured_print
+
+        def emit(event):
+            """Push a structured event into the SSE queue."""
+            event_queue.put(event)
+
+        try:
+            # --- Phase 0: Discovery ---
+            result = run_discovery(goal, event_cb=emit)
+
+            # If intent parsing said the message wasn't actionable, the
+            # pipeline already emitted a needs_clarification event. Stop
+            # cleanly so the stream closes and the user can reply again.
+            if result.get("needs_clarification"):
+                return
+
+            directories = result.get("directories", [])
+            websites = result.get("websites", [])
+
+            if not directories and not websites:
+                event_queue.put({
+                    "type": "complete",
+                    "success": False,
+                    "message": "No scrapable sources found for that goal.",
+                    "directories_scraped": 0,
+                    "records": 0,
+                    "output_files": [],
+                    "websites": [],
+                    "stats": {
+                        "rejected_count": result.get("rejected_count", 0),
+                        "reject_reasons": result.get("reject_reasons", {}),
+                    },
+                })
+                return
+
+            # --- User confirmation gate ---
+            # Even when Phase 0 finds directories, give the user a chance to
+            # deselect ones they don't want before we burn time and tokens
+            # scraping them. We reuse the existing /scrape/respond plumbing
+            # (session_id + response_event) — the frontend posts the list of
+            # approved URLs as a JSON-encoded string in `value`.
+            if directories:
+                session_obj = active_sessions.get(session_id)
+                event_queue.put({
+                    "type": "confirmation_required",
+                    "directories": [
+                        {
+                            "url": d["url"],
+                            "title": d.get("title", ""),
+                            "needs_navigation": d.get("needs_navigation", False),
+                        }
+                        for d in directories
+                    ],
+                    "websites": [
+                        {"url": w["url"], "title": w.get("title", "")}
+                        for w in websites
+                    ],
+                })
+
+                # Block up to 10 minutes for the user to choose. If they
+                # close the tab or wait too long, treat it as "skip".
+                if session_obj:
+                    session_obj["response_event"].wait(timeout=600)
+                    response_value = session_obj.get("response_value") or ""
+                    session_obj["response_event"].clear()
+                    session_obj["response_value"] = None
+                else:
+                    response_value = ""
+
+                # Parse the response. Expected shapes:
+                #   "skip" / "cancel" / "" → user bailed
+                #   "all"                  → scrape every directory
+                #   JSON list of URLs      → scrape just those
+                rv = (response_value or "").strip()
+                selected_urls: set[str] | None = None
+
+                if rv.lower() in ("skip", "cancel", "", "n", "no"):
+                    selected_urls = set()
+                elif rv.lower() in ("all", "y", "yes"):
+                    selected_urls = {d["url"] for d in directories}
+                else:
+                    try:
+                        parsed = json.loads(rv)
+                        if isinstance(parsed, list):
+                            selected_urls = {str(u) for u in parsed}
+                    except (json.JSONDecodeError, TypeError):
+                        selected_urls = set()
+
+                if not selected_urls:
+                    event_queue.put({
+                        "type": "complete",
+                        "success": False,
+                        "message": "Cancelled — no directories selected.",
+                        "directories_scraped": 0,
+                        "records": 0,
+                        "output_files": [],
+                        "websites": [w["url"] for w in websites],
+                        "per_site": [],
+                        "stats": {
+                            "rejected_count": result.get("rejected_count", 0),
+                            "reject_reasons": result.get("reject_reasons", {}),
+                        },
+                    })
+                    return
+
+                directories = [d for d in directories if d["url"] in selected_urls]
+                event_queue.put({
+                    "type": "confirmation_accepted",
+                    "selected_count": len(directories),
+                })
+
+            # --- Phase 1: Auto-scrape each directory ---
+            # We pass mode="direct" because Phase 0 already verified card
+            # structure exists on the URL. Prompts are auto-declined (batch
+            # mode — no human in the loop for detail crawl or Phase 2).
+            output_files = []
+            total_records = 0
+            per_site_results = []
+
+            def auto_decline(detail_url_count, message=None):
+                return False
+
+            def _check_skip():
+                """Check if the user requested a skip via the frontend."""
+                session = active_sessions.get(session_id)
+                if not session:
+                    return False
+                val = (session.get("response_value") or "").strip().lower()
+                if val == "skip":
+                    session["response_value"] = None
+                    session["response_event"].clear()
+                    return True
+                return False
+
+            for i, d in enumerate(directories):
+                url = d["url"]
+                # Always use auto mode. Phase 0 verified the URL belongs to
+                # a directory site, but the actual listing may be one click
+                # away (when DDG returned the homepage). Phase 1's AI
+                # navigator handles both cases uniformly.
+                scrape_mode = "auto"
+
+                # --- Skip gate: user can abort this directory before Phase 1 ---
+                if _check_skip():
+                    event_queue.put({
+                        "type": "scrape_skipped",
+                        "index": i,
+                        "total": len(directories),
+                        "url": url,
+                        "reason": "user_skipped",
+                    })
+                    continue
+
+                event_queue.put({
+                    "type": "scrape_started",
+                    "index": i,
+                    "total": len(directories),
+                    "url": url,
+                    "mode": scrape_mode,
+                })
+
+                try:
+                    members = scrape_directory(
+                        url,
+                        prompt_callback=auto_decline,
+                        mode=scrape_mode,
+                        priority_fields=priority_fields,
+                    )
+
+                    from urllib.parse import urlparse as _urlparse
+                    domain = _urlparse(url).netloc.replace(".", "_")
+                    structured_file = f"{domain}_structured.json"
+                    structured_path = os.path.join(DATA_DUMP, structured_file)
+                    record_count = len(members)
+                    total_records += record_count
+
+                    # --- Auto Phase 2 enrichment on each successful scrape ---
+                    enriched_count = 0
+                    output_file = structured_file
+                    if members and os.path.isfile(structured_path):
+                        # Re-check skip before expensive Phase 2
+                        if _check_skip():
+                            event_queue.put({
+                                "type": "log",
+                                "message": f"Skipping Phase 2 enrichment for {url} (user requested skip)",
+                                "category": "LOG",
+                            })
+                        else:
+                            event_queue.put({
+                                "type": "log",
+                                "message": f"Starting Phase 2 enrichment for {url}...",
+                                "category": "LOG",
+                            })
+                            try:
+                                enriched_path = enrich_from_websites(structured_path)
+                                output_file = os.path.basename(enriched_path)
+                                with open(enriched_path) as ef:
+                                    enriched_results = json.load(ef)
+                                enriched_count = sum(
+                                    1 for r in enriched_results
+                                    if r.get("enrichment_status") == "enriched"
+                                )
+                            except Exception as e:
+                                event_queue.put({
+                                    "type": "log",
+                                    "message": f"Phase 2 failed for {url}: {e}",
+                                    "category": "ERROR",
+                                })
+
+                    output_files.append(output_file)
+                    per_site_results.append({
+                        "url": url,
+                        "records": record_count,
+                        "enriched": enriched_count,
+                        "output_file": output_file,
+                    })
+
+                    event_queue.put({
+                        "type": "scrape_done",
+                        "index": i,
+                        "total": len(directories),
+                        "url": url,
+                        "records": record_count,
+                        "enriched": enriched_count,
+                        "output_file": output_file,
+                    })
+                except Exception as e:
+                    event_queue.put({
+                        "type": "scrape_error",
+                        "index": i,
+                        "total": len(directories),
+                        "url": url,
+                        "error": str(e),
+                    })
+
+            event_queue.put({
+                "type": "complete",
+                "success": total_records > 0,
+                "records": total_records,
+                "directories_scraped": len(directories),
+                "websites_found": len(websites),
+                "websites": [w["url"] for w in websites],
+                "output_files": output_files,
+                "per_site": per_site_results,
+                "stats": {
+                    "rejected_count": result.get("rejected_count", 0),
+                    "reject_reasons": result.get("reject_reasons", {}),
+                },
+            })
+        except Exception as e:
+            original_print(f"ERROR: {e}")
+            event_queue.put({"type": "error", "message": str(e)})
+        finally:
+            builtins.print = original_print
+            event_queue.put(None)  # sentinel
+            active_sessions.pop(session_id, None)
+
+    thread = threading.Thread(target=discover_thread, daemon=True)
     thread.start()
 
     def stream():

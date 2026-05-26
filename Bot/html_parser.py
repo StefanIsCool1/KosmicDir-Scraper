@@ -13,7 +13,6 @@ Strategy:
 
 import re
 import json
-import anthropic
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from collections import Counter
@@ -27,6 +26,7 @@ from config import (
 )
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
 from debug import debug
+from llm import ask
 
 
 # --- UTILITY FUNCTIONS ---
@@ -42,12 +42,40 @@ def is_layout_class(cls_string: str) -> bool:
     return False
 
 
+# Strong card-class hints: when an element's class contains one of these
+# substrings, treat it as a likely content card even if it has no <a> link.
+# Subset of CARD_CLASS_HINTS, intentionally narrower — excludes generic
+# words like "row" / "item" / "entry" that match layout grid cells too.
+_STRONG_CARD_CLASS_HINTS = {
+    "member", "listing", "card", "result", "company", "directory",
+    "profile", "vendor", "supplier", "contractor", "provider",
+    "doctor", "physician", "dentist", "attorney", "lawyer",
+    "restaurant", "clinic", "specialist", "consultant", "therapist",
+    "firm", "practice", "organization",
+}
+
+
+def _class_matches_strong_card_hint(el) -> bool:
+    """True if any of the element's classes contain a strong card-class hint."""
+    classes = " ".join(el.get("class") or []).lower()
+    return any(hint in classes for hint in _STRONG_CARD_CLASS_HINTS)
+
+
 def has_card_structure(el) -> bool:
     """Check if an element has enough structure to be a member card.
-    Needs at least one link and 2+ text elements."""
+
+    Normally requires at least one <a> link plus 2+ text elements. But
+    directory sites that render contact info as plain text (no link wrapper
+    on the phone, no `tel:` href) would otherwise be rejected. So when the
+    element's class strongly indicates a card (e.g. ".hoa-management-directory-result"),
+    we accept it without the link requirement.
+    """
     has_link = bool(el.find("a"))
-    text_tags = el.find_all(["p", "span", "h1", "h2", "h3", "h4", "h5", "address"])
-    return has_link and len(text_tags) >= 2
+    text_tags = el.find_all(["p", "span", "h1", "h2", "h3", "h4", "h5",
+                              "address", "strong", "b"])
+    if len(text_tags) < 2:
+        return False
+    return has_link or _class_matches_strong_card_hint(el)
 
 
 def strip_junk(soup: BeautifulSoup) -> BeautifulSoup:
@@ -492,14 +520,17 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
     for tag in CARD_CANDIDATE_TAGS:
         elements = soup.find_all(tag)
 
-        # Pre-filter: must have a link, 3+ child elements, and enough text.
-        # Use a lower text threshold (40 chars) for elements with schema.org
-        # markup, since some cards are sparse (just name + category).
+        # Pre-filter: 3+ child elements, enough text, AND (a link OR a strong
+        # card-class hint). The link requirement is bypassed when the class
+        # itself flags this as a card — necessary for directory sites that
+        # render contact info as plain text (e.g. hoa-usa.com's
+        # ".hoa-management-directory-result" cards have no <a> per row).
         elements = [
             el for el in elements
-            if el.find("a")
+            if (el.find("a") or _class_matches_strong_card_hint(el))
             and len(el.find_all()) >= 3
-            and (len(el.get_text(strip=True)) > 40 if _has_schema_markup(el)
+            and (len(el.get_text(strip=True)) > 40
+                 if (_has_schema_markup(el) or _class_matches_strong_card_hint(el))
                  else len(el.get_text(strip=True)) > 100)
         ]
 
@@ -590,13 +621,7 @@ def learn_selectors(raw_html: str, domain: str) -> dict:
     Called ONCE per domain, then the result is cached permanently."""
     sample, _card_selector = extract_sample_html(raw_html)
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": f"""Analyze this directory listing HTML sample and return CSS selectors for extracting data.
+    prompt = f"""Analyze this directory listing HTML sample and return CSS selectors for extracting data.
 This could be any type of directory (businesses, doctors, restaurants, attorneys, providers, etc.).
 
 Return ONLY a JSON object (no markdown) with these keys:
@@ -623,17 +648,18 @@ Rules:
 
 HTML SAMPLE:
 {sample}"""
-        }]
-    )
-
-    raw = response.content[0].text.strip()  # type: ignore
-    # Strip markdown fences if Haiku wrapped the response
+    raw = ask(prompt, max_tokens=1000).strip()
+    # Strip markdown fences if the model wrapped the response
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
 
-    selectors = json.loads(raw.strip())
+    try:
+        selectors = json.loads(raw.strip())
+    except json.JSONDecodeError as e:
+        print(f"  LLM returned non-JSON selectors for {domain}: {e}")
+        return {}
 
     # Don't cache useless selectors — Haiku couldn't find anything
     if not selectors.get("card_selector"):

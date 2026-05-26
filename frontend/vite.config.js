@@ -12,6 +12,8 @@ export default defineConfig({
       '/scrape': 'http://localhost:5000',
       '/phase2': 'http://localhost:5000',
       '/scraped-sites': 'http://localhost:5000',
+      '/discover': 'http://localhost:5000',
+      '/download': 'http://localhost:5000',
     },
   },
 })

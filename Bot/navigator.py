@@ -5,9 +5,9 @@ Handles: AI-based multi-depth directory URL discovery, smart search strategy,
 """
 
 import re
-import anthropic
 from urllib.parse import urlparse, parse_qs
 from debug import debug
+from llm import ask
 from config import (
     SEARCH_INPUT_SELECTORS,
     FORM_INPUT_SELECTORS,
@@ -16,6 +16,8 @@ from config import (
     RESULT_COUNT_SELECTORS,
     RESULT_LINK_SELECTORS, NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
     EXTERNAL_SKIP_DOMAINS, CATEGORY_URL_KEYWORDS, CATEGORY_SKIP_VISIBLE_THRESHOLD,
+    DIRECTORY_SEARCH_POSITIVE_CONTEXT, DIRECTORY_SEARCH_NEGATIVE_CONTEXT,
+    DIRECTORY_SEARCH_BUTTON_TEXTS, NON_DIRECTORY_BUTTON_TEXTS,
 )
 
 MAX_NAVIGATION_DEPTH = 3  # max clicks deep to find the directory page
@@ -108,13 +110,7 @@ def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool,
     if page_text:
         content_hint = f"\nVisible page content (preview):\n{page_text[:500]}\n"
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=100,
-        messages=[{
-            "role": "user",
-            "content": f"""I'm on {page_url} trying to find the directory or search/listing page (for businesses, members, doctors, restaurants, attorneys, providers, or any directory).
+    prompt = f"""I'm on {page_url} trying to find the directory or search/listing page (for businesses, members, doctors, restaurants, attorneys, providers, or any directory).
 {search_hint}{content_hint}
 Here are the links on this page:
 {link_list}
@@ -125,10 +121,7 @@ Is this already a directory, search, or listing page where I can find entries (c
 - If no directory exists, respond with ONLY: NONE
 
 Respond with a single word/command. Do not explain."""
-        }]
-    )
-
-    answer = response.content[0].text.strip().upper()  # type: ignore
+    answer = ask(prompt, max_tokens=100).strip().upper()
     print(f"  AI says: {answer}")
 
     # Parse the response — search anywhere in text, not just at the start.
@@ -298,6 +291,156 @@ def find_directory_url(page, link: str) -> str:
 
 # --- SEARCH INPUT & STRATEGIES ---
 
+def _extract_context(page, input_locator, submit_btn=None) -> dict:
+    """Extract rich surrounding context from the DOM around a search input.
+
+    Collects the nearest heading, the visible text of the containing form/table,
+    and the submit button's text. Everything is lowercased for keyword matching.
+
+    Returns a dict with keys: 'combined' (all text joined), 'heading',
+    'container', 'button_text', 'page_title'.
+    """
+    ctx = {"combined": "", "heading": "", "container": "", "button_text": "",
+           "page_title": ""}
+
+    # Page title
+    try:
+        ctx["page_title"] = page.title().lower()
+    except Exception:
+        pass
+
+    # Nearest heading (h1-h4) above the input
+    try:
+        heading = input_locator.evaluate("""el => {
+            let current = el;
+            for (let i = 0; i < 6 && current; i++) {
+                const prev = current.previousElementSibling;
+                if (prev) {
+                    const tag = prev.tagName?.toLowerCase();
+                    if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') {
+                        return prev.innerText.trim();
+                    }
+                    // Check if the previous sibling CONTAINS a heading
+                    const h = prev.querySelector('h1, h2, h3, h4');
+                    if (h) return h.innerText.trim();
+                }
+                current = current.parentElement;
+            }
+            // Fallback: nearest heading ancestor in DOM
+            const section = el.closest('section, article, main, div[id], div[class]');
+            if (section) {
+                const h = section.querySelector('h1, h2, h3, h4');
+                if (h) return h.innerText.trim();
+            }
+            return '';
+        }""")
+        ctx["heading"] = heading.lower() if heading else ""
+    except Exception:
+        pass
+
+    # Container text: walk up to find the closest form, table, section, or
+    # fieldset ancestor and grab its visible text (first 500 chars)
+    try:
+        container = input_locator.evaluate("""el => {
+            const container = el.closest('form, table, section, fieldset, '
+                + 'div[class*=\"search\"], div[class*=\"directory\"], '
+                + 'div[id*=\"search\"], div[id*=\"directory\"]');
+            if (container) return container.innerText.trim().substring(0, 500);
+            // Fallback: parent's parent (typical input > div > form layout)
+            const pp = el.parentElement?.parentElement;
+            if (pp) return pp.innerText.trim().substring(0, 500);
+            return '';
+        }""")
+        ctx["container"] = container.lower() if container else ""
+    except Exception:
+        pass
+
+    # Button text
+    if submit_btn is not None:
+        try:
+            btn_text = submit_btn.inner_text().strip().lower()
+            # Also check value attribute (for <input type="submit">)
+            if not btn_text:
+                btn_text = (submit_btn.get_attribute("value") or "").strip().lower()
+            ctx["button_text"] = btn_text
+        except Exception:
+            pass
+
+    # Join everything for easy substring matching
+    ctx["combined"] = " ".join(
+        v for v in [ctx["page_title"], ctx["heading"], ctx["container"],
+                     ctx["button_text"]] if v
+    )
+    return ctx
+
+
+def _score_search_context(ctx: dict, input_info: dict | None = None) -> int:
+    """Score how likely this input is a real directory search.
+
+    Scans the surrounding context (heading, container text, button text, page
+    title) against positive and negative keyword lists from config.py.
+
+    Also checks the input's own label / placeholder / name / id (input_info).
+
+    Returns:
+        Positive score → likely directory search.
+        Zero → neutral / not enough signal.
+        Negative score → likely a newsletter, login, contact-form, or site search.
+    """
+    score = 0
+    context_text = ctx.get("combined", "")
+
+    # --- Positive signals (+15 each) ---
+    for phrase in DIRECTORY_SEARCH_POSITIVE_CONTEXT:
+        if phrase in context_text:
+            score += 15
+            break  # one match is enough to green-light
+
+    # --- Negative signals (-15 each, composable with positives) ---
+    # Subtractive (not assignment) so strong positive evidence can
+    # counter-balance incidental negative bleed-through from the page header.
+    #
+    # Dedupe by substring: the list contains overlapping entries like
+    # "password" + "forgot password" + "forgot your password". A single
+    # "Forgot Password" link in the nav would otherwise count as 2-3 hits.
+    # Longer phrases win — if "forgot password" matches, ignore "password".
+    raw_hits = [p for p in DIRECTORY_SEARCH_NEGATIVE_CONTEXT if p in context_text]
+    raw_hits.sort(key=len, reverse=True)
+    unique_hits: list[str] = []
+    for p in raw_hits:
+        if not any(p in longer for longer in unique_hits):
+            unique_hits.append(p)
+    score -= 15 * len(unique_hits)
+
+    # --- Button text signals ---
+    btn = ctx.get("button_text", "")
+    if btn:
+        if any(t in btn for t in DIRECTORY_SEARCH_BUTTON_TEXTS):
+            score += 5
+        if any(t in btn for t in NON_DIRECTORY_BUTTON_TEXTS):
+            score -= 15
+
+    # --- Input's own label/placeholder/name/id ---
+    if input_info:
+        info_text = " ".join([
+            input_info.get("label", ""),
+            input_info.get("placeholder", ""),
+            input_info.get("name", ""),
+            input_info.get("id", ""),
+        ]).lower()
+        # Small bonus for directory-related field names
+        dir_hints = ["search", "find", "keyword", "directory", "member",
+                     "company", "doctor", "provider", "attorney", "restaurant"]
+        if any(h in info_text for h in dir_hints):
+            score += 5
+        # Small penalty for generic field names
+        generic_hints = ["q", "query", "s"]
+        if info_text.strip() in generic_hints:
+            pass  # neutral — too common to penalize
+
+    return score
+
+
 def find_search_input(page):
     """Locate the member directory search input on the page.
 
@@ -367,56 +510,76 @@ def find_search_input(page):
         except:
             info = {}
 
-        visible.append({"index": i, "info": info})
+        visible.append({"index": i, "info": info, "locator": inp})
 
     if not visible:
         return None
 
-    # Only one visible input — use it directly
-    if len(visible) == 1:
-        return all_matches.nth(visible[0]["index"])
+    # --- Score each candidate's surrounding context ---
+    # Reject inputs whose DOM context looks like a newsletter, login, or
+    # site-wide search (negative score).  Boost directory-search inputs.
+    for v in visible:
+        ctx = _extract_context(page, v["locator"])
+        score = _score_search_context(ctx, input_info=v["info"])
+        v["ctx_score"] = score
+        if score < -10:
+            label_hint = v["info"].get("label") or v["info"].get("placeholder") or v["info"].get("name") or "?"
+            print(f"  Rejecting input '{label_hint[:40]}' — context score {score} "
+                  f"(heading='{ctx.get('heading', '')[:60]}')")
 
-    # Multiple visible inputs — ask AI which is the directory search
-    print(f"  Found {len(visible)} search inputs, asking AI to pick...")
+    # Keep only non-rejected inputs
+    viable = [v for v in visible if v.get("ctx_score", 0) >= -10]
+    if not viable:
+        print("  All search inputs rejected by context — none look like directory search")
+        return None
+
+    # Only one viable input — use it directly
+    if len(viable) == 1:
+        score = viable[0]["ctx_score"]
+        label_hint = viable[0]["info"].get("label") or viable[0]["info"].get("placeholder") or "?"
+        print(f"  Using search input '{label_hint[:40]}' (context score {score})")
+        return all_matches.nth(viable[0]["index"])
+
+    # Multiple viable inputs — prefer ones with positive context scores
+    # for the AI selection, or just pick the highest-scored one
+    positive = [v for v in viable if v.get("ctx_score", 0) > 0]
+    candidates = positive if positive else viable
+
+    # Multiple candidates — ask AI which is the directory search
+    print(f"  Found {len(candidates)} viable search inputs (from {len(visible)} visible), "
+          f"asking AI to pick...")
 
     input_descriptions = "\n".join(
         f"{j}. placeholder='{v['info'].get('placeholder', '')}' "
         f"id='{v['info'].get('id', '')}' "
         f"name='{v['info'].get('name', '')}' "
         f"label='{v['info'].get('label', '')}' "
-        f"nearby='{v['info'].get('nearby', '')[:80]}'"
-        for j, v in enumerate(visible)
+        f"ctx_score={v.get('ctx_score', 0)}"
+        for j, v in enumerate(candidates)
     )
 
     try:
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=20,
-            messages=[{
-                "role": "user",
-                "content": f"""This page has multiple search inputs. Which one is the directory search (to search for listings — companies, people, providers, restaurants, etc.)?
+        prompt = f"""This page has multiple search inputs. Which one is the directory search (to search for listings — companies, people, providers, restaurants, etc.)?
 
 {input_descriptions}
 
 Return ONLY the number (e.g. "0" or "1")."""
-            }]
-        )
-
-        answer = response.content[0].text.strip()  # type: ignore
+        answer = ask(prompt, max_tokens=20).strip()
         match = re.match(r'^(\d+)', answer)
         if match:
             idx = int(match.group(1))
-            if 0 <= idx < len(visible):
-                chosen = visible[idx]
+            if 0 <= idx < len(candidates):
+                chosen = candidates[idx]
                 print(f"  AI picked input {idx}: {chosen['info'].get('placeholder', chosen['info'].get('id', ''))}")
                 return all_matches.nth(chosen["index"])
     except Exception as e:
         print(f"  AI input selection failed: {e}")
 
-    # Fallback — return the first visible one
-    print(f"  Falling back to first visible input")
-    return all_matches.nth(visible[0]["index"])
+    # Fallback — return the first viable one (prefer positive context score)
+    fallback = candidates[0]
+    print(f"  Falling back to first viable input: "
+          f"{fallback['info'].get('placeholder', fallback['info'].get('id', '?'))}")
+    return all_matches.nth(fallback["index"])
 
 
 def find_form_search(page):
@@ -542,8 +705,7 @@ def find_form_search(page):
 
     print(f"  Form search: found {len(visible_inputs)} form inputs")
 
-    # --- Pick the "name" field ---
-    # Score each input: prefer fields whose label/name/placeholder contains "name"
+    # --- Score each input: field-label heuristics + surrounding context ---
     best_input = None
     best_score = -1
 
@@ -574,6 +736,13 @@ def find_form_search(page):
         if any(w in combined for w in company_words):
             score -= 5
 
+        # --- Add surrounding-context score ---
+        ctx = _extract_context(page, v["locator"])
+        ctx_score = _score_search_context(ctx, input_info=info)
+        score += ctx_score
+        v["ctx"] = ctx
+        v["ctx_score"] = ctx_score
+
         if score > best_score:
             best_score = score
             best_input = v
@@ -582,7 +751,16 @@ def find_form_search(page):
         best_input = visible_inputs[0]
 
     input_label = best_input["info"].get("label") or best_input["info"].get("name") or "unknown"
-    print(f"  Form search: selected input '{input_label}' (score={best_score})")
+    print(f"  Form search: selected input '{input_label}' "
+          f"(field_score+ctx={best_score}, ctx={best_input.get('ctx_score', 0)})")
+
+    # --- Reject the entire form if the best input's context score is terrible ---
+    # (checked BEFORE submit-button search — uses heading + container text only)
+    if best_input.get("ctx_score", 0) < -10:
+        heading = best_input["ctx"].get("heading", "")
+        print(f"  Form search REJECTED — context looks non-directory "
+              f"(ctx_score={best_input['ctx_score']}, heading='{heading[:80]}')")
+        return None, None
 
     # --- Find the submit button ---
     # Look within the same form element first, then fall back to page-wide search
@@ -624,6 +802,16 @@ def find_form_search(page):
 
     if submit_btn is None:
         print(f"  Form search: no submit button found")
+        return None, None
+
+    # --- Final context check with submit button text ---
+    # Now that we have the button, re-extract context with it included
+    ctx_with_btn = _extract_context(page, best_input["locator"], submit_btn=submit_btn)
+    final_score = _score_search_context(ctx_with_btn, input_info=best_input["info"])
+    if final_score < -10:
+        btn_text = ctx_with_btn.get("button_text", "")
+        print(f"  Form search REJECTED — button text confirms non-directory "
+              f"(final_ctx={final_score}, btn='{btn_text}')")
         return None, None
 
     return best_input["locator"], submit_btn
@@ -773,20 +961,11 @@ def read_result_count(page, query: str = "") -> dict:
 
     # --- AI fallback: send more text (first 800 chars) for better coverage ---
     try:
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
-            messages=[{
-                "role": "user",
-                "content": f"""How many total results does this directory page show?
+        prompt = f"""How many total results does this directory page show?
 Reply ONLY: a number, "all", or "unknown".
 
 {text[:800]}"""
-            }]
-        )
-
-        answer = response.content[0].text.strip().lower()  # type: ignore
+        answer = ask(prompt, max_tokens=10).strip().lower()
         print(f"    AI result count: {answer}")
 
         if "all" in answer:

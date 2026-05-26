@@ -21,8 +21,9 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from browser import capture_responses
 from html_parser import parse_member_html
-from cleaner import clean_members
+from cleaner import clean_members, is_extraction_garbage
 from detail_crawler import crawl_detail_pages
+from cache import delete_cached_selectors
 
 # Fields that can only be found via Phase 2 (website enrichment), not detail pages.
 PHASE2_ONLY_FIELDS = {"social_media"}
@@ -270,6 +271,16 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
     # Clean and deduplicate all members
     all_members = clean_members(all_members)
 
+    # --- Quality gate: reject garbage extractions ---
+    # When the extractor scrapes navigation / content sections (not real
+    # member records), every "member" lacks contact data. Detect this and
+    # invalidate the cached selectors so future scrapes don't reuse them.
+    if is_extraction_garbage(all_members):
+        print(f"WARNING: Extraction appears to be garbage for {domain} — "
+              f"purging cached selectors and returning 0 members")
+        delete_cached_selectors(domain)
+        return []
+
     # --- Sanity checks ---
     if len(all_members) < 3:
         print(f"WARNING: Only {len(all_members)} members extracted for {domain} — scrape likely failed")
@@ -358,6 +369,33 @@ def prompt_detail_crawl(detail_url_count: int) -> bool:
         print("  Please enter 'y' or 'n'.")
 
 
+def _login_interactive(page, domain: str) -> bool:
+    """Interactive login handler for gated directories.
+
+    A browser window is already open showing the login page.  The user
+    logs in manually in that window, then presses Enter here to continue.
+    Cookies are saved automatically after login by capture_responses.
+
+    Returns True if the user logged in and wants to retry the scrape,
+    False to skip this directory entirely.
+    """
+    print(f"\n  A browser window should be open showing the login page.")
+    print(f"\n  → Log in manually in the browser window.")
+    print(f"  → Navigate to the directory/search page after logging in.")
+    print(f"  → Press Enter here to continue scraping.")
+    print(f"  → Or type 'skip' to abandon this directory.\n")
+
+    while True:
+        answer = input("  Press Enter when logged in, or type 'skip': ").strip().lower()
+        if answer == "":
+            print("  Continuing scrape with authenticated session...")
+            return True
+        if answer == "skip":
+            print("  Skipping this directory.")
+            return False
+        print("  Press Enter to continue or type 'skip'.")
+
+
 def _check_fields_from_raw(results: list) -> set:
     """Quick-check which fields exist in raw captured JSON responses.
     Looks at the first few JSON member records without full parsing."""
@@ -439,8 +477,11 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
 
     # --- Step 1: Browser automation — capture all responses ---
     with sync_playwright() as playwright:
-        results, detail_urls = capture_responses(playwright, url, mode=mode,
-                                                  priority_fields=priority_fields)
+        results, detail_urls = capture_responses(
+            playwright, url, mode=mode,
+            priority_fields=priority_fields,
+            login_callback=_login_interactive,
+        )
 
     # --- Step 2: Save raw responses ---
     raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
@@ -491,13 +532,10 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
     members = parse_and_save_results(results, data_dump_dir, domain,
                                      detail_members=detail_members)
 
-    # --- Step 5: If zero results, check for login wall ---
+    # --- Step 5: If zero results, warn (login gate already handled in browser) ---
     if len(members) == 0:
-        login_detected = _detect_login_wall(results)
-        if login_detected:
-            print("LOGIN WALL DETECTED — this directory likely requires authentication")
-            print("  The page contains login/password fields but no public member data.")
-            print("  To scrape gated directories, log in manually and use the direct URL.")
+        print("WARNING: 0 members extracted — the page may be login-gated "
+              "or the extraction strategy failed")
 
     return members
 

@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 # --- API KEYS ---
-# Set in .env file: ANTHROPIC_API_KEY=sk-ant-api03-...
+# Set in .env file: DEEPSEEK_API_KEY=sk-...
+# LLM client wiring lives in Bot/llm.py
 
 # --- TIMEOUTS ---
 DEFAULT_IDLE_TIMEOUT = 4        # seconds of silence before closing browser
@@ -87,6 +88,53 @@ PREFERRED_NAME_FIELD_LABELS = [
     "attorney name", "clinic name", "professional name",
 ]
 
+# --- SEARCH CONTEXT VALIDATION ---
+# Words/phrases found in the surrounding DOM context (label, nearby text, heading,
+# button text) that STRONGLY indicate the input is for a member/business directory search.
+# Each entry is scored +15 confidence.
+DIRECTORY_SEARCH_POSITIVE_CONTEXT = [
+    "member directory", "find a member", "search members", "member search",
+    "find a doctor", "doctor search", "physician directory", "physician search",
+    "find an attorney", "attorney search", "lawyer directory",
+    "find a restaurant", "restaurant search",
+    "find a provider", "provider directory", "provider search",
+    "company search", "business directory", "business search",
+    "search by name", "search by company", "search by keyword",
+    "browse members", "member listing", "directory search",
+    "find a dentist", "dentist search", "clinic search",
+    "search our directory", "search the directory",
+]
+
+# Words/phrases that STRONGLY indicate the input is NOT a directory search
+# (newsletter, login, contact-form, site-wide blog search, etc.).
+# Each entry is scored -15 confidence.
+DIRECTORY_SEARCH_NEGATIVE_CONTEXT = [
+    "newsletter", "subscribe", "email signup", "join our mailing list",
+    "enter your email", "sign up for", "signup",
+    "username", "password", "sign in", "log in", "login",
+    "forgot password", "forgot your password", "remember me",
+    "contact us", "send message", "get in touch", "your message",
+    "search site", "search website", "search blog", "search articles",
+    "search products", "search shop", "product search",
+    "request a quote", "get a quote", "request quote",
+    "register", "create account", "new account",
+]
+
+# Submit button texts that suggest a directory search form (preferred).
+DIRECTORY_SEARCH_BUTTON_TEXTS = [
+    "search", "find", "continue", "go", "submit",
+    "search directory", "find members", "find a member",
+    "find a doctor", "find an attorney",
+]
+
+# Submit button texts that suggest a NON-directory form (rejected).
+NON_DIRECTORY_BUTTON_TEXTS = [
+    "send", "subscribe", "sign up", "signup", "sign in",
+    "log in", "login", "register", "contact", "reset password",
+    "request quote", "get quote",
+]
+
+# --- FORM DETECTION ---
 # Submit button selectors for form-based directories.
 # Used when form inputs are detected via FORM_INPUT_SELECTORS.
 FORM_SUBMIT_SELECTORS = (

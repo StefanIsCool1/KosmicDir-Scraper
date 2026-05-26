@@ -22,7 +22,6 @@ from urllib.parse import urlparse
 import random
 import ssl
 import urllib.request
-import anthropic
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
@@ -32,6 +31,7 @@ from config import (
     NETWORK_IDLE_TIMEOUT, EXTERNAL_SKIP_DOMAINS,
     block_unnecessary_resources,
 )
+from llm import ask
 from html_parser import strip_junk, regex_extract_from_card, _merge_member_data
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
 
@@ -404,13 +404,7 @@ def learn_detail_selectors(sample_htmls: list, domain: str) -> dict:
 
     combined = "\n\n---PAGE BREAK---\n\n".join(samples)
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": f"""Analyze these {len(samples)} detail page HTML samples from the same directory website.
+    prompt = f"""Analyze these {len(samples)} detail page HTML samples from the same directory website.
 Each page shows info about ONE listing (a company, person, provider, restaurant, practice, etc.). Return CSS selectors to extract data from any detail page on this site.
 
 Return ONLY a JSON object (no markdown) with these keys:
@@ -434,17 +428,18 @@ Rules:
 
 HTML SAMPLES:
 {combined}"""
-        }]
-    )
-
-    raw = response.content[0].text.strip()  # type: ignore
-    # Strip markdown fences if Haiku wrapped the response
+    raw = ask(prompt, max_tokens=1000).strip()
+    # Strip markdown fences if the model wrapped the response
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
 
-    selectors = json.loads(raw.strip())
+    try:
+        selectors = json.loads(raw.strip())
+    except json.JSONDecodeError as e:
+        print(f"  LLM returned non-JSON detail selectors for {domain}: {e}")
+        return {}
 
     # Don't cache useless selectors — Haiku couldn't find anything
     if not selectors.get("company_name"):

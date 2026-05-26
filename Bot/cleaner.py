@@ -1,16 +1,183 @@
 """
 Data cleaning and normalization.
 Runs AFTER extraction — completely separate from scraping/parsing logic.
-Handles: deduplication, phone formatting, website normalization, address cleanup.
+Handles: deduplication, phone formatting, website normalization, address cleanup,
+         label-name rejection, and shared-email pruning.
 """
 
 import re
+from collections import Counter
+
+# UI labels that frequently leak into company_name when extraction misfires.
+# A record whose entire name (minus whitespace and trailing colon) matches
+# one of these is not a real company — drop it.
+_LABEL_WORDS = {
+    "phone", "email", "website", "fax", "address", "mailing address",
+    "street address", "contact", "contact us", "hours", "services",
+    "service area", "category", "specialty", "specialties", "type",
+    "description", "about", "summary", "name", "title", "company",
+    "tel", "telephone", "e-mail", "url", "web",
+}
+
+# Phrases that, when found anywhere in a company_name, strongly indicate
+# the text is NOT a real company/organization. This catches extraction
+# failures where navigation items, FAQ headings, CTA text, or content
+# sections leak in as "members" (e.g. matchhoa.com extracting "Cities in
+# Alabama" or "Ready to Find Your Match?" as member records).
+_FALSE_POSITIVE_NAME_PHRASES = [
+    "faq", "faqs", "laws & regulations", "laws and regulations",
+    "guides for", "guide to",
+    "ready to", "find your", "why use", "why choose",
+    "click here", "learn more", "read more", "get started",
+    "sign up", "log in", "login", "register now",
+    "privacy policy", "terms of", "cookie", "cookies",
+    "all rights reserved", "copyright",
+]
+
+# Prefixes that, when a company_name starts with them, indicate
+# the text is navigational or content-section text, not a real company.
+_FALSE_POSITIVE_NAME_PREFIXES = [
+    "cities in", "city in",
+    "management in", "managers in",
+    "hoa management", "property management",
+    "search results for",
+    "showing results",
+    "page",  # "Page 1 of 10"
+]
+
+# Words that, when a company_name consists entirely of one of them
+# (possibly with a trailing colon), are too generic to be a real company.
+_GENERIC_SINGLE_WORDS = {
+    "member", "members", "vendor", "vendors", "supplier", "suppliers",
+    "provider", "providers", "customer", "customers", "client", "clients",
+    "partner", "partners", "user", "users", "account", "accounts",
+    "profile", "profiles", "listing", "listings",
+    "details", "detail", "information", "info",
+}
+
+# Thresholds for shared-email pruning. An email appearing in BOTH
+# (a) at least this many records, AND
+# (b) this fraction of all records,
+# is treated as a referral/contact-us email shared across the directory,
+# not a per-company contact. Stripped from every record it pollutes.
+_SHARED_EMAIL_MIN_COUNT = 5
+_SHARED_EMAIL_MIN_FRACTION = 0.20
+
+
+def _is_false_positive_name(name: str) -> bool:
+    """True if `name` looks like navigational text, CTA copy, FAQ headings,
+    or content-section labels — not a real company/organization name.
+
+    Triggered by patterns like:
+      "Cities in Alabama", "HOA Management in Alaska",
+      "Ready to Find Your Match?", "Alaska HOA Laws & Regulations",
+      "Guides for HOA Boards", "Why Use Match HOA?"
+    """
+    if not name:
+        return True
+
+    stripped = name.strip().lower()
+
+    # Empty or whitespace-only
+    if not stripped:
+        return True
+
+    # Question marks — real organizations don't have them
+    if "?" in stripped:
+        return True
+
+    # Generic single words
+    if stripped in _GENERIC_SINGLE_WORDS:
+        return True
+
+    # Known false-positive phrases anywhere in the name
+    if any(fp in stripped for fp in _FALSE_POSITIVE_NAME_PHRASES):
+        return True
+
+    # Known false-positive prefixes
+    if any(stripped.startswith(prefix) for prefix in _FALSE_POSITIVE_NAME_PREFIXES):
+        return True
+
+    return False
+
+
+def _is_label_name(name: str) -> bool:
+    """True if `name` looks like a UI label, not a real company name.
+
+    Catches extractor false positives like 'Phone:', 'Email:', 'Website:',
+    'Service Area:', etc. — text that came from a <strong> label in the
+    DOM, not a heading.
+    """
+    if not name:
+        return True
+    # Strip whitespace, trailing colon, and surrounding punctuation/quotes
+    stripped = name.strip().strip(":").strip(" \t\"'*•·-—").lower()
+    if not stripped:
+        return True
+    # Multi-word labels like "service area"
+    if stripped in _LABEL_WORDS:
+        return True
+
+    return False
+
+
+def _prune_shared_emails(members: list) -> int:
+    """Remove emails that appear across many records — they're referral
+    addresses (e.g. 'hoausa@associaonline.com'), not per-company contacts.
+
+    Mutates `members` in place. Returns the number of email entries removed.
+    """
+    if len(members) < _SHARED_EMAIL_MIN_COUNT:
+        return 0
+
+    # Count: how many DISTINCT records contain each email at least once?
+    email_record_counts: Counter[str] = Counter()
+    for m in members:
+        seen_in_this_record = set()
+        for c in m.get("contacts") or []:
+            e = (c.get("email") or "").lower().strip()
+            if e and e not in seen_in_this_record:
+                email_record_counts[e] += 1
+                seen_in_this_record.add(e)
+
+    total = len(members)
+    poisoned = {
+        email for email, count in email_record_counts.items()
+        if count >= _SHARED_EMAIL_MIN_COUNT
+        and count / total >= _SHARED_EMAIL_MIN_FRACTION
+    }
+    if not poisoned:
+        return 0
+
+    print(
+        f"  Cleaner: pruning {len(poisoned)} shared email(s) "
+        f"appearing across many records: " + ", ".join(sorted(poisoned))
+    )
+
+    removed = 0
+    for m in members:
+        contacts = m.get("contacts") or []
+        new_contacts = []
+        for c in contacts:
+            e = (c.get("email") or "").lower().strip()
+            if e in poisoned:
+                # If the contact has only the email (no name), drop the
+                # whole contact. Otherwise just blank the email and keep
+                # the name.
+                if not (c.get("name") or "").strip():
+                    removed += 1
+                    continue
+                c["email"] = None
+            new_contacts.append(c)
+        m["contacts"] = new_contacts
+    return removed
 
 
 def clean_members(members: list) -> list:
     """Clean and deduplicate extracted member data.
-    
+
     Operations:
+    - Reject false-positive names (nav text, CTA, FAQ headings, etc.)
     - Deduplicate by company name (case-insensitive)
     - Normalize phone/fax to (XXX) XXX-XXXX format
     - Prefix bare domain websites with https://
@@ -20,12 +187,23 @@ def clean_members(members: list) -> list:
     """
     seen_companies = set()
     cleaned = []
+    dropped_false_positives = 0
 
     for m in members:
         # --- COMPANY NAME ---
         name = " ".join((m.get("company_name") or "").split())  # collapse whitespace
         if not name:
             continue  # skip entries with no company name
+        # Drop label-only records ("Phone:", "Email:", "Website:", etc.)
+        # that leak in when the regex fallback grabs <strong> labels.
+        if _is_label_name(name):
+            continue
+        # Drop false-positive names ("Cities in Alabama", "Ready to Find Your Match?",
+        # "Alaska HOA Laws & Regulations", etc.) that leak in when the parser scrapes
+        # navigation / content sections as member cards.
+        if _is_false_positive_name(name):
+            dropped_false_positives += 1
+            continue
         name_key = name.lower().strip()
         if name_key in seen_companies:
             continue  # deduplicate
@@ -86,4 +264,55 @@ def clean_members(members: list) -> list:
 
         cleaned.append(m)
 
+    if dropped_false_positives:
+        print(f"  Cleaner: dropped {dropped_false_positives} false-positive name(s)")
+
+    # Strip shared/poisoned emails — emails that appear across many
+    # records (e.g. a referral contact address) are NOT per-company data.
+    _prune_shared_emails(cleaned)
+
     return cleaned
+
+
+def is_extraction_garbage(members: list, min_contact_ratio: float = 0.05) -> bool:
+    """Check if cleaned member records are mostly garbage — names with
+    no contact data, likely extracted from navigation/content sections
+    rather than real directory listings.
+
+    Returns True when fewer than `min_contact_ratio` of records have any
+    contact info (phone, email, website, or address). Also returns True
+    when the majority of names look like false positives.
+
+    Used by main.py to detect failed extractions and invalidate cached
+    selectors so future scrapes don't reuse bad selectors.
+    """
+    if not members:
+        return True
+
+    n = len(members)
+    with_contact = sum(
+        1 for m in members
+        if m.get("phone")
+        or m.get("website")
+        or m.get("street_address")
+        or m.get("mailing_address")
+        or (m.get("contacts") and any(c.get("email") for c in m["contacts"]))
+    )
+    contact_ratio = with_contact / n
+
+    # Check how many names still look like false positives (should have been
+    # caught by _is_false_positive_name, but some slip through)
+    still_false = sum(1 for m in members if _is_false_positive_name(m.get("company_name", "")))
+    false_ratio = still_false / n
+
+    if contact_ratio < min_contact_ratio:
+        print(f"  Cleaner: extraction is garbage — only {with_contact}/{n} "
+              f"records have contact data ({contact_ratio:.1%})")
+        return True
+
+    if false_ratio > 0.3:
+        print(f"  Cleaner: extraction is garbage — {still_false}/{n} names "
+              f"still look like false positives after cleaning ({false_ratio:.1%})")
+        return True
+
+    return False

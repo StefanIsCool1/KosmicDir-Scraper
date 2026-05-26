@@ -1,7 +1,7 @@
 # Kosomic Scraper 
 (a directory built scraper)
 **FEEL FREE TO PULL REQUEST OR GIVE ME ADVICE ON STUFF**
-A universal directory scraping tool that extracts data from directory website. Combines Playwright browser automation with AI-powered selector learning (Claude Haiku) to adapt to different website structuring.
+A universal directory scraping tool that extracts data from directory website. Combines Playwright browser automation with AI-powered selector learning (DeepSeek V4 Flash) to adapt to different website structuring.
 
 Built by **Stefan O'Leary**
 
@@ -106,9 +106,10 @@ All Phase 1 fields preserved, plus: (basically data to build consumer profile)
 
 ***External APIs & Libraries***
 
-### Anthropic Claude Haiku
-- **Page analysis**: "Is this a directory page?" — 1 call per navigation depth (uses basically no money)
-The average cost is alround ~$0.005 per new domain, basically zero if bot fins api or nicley structured data 
+### DeepSeek (deepseek-v4-flash)
+- **Page analysis**: "Is this a directory page?" — 1 call per navigation depth
+- **Selector learning**: 1 call per new domain (cached forever after)
+- All LLM calls go through `Bot/llm.py` — swap providers there.
 
 PLAYWRIGHT:
 
@@ -145,7 +146,7 @@ cd UnderDeckScraper/UnderDeckScraper
 # Python dependencies
 python3 -m venv .venv
 source .venv/bin/activate
-pip install flask flask-cors playwright anthropic curl-cffi beautifulsoup4 playwright-stealth
+pip install flask flask-cors playwright openai python-dotenv curl-cffi beautifulsoup4 playwright-stealth
 
 # Install Chromium
 playwright install chromium

@@ -8,6 +8,8 @@ Handles: launching browser, capturing responses, human-like scrolling, paginatio
 import random
 import time
 import threading
+import json
+import os
 from urllib.parse import urlparse
 from config import (
     DEFAULT_IDLE_TIMEOUT, SEARCH_IDLE_TIMEOUT, PAGINATION_IDLE_TIMEOUT,
@@ -496,8 +498,74 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
     return pages_loaded
 
 
+# --- LOGIN WALL DETECTION & COOKIE MANAGEMENT ---
+
+_LOGIN_SIGNALS = [
+    "sign in", "log in", "login", "username",
+    "members only", "member login", "member sign in",
+    "forgot password", "forgot your password",
+    "click here for login", "portal login",
+]
+
+# Directory where per-domain cookies are persisted
+_COOKIE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies")
+
+
+def _is_login_page(page) -> bool:
+    """Check if the current page is a login/authentication wall.
+
+    Requires password field + 2+ login-related phrases in the HTML.
+    Low false-positive rate — sites with public directories that also have
+    a login link in the nav won't trigger this.
+    """
+    try:
+        html = page.content().lower()
+    except Exception:
+        return False
+
+    has_password = 'type="password"' in html or "type='password'" in html
+    if not has_password:
+        return False
+
+    signals = sum(1 for phrase in _LOGIN_SIGNALS if phrase in html)
+    return signals >= 2
+
+
+def _load_cookies(page, domain: str) -> bool:
+    """Load saved cookies for a domain into the browser context.
+
+    Returns True if cookies were loaded, False if no cookie file exists.
+    """
+    cookie_file = os.path.join(_COOKIE_DIR, f"{domain}.json")
+    if not os.path.exists(cookie_file):
+        return False
+    try:
+        with open(cookie_file, "r") as f:
+            cookies = json.load(f)
+        page.context.add_cookies(cookies)
+        print(f"  Loaded {len(cookies)} cookies for {domain}")
+        return True
+    except Exception as e:
+        print(f"  Failed to load cookies for {domain}: {e}")
+        return False
+
+
+def _save_cookies(page, domain: str):
+    """Save current browser cookies to disk for reuse on future scrapes."""
+    os.makedirs(_COOKIE_DIR, exist_ok=True)
+    cookie_file = os.path.join(_COOKIE_DIR, f"{domain}.json")
+    try:
+        cookies = page.context.cookies()
+        with open(cookie_file, "w") as f:
+            json.dump(cookies, f, indent=2)
+        print(f"  Saved {len(cookies)} cookies for {domain}")
+    except Exception as e:
+        print(f"  Failed to save cookies for {domain}: {e}")
+
+
 def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
-                      priority_fields: list | None = None) -> tuple[list, list]:
+                      priority_fields: list | None = None,
+                      login_callback=None) -> tuple[list, list]:
     """Main browser automation entry point.
 
     Launches browser, navigates to directory page, captures all responses.
@@ -505,19 +573,15 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     mode: "auto" = find directory page + search (default)
           "direct" = skip navigation/search, scrape the page as-is
 
+    login_callback: Optional callable(page, domain) -> bool.
+        Called when a login wall is detected. The callback should pause
+        and let the user log in manually, then return True to retry or
+        False to skip. If None and a login wall is hit, the scrape fails.
+
     Returns:
         Tuple of (results, detail_urls):
         - results: list of dicts [{"url": str, "data": dict}, ...]
         - detail_urls: list of member detail page URLs (may be empty)
-
-    Flow:
-    1. Navigate to site, find directory page
-    2. Try search strategies (empty → all → * → a → alphabet)
-    3. If no search, scroll to trigger lazy loading
-    4. Handle pagination (Next/Load More buttons)
-    5. Collect links from all paginated pages for detail detection
-    6. Capture JSON responses + page HTML as fallback
-    7. Detect detail links if data is shallow
     """
     results = []
     detail_urls = []
@@ -528,6 +592,8 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     idle_timeout_value = DEFAULT_IDLE_TIMEOUT
     pending_html_responses = []
     timer_enabled = False  # Don't start idle timer until after search/scroll phase
+
+    domain = urlparse(link).netloc.replace(".", "_")
 
     browser = playwright.chromium.launch(headless=False)
     page = browser.new_page()
@@ -547,6 +613,9 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
 
     # Block images, fonts, media, analytics — bot only needs JSON + HTML
     block_unnecessary_resources(page)
+
+    # --- Load saved cookies for this domain (if any) ---
+    had_cookies = _load_cookies(page, domain)
 
     def reset_idle_timer():
         """Reset the idle timer. Called each time a relevant response arrives.
@@ -632,7 +701,7 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         page.goto(link)
         try:
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-        except:
+        except Exception:
             pass
         directory_url = link
         search_triggered = False
@@ -644,9 +713,92 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
             page.goto(directory_url)
             try:
                 page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-            except:
+            except Exception:
                 pass
 
+    # --- Login gate: detect and handle authentication walls ---
+    # Runs after initial navigation in BOTH modes. If cookies were loaded
+    # but are stale, the page will still show a login wall.
+    if _is_login_page(page):
+        if login_callback is None:
+            print(f"  LOGIN WALL DETECTED — no login_callback provided, "
+                  f"scrape will likely return 0 results")
+        else:
+            print(f"\n  ╔══════════════════════════════════════════╗")
+            print(f"  ║  LOGIN WALL DETECTED                    ║")
+            print(f"  ║  This directory requires authentication. ║")
+            print(f"  ╚══════════════════════════════════════════╝")
+            # Up to MAX_LOGIN_ATTEMPTS rounds of prompt-then-verify.
+            # If the user presses Enter prematurely (before actually logging
+            # in), the post-navigation _is_login_page check catches it and
+            # we re-prompt instead of saving useless cookies.
+            #
+            # First attempt: goto directory_url after login_callback
+            #   returns. Handles the common case where the site
+            #   auto-redirected to a dashboard after login.
+            # Retry attempt: skip the goto and verify whatever page the
+            #   user is on. After being told "verification failed", the
+            #   user may have manually navigated to the right page —
+            #   don't yank them away from it.
+            MAX_LOGIN_ATTEMPTS = 2
+            for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
+                retry = login_callback(page, domain)
+                if not retry:
+                    print(f"  Login skipped — scrape will likely return 0 results")
+                    break
+
+                if attempt == 1:
+                    # Common case: login redirected the user to /dashboard
+                    # or similar. Navigate to our target URL so we end up
+                    # on the page we actually want to scrape.
+                    print(f"  Navigating to directory page after login: {directory_url}")
+                    page.goto(directory_url)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                    except Exception:
+                        pass
+                else:
+                    # Retry: trust the user's current location. They may
+                    # have manually navigated to a better page than
+                    # directory_url after the first verification failed.
+                    print(f"  Verifying current page: {page.url}")
+
+                # Verify login actually worked. If still a login wall, the
+                # cookies are useless — do NOT save them (would poison the
+                # cache and make future scrapes silently fail).
+                if not _is_login_page(page):
+                    _save_cookies(page, domain)
+                    print(f"  Login verified on {page.url} — continuing scrape")
+                    break
+
+                remaining = MAX_LOGIN_ATTEMPTS - attempt
+                if remaining > 0:
+                    print(f"  Login verification FAILED — page still shows a "
+                          f"login wall. {remaining} attempt(s) remaining.")
+                    print(f"  If login redirected you elsewhere, you can "
+                          f"manually navigate to the directory page before "
+                          f"pressing Enter on the next prompt.")
+                else:
+                    print(f"  Login verification FAILED after {MAX_LOGIN_ATTEMPTS} "
+                          f"attempts — NOT saving cookies. Scrape will likely "
+                          f"return 0 results.")
+
+    # --- Fast path: URL-parameter enumeration ---
+    # If the page has a GET form with a static <select> (e.g.
+    # hoa-usa.com's ?state=Alabama dropdown), we can fetch every
+    # parameter value in parallel via curl_cffi and skip the entire
+    # browser-based search/scroll/paginate flow. ~20–50x faster.
+    try:
+        from url_enumeration import try_url_enumeration_cached
+        if try_url_enumeration_cached(page, domain, link, results):
+            print(f"  URL enumeration captured {len(results)} pages — "
+                  f"skipping browser search flow")
+            browser.close()
+            return results, []
+    except Exception as e:
+        print(f"  URL enumeration error (non-fatal, falling through): {e}")
+
+    if mode != "direct":
         # --- Step 2: Try search strategies ---
         pre_search_count = len(results)
         debug.log("SEARCH", f"Starting search. JSON results so far: {pre_search_count}")
