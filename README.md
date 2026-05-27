@@ -138,7 +138,7 @@ Formally ***requests*** now switched to  curl_cffi  for better function(Phase 2)
 
 
 ## Installation
-YOU WILL NEED AN CLAUDE API KEY FOR THIS TO WORK (this bot doenst use much tokens)
+YOU WILL NEED A DEEPSEEK API KEY FOR THIS TO WORK (this bot doesn't use many tokens). Copy `.env.example` to `.env` and set `DEEPSEEK_API_KEY`.
 ```bash
 git clone https://github.com/StefanIsCool1/UnderDeckScraper.git
 cd UnderDeckScraper/UnderDeckScraper
@@ -154,6 +154,8 @@ playwright install chromium
 # Frontend
 cd frontend && npm install && cd ..
 ```
+
+The LLM client uses the OpenAI-compatible DeepSeek endpoint (`https://api.deepseek.com`). The `openai` SDK is installed only as the HTTP client — it is pointed at DeepSeek in `Bot/llm.py`. Swap `_BASE_URL` and `_MODEL` there to change providers.
 
 ## Running
 

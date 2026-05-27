@@ -9,6 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "Bot"))
 
 from Bot.main import scrape_directory, PHASE2_ONLY_FIELDS
 from Bot.debug import debug
+from Bot.intent_filter import intent_from_plan
 from Phase2Bot.email_extractor import enrich_from_websites
 from DiscoveryBot import run_discovery
 
@@ -608,6 +609,14 @@ def discover():
             # We pass mode="direct" because Phase 0 already verified card
             # structure exists on the URL. Prompts are auto-declined (batch
             # mode — no human in the loop for detail crawl or Phase 2).
+            #
+            # Agent mode also passes the parsed intent through, so Phase 1's
+            # AI navigator can pick intent-relevant sub-directory links and
+            # the category iterator can narrow to matching tabs (e.g. only
+            # "Restaurants, Food & Beverages" on a multi-category chamber).
+            # The Playground endpoints (/scrape/single, /scrape/csv) do NOT
+            # pass intent — their behavior is unchanged.
+            intent = intent_from_plan(result.get("plan"))
             output_files = []
             total_records = 0
             per_site_results = []
@@ -660,6 +669,7 @@ def discover():
                         prompt_callback=auto_decline,
                         mode=scrape_mode,
                         priority_fields=priority_fields,
+                        intent=intent,
                     )
 
                     from urllib.parse import urlparse as _urlparse

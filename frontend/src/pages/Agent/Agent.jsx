@@ -13,7 +13,7 @@ const SUGGESTIONS = [
 
 const INITIAL_MESSAGE = {
   role: 'agent',
-  text: "Hi! I'm the Kosmic Agent. Tell me what you're looking for and I'll find directories on the web. You pick which to scrape; I'll handle Phase 1 and Phase 2 from there.",
+  text: "Hi! I'm the Kosmic Agent. Tell me what you're looking for and I'll scrape those directories for you.",
 }
 
 const REJECT_REASONS = {

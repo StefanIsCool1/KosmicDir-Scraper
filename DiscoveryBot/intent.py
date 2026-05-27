@@ -2,6 +2,13 @@
 Phase 0 — Intent Parsing
 One LLM call: free-form user goal → structured search plan.
 
+Also acts as the SCOPE GATE for the whole pipeline. The tool scrapes
+directories of businesses/organizations/professionals/members — not jobs,
+news, products, real estate, recipes, events, or individual people.
+Out-of-scope queries return is_actionable=false with a clarification
+explaining the tool's scope, so the user doesn't waste time on a scrape
+whose schema (company_name/phone/address/website) doesn't fit their goal.
+
 Reuses Bot/llm.py's ask() client (DeepSeek, OpenAI-compatible) without
 modifying it. Falls back to a deterministic plan if the call fails.
 """
@@ -52,14 +59,41 @@ def _build_prompt(goal: str) -> str:
 
 User message: {goal}
 
-FIRST decide if this is a clear, actionable scraping goal.
-- ACTIONABLE: names an industry, entity type, or category to search for. Examples: "HOAs in Washington", "dentists in Austin", "roofing contractors in Florida", "restaurants", "law firms in New York".
-- NOT ACTIONABLE: greetings ("hi"), tool questions ("what can you do"), vague requests ("scrape something"), random text. If no concrete industry or entity is named, it is NOT actionable.
+This tool scrapes DIRECTORIES of businesses, organizations, professionals, and members. It extracts fields like company_name, phone, address, website, contacts. It does NOT handle jobs, news, products, real estate listings, recipes, events, or individual people.
+
+FIRST decide if this is an actionable goal FOR THIS TOOL.
+
+ACTIONABLE — the user wants a directory or list of ENTITIES (businesses/orgs/professionals/members):
+  • "HOAs in Washington", "dentists in Austin", "roofing contractors in Florida"
+  • "restaurants in Austin", "law firms in New York", "chambers of commerce in Texas"
+  • "Austin Chamber members", "AGA member list", "alumni directory of UCLA"
+  • Qualifiers like "best", "top", "all" are fine — the underlying ask is still a list of entities.
+
+NOT ACTIONABLE — the user wants something this tool can't produce. Set is_actionable=false and return a helpful clarification:
+  • JOBS / employment ("jobs in NYC", "openings at Google", "hiring near me", "remote dev jobs", "career opportunities")
+  • NEWS / articles ("news about X", "press releases", "articles on Y")
+  • REVIEWS / opinion ("reviews of X", "what people say about Y", "ratings for Z")
+  • PRODUCTS / shopping ("laptops under $1000", "Nike shoes", "buy X")
+  • REAL ESTATE listings ("homes for sale", "apartments for rent", "houses in Austin")
+  • RECIPES / how-to / blog content
+  • INDIVIDUAL PERSON searches ("find John Smith", "LinkedIn profile of X")
+  • EVENTS ("concerts this weekend", "conferences in 2026")
+  • PURE DATA / statistics ("how many X exist", "average salary of Y")
+  • Greetings, tool questions, vague requests ("hi", "what can you do", "scrape something", random text)
+
+DISAMBIGUATION RULE — focus on the PRIMARY thing the user wants:
+  • "staffing agencies in Austin" → ACTIONABLE (directory of staffing businesses)
+  • "jobs at staffing agencies in Austin" → NOT actionable (user wants job postings)
+  • "real estate companies in Austin" → ACTIONABLE (directory of agencies)
+  • "homes for sale in Austin" → NOT actionable (user wants property listings)
+  • "marketing agencies" → ACTIONABLE
+  • "marketing jobs" → NOT actionable
+If genuinely ambiguous, default to ACTIONABLE.
 
 Return ONLY a JSON object — no markdown fences, no explanation. Use this schema:
 {{
   "is_actionable": <true | false>,
-  "clarification": "<if NOT actionable: a short friendly question (1-2 sentences) asking what the user wants to scrape, ideally with an example. Omit when actionable.>",
+  "clarification": "<REQUIRED when NOT actionable. 1-2 friendly sentences. For greetings/vague messages: ask what they want to scrape with an example like 'HOAs in Washington' or 'dentists in Austin'. For OUT-OF-SCOPE data types: briefly say this tool scrapes business/member directories (not jobs/products/news/etc.) and suggest a related directory query that WOULD work — e.g. for 'jobs in Austin' suggest 'staffing agencies in Austin'; for 'homes for sale in Austin' suggest 'real estate agencies in Austin'; for 'best restaurants reviews' suggest 'restaurants in <city>'. Omit when actionable.>",
   "industry": {{
     "canonical": "<lowercase canonical name, e.g. 'homeowners associations'>",
     "aliases": ["<2-5 alternate names the directory might use>"],
@@ -154,7 +188,8 @@ def _is_trivial(goal: str) -> bool:
 
 
 _DEFAULT_CLARIFICATION = (
-    "What kind of businesses or organizations are you looking for? "
+    "This tool scrapes ONLY directory type data of businesses, organizations, and professionals "
+    "What kind of directory are you looking for? "
     "Try something like 'HOAs in Washington' or 'dentists in Austin, TX'."
 )
 
@@ -179,7 +214,7 @@ def parse_intent(goal: str) -> dict:
         print(f"  Intent: LLM call failed ({e}) — using fallback plan")
         return _fallback_plan(goal)
 
-    text = _strip_fences(raw)
+    text = _strip_fences(raw) #strips response to make it cleaner
     try:
         plan = json.loads(text)
     except json.JSONDecodeError as e:

@@ -23,6 +23,7 @@ from config import (
     block_unnecessary_resources,
 )
 from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all
+from intent_filter import filter_categories_by_intent
 from debug import debug
 from playwright.sync_api import Playwright
 from detail_crawler import collect_page_links, detect_detail_links, is_shallow_data, html_has_contact_info, CONTACT_KEYS
@@ -80,6 +81,63 @@ def _is_third_party_frame(frame_url: str) -> bool:
         return any(domain in frame_domain for domain in THIRD_PARTY_FRAME_DOMAINS)
     except Exception:
         return False
+
+
+def _find_member_array(data, max_depth: int = 3) -> bool:
+    """Recursively look for a list of member-shape dicts inside an envelope JSON.
+
+    Catches platforms where the directory data is wrapped, which Method 3
+    (which only checks data[0] or top-level keys) misses:
+      - GraphQL:   {"data": {"members": {"edges": [{"node": {...}}, ...]}}}
+      - Drupal:    {"data": [{"attributes": {...}}, ...]}
+      - SharePoint:{"d": {"results": [{...}]}}
+      - WP custom: {"items": [{"acf": {...}}, ...]}
+
+    Thresholds tuned conservatively so config blobs, i18n bundles, and
+    chat-widget agent lists don't trip a false positive:
+      - List must have >=3 entries
+      - >=2 of the first 5 entries must each have >=3 matching JSON_STRUCTURE_FIELDS keys
+      - Handles 1-key wrapper entries by unwrapping one level (node/attributes/fields)
+
+    Bounded: max_depth=3, 20 list items per level, 25 dict values per level.
+    Wrapped in try/except by the caller; any exception → no detection.
+    """
+    if max_depth < 0:
+        return False
+
+    if isinstance(data, list):
+        if len(data) >= 3:
+            matching = 0
+            for entry in data[:5]:
+                if not isinstance(entry, dict):
+                    continue
+                keys_lower = {k.lower() for k in entry.keys()}
+                if len(keys_lower & set(JSON_STRUCTURE_FIELDS)) >= 3:
+                    matching += 1
+                    continue
+                # Wrapper unwrap: if any nested value is a dict with member-shape
+                # keys, treat as a wrapped record. Handles JSON:API ({id, type,
+                # attributes:{...}}), Elasticsearch ({_id, _source:{...}}),
+                # Salesforce ({Id, fields:{...}}), GraphQL ({node:{...}}), etc.
+                for v in entry.values():
+                    if isinstance(v, dict):
+                        v_keys = {k.lower() for k in v.keys()}
+                        if len(v_keys & set(JSON_STRUCTURE_FIELDS)) >= 3:
+                            matching += 1
+                            break
+            if matching >= 2:
+                return True
+        # Recurse — bounded sample of items
+        for item in data[:20]:
+            if _find_member_array(item, max_depth - 1):
+                return True
+    elif isinstance(data, dict):
+        # Bounded sample of values — pathological cases (large i18n bundles,
+        # config blobs) can have hundreds of keys
+        for value in list(data.values())[:25]:
+            if _find_member_array(value, max_depth - 1):
+                return True
+    return False
 
 
 def find_content_frame(page):
@@ -565,7 +623,8 @@ def _save_cookies(page, domain: str):
 
 def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                       priority_fields: list | None = None,
-                      login_callback=None) -> tuple[list, list]:
+                      login_callback=None,
+                      intent: dict | None = None) -> tuple[list, list]:
     """Main browser automation entry point.
 
     Launches browser, navigates to directory page, captures all responses.
@@ -577,6 +636,12 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         Called when a login wall is detected. The callback should pause
         and let the user log in manually, then return True to retry or
         False to skip. If None and a login wall is hit, the scrape fails.
+
+    intent: Optional dict from intent_filter.intent_from_plan. When set
+        (Agent mode), used to (a) hint the AI navigator toward intent-
+        relevant sub-directory links and (b) narrow detected category
+        lists before iteration. Playground callers pass None and every
+        downstream consumer falls back to existing behavior.
 
     Returns:
         Tuple of (results, detail_urls):
@@ -670,6 +735,14 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                         if len(matches) >= 3:
                             is_directory_data = True
 
+                # Method 4: Recursive envelope unwrap — catches GraphQL, Drupal
+                # JSON:API, SharePoint, and other platforms that wrap the member
+                # array in a deeper structure that Method 3 doesn't see.
+                # Purely additive: only fires when Methods 1-3 all said False.
+                if not is_directory_data and _find_member_array(data):
+                    is_directory_data = True
+                    print(f"  Method 4 (envelope unwrap): member array detected")
+
                 # Final veto: exclude known non-data endpoints even if content matched
                 # (e.g. /memberdirectory/Filters contains "member" in data but isn't member data)
                 if is_directory_data and any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
@@ -707,7 +780,7 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         search_triggered = False
         debug.log("NAV", f"Direct mode — skipping navigation and search")
     else:
-        directory_url = find_directory_url(page, link)
+        directory_url = find_directory_url(page, link, intent=intent)
         debug.log("NAV", f"Directory URL resolved: {directory_url}")
         if page.url.rstrip("/") != directory_url.rstrip("/"):
             page.goto(directory_url)
@@ -833,6 +906,10 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
             # 2. If no View All, try category iteration
             if not view_all_clicked:
                 categories = detect_category_links(page)
+                # Agent mode narrows categories to the user's intent. Fall-open
+                # if intent is None or no matches found — never accidentally drop
+                # every category and end up scraping nothing.
+                categories = filter_categories_by_intent(categories, intent)
                 if categories:
                     print(f"  Iterating {len(categories)} categories...")
                     timer_enabled = False

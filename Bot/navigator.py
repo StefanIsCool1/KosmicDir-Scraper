@@ -86,10 +86,17 @@ def navigate_to_link(page, chosen_link: dict, fallback_url: str) -> str:
         return href
 
 
-def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool, page_text: str = "") -> dict:
+def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool,
+                     page_text: str = "", intent: dict | None = None) -> dict:
     """Ask Haiku to analyze the current page:
     - Is this already a directory/search page? (has search input or member listings)
     - If not, which link should we click to get there?
+
+    When `intent` is provided (Agent mode), the prompt also tells the model
+    what the user is searching for so it picks the most relevant sub-directory
+    link (e.g. "Find a Restaurant" over "Find a Member" on a chamber homepage).
+    The intent hint EXPLICITLY reinforces the STAY bias so we don't navigate
+    away from a page that already shows entries.
 
     Returns dict with:
       {"action": "stay"}  — we're already on the directory page
@@ -110,8 +117,23 @@ def ai_analyze_page(filtered_links: list, page_url: str, has_search_input: bool,
     if page_text:
         content_hint = f"\nVisible page content (preview):\n{page_text[:500]}\n"
 
+    intent_hint = ""
+    if intent:
+        target = (intent.get("industry_canonical") or "").strip()
+        if target:
+            aliases = intent.get("industry_aliases") or []
+            alias_str = f" (a.k.a. {', '.join(aliases[:4])})" if aliases else ""
+            intent_hint = (
+                f"\nThe user is searching for: {target}{alias_str}.\n"
+                f"STAY BIAS: If this page already shows a list, grid, search form, or category "
+                f"selector for entries — even if not yet narrowed to {target} — respond STAY. "
+                f"We can filter after we land here.\n"
+                f"Only CLICK when no entries are visible AND a link clearly leads to a "
+                f"{target}-focused sub-directory (e.g. 'Find a {target.rstrip('s').title()}').\n"
+            )
+
     prompt = f"""I'm on {page_url} trying to find the directory or search/listing page (for businesses, members, doctors, restaurants, attorneys, providers, or any directory).
-{search_hint}{content_hint}
+{intent_hint}{search_hint}{content_hint}
 Here are the links on this page:
 {link_list}
 
@@ -152,7 +174,7 @@ Respond with a single word/command. Do not explain."""
     return {"action": "none"}
 
 
-def find_directory_url(page, link: str) -> str:
+def find_directory_url(page, link: str, intent: dict | None = None) -> str:
     """Navigate to a site and find the member directory page.
 
     Multi-depth: clicks through up to 3 pages to find the actual directory.
@@ -162,6 +184,9 @@ def find_directory_url(page, link: str) -> str:
     - Depth 1: Homepage → "Member Directory" → lands on search page (done)
     - Depth 2: Homepage → "Membership" → "Find a Member" → search page (done)
     - Depth 0: Homepage already has the directory loaded (done immediately)
+
+    `intent` is forwarded to ai_analyze_page so the AI picks intent-relevant
+    sub-directory links when there are multiple. Playground callers pass None.
 
     Returns the URL of the page we ended up on.
     """
@@ -251,7 +276,8 @@ def find_directory_url(page, link: str) -> str:
         debug.log("NAV", f"Depth {depth}: {len(filtered)} links, search={has_search}, url={current_url[:100]}")
 
         try:
-            result = ai_analyze_page(filtered, current_url, has_search, page_text=page_text)
+            result = ai_analyze_page(filtered, current_url, has_search,
+                                      page_text=page_text, intent=intent)
         except Exception as e:
             print(f"  AI analysis failed: {e}, stopping here")
             break

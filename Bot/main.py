@@ -451,7 +451,8 @@ def _check_fields(members: list) -> set:
 
 
 def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
-                     priority_fields: list | None = None) -> list:
+                     priority_fields: list | None = None,
+                     intent: dict | None = None) -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
@@ -463,6 +464,10 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
               "direct" = skip navigation/search, scrape the page as-is
         priority_fields: List of field names the user wants (e.g. ["email", "phone", "address"]).
                          Used to make smarter detail crawl decisions.
+        intent: Optional dict from intent_filter.intent_from_plan. Only the
+                Agent (/discover) entry point sets this. Forwarded to the
+                browser/navigator so the AI picks intent-relevant links and
+                the category iterator only walks matching tabs.
     """
     if priority_fields is None:
         priority_fields = []
@@ -481,6 +486,7 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
             playwright, url, mode=mode,
             priority_fields=priority_fields,
             login_callback=_login_interactive,
+            intent=intent,
         )
 
     # --- Step 2: Save raw responses ---

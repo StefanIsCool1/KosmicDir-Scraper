@@ -293,6 +293,73 @@ _GENERIC_INDUSTRY_WORDS = {
     "pro", "plus", "first", "best", "elite", "superior", "precision",
 }
 
+# Free-email / consumer-ISP domains — personal accounts, not company sites.
+# Used to skip the "derive website from email domain" shortcut for records
+# whose only contact is a personal address.
+_FREE_EMAIL_PROVIDERS = frozenset({
+    # Major free providers
+    "gmail.com", "googlemail.com",
+    "yahoo.com", "ymail.com", "rocketmail.com",
+    "hotmail.com", "outlook.com", "live.com", "msn.com",
+    "aol.com", "aim.com",
+    "icloud.com", "me.com", "mac.com",
+    "protonmail.com", "proton.me",
+    "gmx.com", "gmx.us", "mail.com",
+    "zoho.com", "yandex.com", "fastmail.com", "hey.com", "tutanota.com",
+    # US consumer ISPs (often the only email a small business publishes)
+    "comcast.net", "verizon.net", "att.net", "sbcglobal.net", "cox.net",
+    "bellsouth.net", "charter.net", "earthlink.net", "juno.com",
+    "netzero.net", "frontier.com", "windstream.net", "centurylink.net",
+    "optimum.net", "rr.com", "roadrunner.com", "twc.com",
+    # Placeholders
+    "example.com", "example.org", "test.com",
+})
+
+
+def website_from_emails(contacts: list[dict]) -> str | None:
+    """Derive a business website from contact email domains.
+
+    Skips free providers and consumer ISPs. Returns the first usable domain
+    as https://<domain>, or None if no contact qualifies.
+
+    Lets Phase 2 bypass DDG search when the Phase 1 record already exposes
+    an email like john@acmecorp.com — that domain is almost always the
+    company website. No network call, no rate limit, no false-positive risk
+    from search-result matching.
+    """
+    if not contacts:
+        return None
+    for c in contacts:
+        email = (c.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        domain = email.rsplit("@", 1)[-1].strip()
+        if not domain or "." not in domain or " " in domain:
+            continue
+        if domain in _FREE_EMAIL_PROVIDERS:
+            continue
+        return f"https://{domain}"
+    return None
+
+
+def _build_phone_query(phone: str | None) -> str | None:
+    """Build a quoted DDG query from a 10-digit US phone number.
+
+    A formatted phone like "(512) 555-1234" is often a near-unique
+    identifier — businesses display it in their site header/footer, and
+    DDG indexes those pages. Returns None for malformed or non-US shapes.
+    """
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return None
+    formatted = f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
+    return f'"{formatted}"'
+
+
 # Search rate limiting — reset per run, not global
 _search_stopped = False
 
@@ -359,7 +426,8 @@ def reset_search_state():
 def _ddg_fetch_results(query: str) -> list[dict[str, str]]:
     """Execute a DDG HTML search via curl_cffi (TLS-impersonated).
 
-    Returns list of result dicts with 'href' and 'title' keys.
+    Returns list of result dicts with 'href', 'title', and 'snippet' keys.
+    'snippet' may be an empty string when DDG didn't render one.
     The duckduckgo-search library gets blocked; curl_cffi doesn't.
     """
     global _search_stopped
@@ -392,7 +460,12 @@ def _ddg_fetch_results(query: str) -> list[dict[str, str]]:
         soup = BeautifulSoup(resp.text, "html.parser")
 
         results = []
-        for a in soup.select("a.result__a"):
+        # Iterate per-result block so we can grab the snippet element that
+        # belongs to each title rather than guessing pair-wise.
+        for block in soup.select(".result"):
+            a = block.select_one("a.result__a")
+            if not a:
+                continue
             href = str(a.get("href", ""))
             title = a.get_text(strip=True)
 
@@ -402,7 +475,10 @@ def _ddg_fetch_results(query: str) -> list[dict[str, str]]:
             elif not href.startswith("http"):
                 continue
 
-            results.append({"href": href, "title": title})
+            snippet_el = block.select_one(".result__snippet")
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+
+            results.append({"href": href, "title": title, "snippet": snippet})
 
         return results
 
@@ -493,13 +569,21 @@ def ddg_search_website(
     phone: str | None = None,
     source_domain: str | None = None,
 ) -> tuple[str | None, str]:
-    """Search DuckDuckGo for a company's website using available data.
+    """Search DuckDuckGo for a company's website using all available signal.
 
-    Strategy:
-      1. Exact quoted company name + location + category (precise)
-      2. If no match: unquoted significant words + location (broader)
+    Strategy (each attempt only fires if earlier ones returned nothing useful):
+      1. Quoted exact company name + location + category — precise.
+      2. Cleaned name words (no suffixes) + location + category — broader.
+      3. Quoted phone number — a uniquely formatted phone often nails the
+         company's own pages because they display it in headers/footers.
 
-    Returns (url_or_none, best_query_used).
+    Email-domain shortcuts run BEFORE this function in enrich_from_websites
+    (see website_from_emails) — records with a usable contact-email domain
+    skip DDG entirely.
+
+    Returns (url_or_none, best_query_used). The query string in the failure
+    case is whichever attempt ran last, useful for debugging which strategies
+    were tried.
     """
     global _search_stopped
     if _search_stopped:
@@ -512,13 +596,18 @@ def ddg_search_website(
     source_root = _extract_source_root(source_domain)
     location = _extract_search_location(street_address)
 
-    # --- Attempt 1: Full company name + all context (no quotes) ---
-    parts = [company_name]
+    # --- Attempt 1: Quoted exact name + context ---
+    # Quoting forces DDG to treat the name as a phrase, not a bag of words.
+    # Strip nested quotes defensively (e.g. 'Joe "The Builder" Inc') so we
+    # don't generate malformed query syntax.
+    clean_name = company_name.replace('"', '').strip()
+    parts = [f'"{clean_name}"'] if clean_name else []
     if location:
         parts.append(location)
     if category and len(category) < 40:
         parts.append(category)
     query1 = " ".join(parts)
+    last_query = query1
 
     results1 = _ddg_fetch_results(query1)
     if results1:
@@ -526,10 +615,10 @@ def ddg_search_website(
         if match:
             return match, query1
 
-    # --- Attempt 2: Cleaned name (no suffixes) + all context ---
-    # Strips "INC", "LLC", "OF WPB" etc. but keeps location + category
+    # --- Attempt 2: Cleaned name (no suffixes) + context ---
+    # Strips "INC", "LLC", "OF WPB" etc. but keeps location + category.
     if _search_stopped:
-        return None, query1
+        return None, last_query
 
     broad_words = sorted(company_words, key=len, reverse=True)[:4]
     parts2 = broad_words[:]
@@ -539,14 +628,27 @@ def ddg_search_website(
         parts2.append(category)
     query2 = " ".join(parts2)
 
-    # Don't repeat if cleaning didn't change anything
-    if query2 == query1:
-        return None, query1
+    if query2 and query2 != query1:
+        last_query = query2
+        results2 = _ddg_fetch_results(query2)
+        if results2:
+            match = _match_from_results(results2, company_words, source_root)
+            if match:
+                return match, query2
 
-    results2 = _ddg_fetch_results(query2)
-    if results2:
-        match = _match_from_results(results2, company_words, source_root)
-        if match:
-            return match, query2
+    # --- Attempt 3: Quoted phone number ---
+    # A formatted phone like "(512) 555-1234" is often a near-unique
+    # identifier — DDG indexes the business's own header/footer pages.
+    if _search_stopped:
+        return None, last_query
 
-    return None, query1
+    phone_query = _build_phone_query(phone)
+    if phone_query:
+        last_query = phone_query
+        results3 = _ddg_fetch_results(phone_query)
+        if results3:
+            match = _match_from_results(results3, company_words, source_root)
+            if match:
+                return match, phone_query
+
+    return None, last_query

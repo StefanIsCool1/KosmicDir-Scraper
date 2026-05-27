@@ -19,7 +19,10 @@ from html_parser import ( #type: ignore
 )
 from bs4 import BeautifulSoup
 
-from Phase2Bot.page_fetcher import fetch_page, discover_subpages, ddg_search_website, reset_search_state
+from Phase2Bot.page_fetcher import (
+    fetch_page, discover_subpages, ddg_search_website,
+    reset_search_state, website_from_emails,
+)
 
 
 # --- CONFIG ---
@@ -605,6 +608,23 @@ def enrich_from_websites(json_path, event_callback=None):
     # Separate entries: those with website vs those needing Google search
     has_website = [m for m in enrichable if (m.get("website") or "").strip()]
     no_website = [m for m in enrichable if not (m.get("website") or "").strip()]
+
+    # Pre-DDG shortcut: a contact email like john@acmecorp.com is almost
+    # always the company's own domain. Derive the website locally and skip
+    # the DDG roundtrip (which has a 1.5–3s rate-limit sleep per record).
+    email_derived = 0
+    remaining_no_website = []
+    for m in no_website:
+        derived = website_from_emails(m.get("contacts") or [])
+        if derived:
+            m["website"] = derived
+            has_website.append(m)
+            email_derived += 1
+        else:
+            remaining_no_website.append(m)
+    no_website = remaining_no_website
+    if email_derived:
+        log(f"  Derived {email_derived} websites from contact email domains (DDG skipped)")
 
     log(f"  {len(has_website)} have website, {len(no_website)} need Google search, {len(complete)} already complete")
 
