@@ -64,6 +64,68 @@ _SHARED_EMAIL_MIN_COUNT = 5
 _SHARED_EMAIL_MIN_FRACTION = 0.20
 
 
+# --- Dedup key normalization ---
+# Previously the dedup key was just name.lower().strip(). That caused obvious
+# dupes to slip through whenever extraction picked up two formatted variants
+# of the same name — e.g. "Acme Corp" / "Acme Corp." / "Acme Corporation" /
+# "Acme, Corp." would all hash to different keys.
+#
+# Normalization:
+#   1. Lowercase + collapse internal whitespace
+#   2. Strip commas (formatting variation, almost never meaningful)
+#   3. Strip trailing punctuation
+#   4. Strip dots from all tokens (handles "L.L.C." -> "llc", "Inc." -> "inc")
+#   5. Map the trailing token to a canonical form for common business
+#      suffixes (incorporated -> inc, corporation -> corp, etc.)
+#
+# Only the TRAILING token is rewritten so an internal "Co" (e.g. "Co-op
+# Market") isn't accidentally normalized to anything weird.
+
+_TRAILING_PUNCT_RE = re.compile(r'[.,;:!?\-\s]+$')
+
+# Canonical forms for common business-suffix variants. Used after step 4
+# (dot-stripping), so the keys here are dot-free.
+_SUFFIX_CANONICAL = {
+    "incorporated": "inc",
+    "corporation": "corp",
+    "company": "co",
+    "limited": "ltd",
+    # Dot-stripped variants of acronym forms collapse to the same canonical
+    # already (l.l.c. -> llc after step 4), so they don't need entries here.
+}
+
+
+def _normalize_name_key(name: str) -> str:
+    """Build a dedup key for a company name.
+
+    Conflates common formatting variations: "Acme Corp", "Acme Corp.",
+    "Acme Corporation", "Acme, Corp", "ACME CORP" all → "acme corp".
+    Acronym suffixes with dots collapse: "Acme L.L.C." → "acme llc".
+    """
+    if not name:
+        return ""
+    # Lowercase + collapse internal whitespace
+    key = " ".join(name.lower().split())
+    # Strip commas (formatting variation, not semantically meaningful in
+    # company names — "Smith, Jones LLC" almost always = "Smith Jones LLC")
+    key = key.replace(",", " ")
+    # Strip all dots — converts "L.L.C." -> "LLC", "Inc." -> "Inc"
+    key = key.replace(".", "")
+    # Collapse whitespace again (comma->space may have left doubles)
+    key = " ".join(key.split())
+    # Strip remaining trailing punctuation
+    key = _TRAILING_PUNCT_RE.sub('', key)
+    if not key:
+        return ""
+    # Rewrite trailing token if it matches a known full-form suffix
+    tokens = key.split()
+    if tokens:
+        canonical = _SUFFIX_CANONICAL.get(tokens[-1])
+        if canonical:
+            tokens[-1] = canonical
+    return " ".join(tokens).strip()
+
+
 def _is_false_positive_name(name: str) -> bool:
     """True if `name` looks like navigational text, CTA copy, FAQ headings,
     or content-section labels — not a real company/organization name.
@@ -204,7 +266,11 @@ def clean_members(members: list) -> list:
         if _is_false_positive_name(name):
             dropped_false_positives += 1
             continue
-        name_key = name.lower().strip()
+        # Normalized dedup key collapses "Acme Corp" / "Acme Corp." /
+        # "Acme Corporation" / "Acme, Corp" into a single bucket.
+        name_key = _normalize_name_key(name)
+        if not name_key:
+            continue
         if name_key in seen_companies:
             continue  # deduplicate
         seen_companies.add(name_key)

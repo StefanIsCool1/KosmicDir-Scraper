@@ -1,5 +1,5 @@
 export const MOCK_TERMINAL_EVENTS = [
-  { delay: 300, text: '$ kosmic scrape https://members.example.org', category: 'INPUT' },
+  { delay: 300, text: '$ trawlbase scrape https://members.example.org', category: 'INPUT' },
   // Anti-bot setup (real measures)
   { delay: 600, text: '→ Launching headless browser...', category: 'BROWSER' },
   { delay: 400, text: '→ Stealth: navigator.webdriver patched', category: 'BROWSER' },

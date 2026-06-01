@@ -28,8 +28,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Bot"))
 from llm import ask  # type: ignore  # noqa: E402
 
 
-# DDG result quality drops sharply past rank ~5; take top 6 instead of 10.
-MAX_RESULTS_PER_QUERY = 6
+# DDG's HTML search returns ~20-25 results per page. Taking only 6 misses
+# legitimate directories buried below SEO aggregators. 25 pulls the full page;
+# preflight qualification filters the garbage out for free in parallel.
+MAX_RESULTS_PER_QUERY = 25
 MAX_PLATFORM_DORKS = 3
 # Cap paths from a single domain to stop one site dominating the candidate set
 # via its /about, /contact, /news clones.
@@ -183,6 +185,9 @@ def _llm_filter_results(
 
     target = industry or "the target businesses or organizations"
     location_phrase = f" in {location_hint}" if location_hint else ""
+    # query is optional: the single post-dedup pass passes None. Only name the
+    # originating query when filtering one query's results (legacy callers).
+    query_line = f'The search query that produced these was: "{query}"\n\n' if query else ""
 
     prompt = f"""You are filtering DuckDuckGo search results for a scraper.
 
@@ -200,9 +205,7 @@ REJECT results that are obviously:
 - Conference/event pages, course/training pages
 - Unrelated topics that share a keyword
 
-The search query that produced these was: "{query}"
-
-Results:
+{query_line}Results:
 {enumerated}
 
 Return ONLY a JSON object — no markdown fences, no explanation:
@@ -212,7 +215,7 @@ If none of the results look like plausible directory candidates, return {{"keep"
 """
 
     try:
-        raw = ask(prompt, max_tokens=200)
+        raw = ask(prompt, max_tokens=min(1200, 200 + 4 * len(results)))
     except Exception as e:
         print(f"  LLM filter: call failed ({e}) — keeping all {len(results)} results")
         return results, 0
@@ -274,8 +277,12 @@ def discover_candidates(
     industry = (plan.get("industry") or {}).get("canonical", "")
     location_hint = _location_hint(plan)
 
-    # When the same (netloc, path) appears under multiple queries, keep the
-    # better-ranked occurrence rather than first-seen.
+    # Collect + dedup across ALL queries with rule-skip only. The LLM relevance
+    # filter runs ONCE on the deduped survivors (below), not per-query — the
+    # same URL surfacing under several queries used to be sent to the LLM once
+    # per query. When the same (netloc, path) recurs, keep the better-ranked
+    # occurrence. We stash the raw DDG result dict (href/title/snippet) so the
+    # single filter pass has the snippet to judge on.
     by_key: dict[tuple[str, str], dict] = {}
     domain_counts: dict[str, int] = {}
 
@@ -284,57 +291,36 @@ def discover_candidates(
             event_cb({"type": "discovery_query", "query": query})
 
         raw_results = _ddg_fetch_results(query)[:MAX_RESULTS_PER_QUERY]
-
-        # Tag with DDG rank before any filtering, so dedup-prefer-better-rank
-        # still reflects DDG's original ordering rather than post-filter index.
+        # Tag with DDG rank so dedup-prefer-better-rank reflects DDG ordering.
         for rank, r in enumerate(raw_results):
             r["_ddg_rank"] = rank
 
-        # Layer 1: rule-based skip (cheap)
-        survivors = [
-            r for r in raw_results
-            if (r.get("href") or "").startswith("http") and not _is_skippable(r.get("href") or "")
-        ]
-
-        # Layer 2: LLM relevance filter (one call, fail-open)
-        llm_dropped = 0
-        if use_llm_filter and survivors:
-            survivors, llm_dropped = _llm_filter_results(
-                query, survivors, industry, location_hint
-            )
-
         added_for_query = 0
-        for r in survivors:
+        for r in raw_results:
             url = (r.get("href") or "").strip()
-            title = (r.get("title") or "").strip()
-            ddg_rank = r.get("_ddg_rank", MAX_RESULTS_PER_QUERY)
-
+            if not url.startswith("http") or _is_skippable(url):
+                continue
             try:
                 parsed = urlparse(url)
             except Exception:
                 continue
-
             domain = parsed.netloc.lower().replace("www.", "")
             if not domain:
                 continue
             key = (domain, parsed.path.rstrip("/").lower())
+            ddg_rank = r.get("_ddg_rank", MAX_RESULTS_PER_QUERY)
 
             existing = by_key.get(key)
             if existing is not None:
-                if ddg_rank < existing["rank"]:
-                    existing["rank"] = ddg_rank
+                if ddg_rank < existing.get("_ddg_rank", MAX_RESULTS_PER_QUERY):
+                    existing["_ddg_rank"] = ddg_rank
                     existing["via_query"] = query
                 continue
-
             if domain_counts.get(domain, 0) >= MAX_PER_DOMAIN:
                 continue
 
-            by_key[key] = {
-                "url": url,
-                "title": title,
-                "via_query": query,
-                "rank": ddg_rank,
-            }
+            r["via_query"] = query
+            by_key[key] = r
             domain_counts[domain] = domain_counts.get(domain, 0) + 1
             added_for_query += 1
 
@@ -344,7 +330,25 @@ def discover_candidates(
                 "query": query,
                 "added": added_for_query,
                 "total": len(by_key),
-                "llm_dropped": llm_dropped,
             })
 
-    return sorted(by_key.values(), key=lambda c: c["rank"])
+    survivors = list(by_key.values())
+
+    # Single LLM relevance pass over the full deduped set (fail-open). One call
+    # instead of one-per-query, and the model sees every candidate at once.
+    if use_llm_filter and survivors:
+        survivors, llm_dropped = _llm_filter_results(None, survivors, industry, location_hint)
+        print(f"  Discovery filter: kept {len(survivors)}, dropped {llm_dropped} of {len(by_key)}")
+
+    return sorted(
+        (
+            {
+                "url": (r.get("href") or "").strip(),
+                "title": (r.get("title") or "").strip(),
+                "via_query": r.get("via_query", ""),
+                "rank": r.get("_ddg_rank", MAX_RESULTS_PER_QUERY),
+            }
+            for r in survivors
+        ),
+        key=lambda c: c["rank"],
+    )

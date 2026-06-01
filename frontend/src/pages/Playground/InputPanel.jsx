@@ -19,6 +19,7 @@ export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }
   const [taskType, setTaskType] = useState('Auto Discover')
   const [inputValue, setInputValue] = useState('')
   const [priorities, setPriorities] = useState(new Set(DEFAULT_PRIORITIES))
+  const [accurateEnrichment, setAccurateEnrichment] = useState(false)
 
   const togglePriority = (key) => {
     setPriorities((prev) => {
@@ -83,7 +84,7 @@ export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }
     if (allUrls.length === 0) return
     setUrls(allUrls)
     setInputValue('')
-    onRun({ urls: allUrls, taskType, priorityFields: [...priorities] })
+    onRun({ urls: allUrls, taskType, priorityFields: [...priorities], accurateEnrichment })
   }
 
   const activeUrls = urls.filter(Boolean)
@@ -161,7 +162,7 @@ export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }
       {/* Task type */}
       <div>
         <label className="block text-xs font-medium text-gray-400 mb-1.5">Task Type</label>
-        <div className="flex rounded-lg border border-gray-200 p-0.5">
+        <div data-tour="playground-task-type" className="flex rounded-lg border border-gray-200 p-0.5">
           {TASK_TYPES.map((type) => (
             <button
               key={type}
@@ -206,6 +207,28 @@ export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }
         </p>
       </div>
 
+      {/* Accurate enrichment toggle */}
+      <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5">
+        <label className="flex items-start gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={accurateEnrichment}
+            onChange={(e) => setAccurateEnrichment(e.target.checked)}
+            disabled={isRunning}
+            className="mt-0.5 h-4 w-4 rounded border-gray-300 text-accent focus:ring-accent disabled:opacity-50"
+          />
+          <span className="flex-1">
+            <span className="block text-sm font-medium text-gray-700">
+              More accurate web enrichment
+            </span>
+            <span className="mt-0.5 block text-[11px] text-amber-600">
+              ⚠ WARNING: takes longer — verifies each candidate website by fetching and matching
+              phone, email, address, and name against the page.
+            </span>
+          </span>
+        </label>
+      </div>
+
       {/* Run button */}
       <button
         type="submit"
@@ -222,7 +245,7 @@ export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }
             <Play size={16} />
             {activeUrls.length > 1 || (activeUrls.length === 1 && inputValue.trim())
               ? `Scrape ${activeUrls.length + (inputValue.trim() ? 1 : 0)} Sites`
-              : 'Run Kosmic Scraper'}
+              : 'Run Trawlbase'}
           </>
         )}
       </button>

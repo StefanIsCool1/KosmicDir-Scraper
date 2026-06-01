@@ -1,7 +1,6 @@
 import HeroSection from './HeroSection'
-import SocialProof from './SocialProof'
 import FeaturesGrid from './FeaturesGrid'
-import ComparisonTable from './ComparisonTable'
+import WhyChooseUs from './WhyChooseUs'
 import HowItWorks from './HowItWorks'
 import CTASection from './CTASection'
 
@@ -9,10 +8,9 @@ export default function Landing() {
   return (
     <>
       <HeroSection />
-      <SocialProof />
       <FeaturesGrid />
-      <ComparisonTable />
       <HowItWorks />
+      <WhyChooseUs />
       <CTASection />
     </>
   )

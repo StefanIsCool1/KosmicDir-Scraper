@@ -59,7 +59,7 @@ export default function Docs() {
             Documentation
           </h1>
           <p className="mt-4 text-lg text-gray-500">
-            How Kosmic Scraper works under the hood — the extraction pipeline,
+            How Trawlbase works under the hood — the extraction pipeline,
             anti-detection stack, enrichment system, and output format.
           </p>
         </div>
@@ -103,7 +103,7 @@ export default function Docs() {
       <SectionWrapper>
         <h2 className="text-2xl font-bold tracking-tight text-gray-900">AI Selector Learning</h2>
         <p className="mt-3 max-w-2xl text-sm text-gray-500">
-          Most scrapers force you to write CSS selectors by hand. Kosmic Scraper
+          Most scrapers force you to write CSS selectors by hand. Trawlbase
           learns them automatically from 3 sample HTML cards using Claude Haiku,
           then applies those selectors to extract thousands of records with zero AI cost.
         </p>
@@ -139,7 +139,7 @@ export default function Docs() {
       <SectionWrapper className="bg-gray-50/60">
         <h2 className="text-2xl font-bold tracking-tight text-gray-900">Anti-Detection Stack</h2>
         <p className="mt-3 max-w-2xl text-sm text-gray-500">
-          Modern websites use multiple layers of bot detection. Kosmic Scraper
+          Modern websites use multiple layers of bot detection. Trawlbase
           defeats each one with a corresponding countermeasure.
         </p>
 
@@ -246,9 +246,9 @@ export default function Docs() {
         <div className="mt-6 max-w-2xl">
           <Collapse title="What kind of sites does this work on?" defaultOpen>
             <p>
-              Any public directory or listing page — builder associations, chambers
-              of commerce, medical directories, attorney directories, restaurant
-              listings, real estate agent pages. The AI adapts to each site's
+              Any public directory or listing page — HOA rosters, chambers of
+              commerce, trade and professional associations, medical and attorney
+              directories, real estate agent pages. The AI adapts to each site's
               structure. Sites built on GrowthZone, ChamberMaster, YourMembership,
               WordPress, and custom CMS platforms are all supported.
             </p>

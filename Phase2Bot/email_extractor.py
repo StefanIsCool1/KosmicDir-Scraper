@@ -17,11 +17,17 @@ from html_parser import ( #type: ignore
     _PHONE_RE, _EMAIL_RE, _ADDRESS_RE, _STATE_ZIP_RE,
     strip_junk, FAX_CONTEXT_WINDOW,
 )
+from main import read_members, read_metadata, compute_metadata  # type: ignore
 from bs4 import BeautifulSoup
 
 from Phase2Bot.page_fetcher import (
     fetch_page, discover_subpages, ddg_search_website,
     reset_search_state, website_from_emails,
+    _ddg_fetch_results,
+)
+from Phase2Bot.vertical_enrichment import (
+    enrich_by_vertical, reset_vertical_cache,
+    VERTICAL_HEALTHCARE, VERTICAL_LAWYER, VERTICAL_REAL_ESTATE, VERTICAL_BUSINESS,
 )
 
 
@@ -108,7 +114,7 @@ def _email_sort_key(email: str) -> tuple[int, int, str]:
 
 
 def _extract_emails(soup):
-    """Extract emails, ranked by contact relevance. Returns top 3."""
+    """Extract emails, ranked by contact relevance. Returns up to MAX_EMAILS."""
     emails = set()
 
     for a in soup.find_all("a", href=True):
@@ -156,7 +162,7 @@ def _extract_phones(soup):
         href = str(a["href"])
         if href.lower().startswith("tel:"):
             number = href[4:].strip()
-            number = re.sub(r'[^\d+()-.\s]', '', number)
+            number = re.sub(r'[^\d+()\-.\s]', '', number)
             _add_phone(number)
 
     # Priority 2: regex matches from page text (but capped)
@@ -236,7 +242,9 @@ def _extract_social_media(soup):
         except Exception:
             continue
         for sd, platform in SOCIAL_DOMAINS.items():
-            if sd in domain and platform not in social:
+            # Exact host or subdomain only — a substring test would tag
+            # netflix.com (and any *x.com) as the "x.com" Twitter profile.
+            if (domain == sd or domain.endswith("." + sd)) and platform not in social:
                 social[platform] = href
                 break
     return social
@@ -424,7 +432,10 @@ def _extract_jsonld(soup):
                 if state:
                     parts.append(state)
                 if zipcode:
-                    parts[-1] = parts[-1] + " " + zipcode if parts else zipcode
+                    if parts:
+                        parts[-1] = parts[-1] + " " + zipcode
+                    else:
+                        parts.append(zipcode)
                 if len(parts) >= 2:
                     result.setdefault("address", ", ".join(parts))
             elif isinstance(addr, str) and len(addr) > 10:
@@ -590,15 +601,22 @@ def _needs_enrichment(member):
     return not (has_desc and has_phone and has_email)
 
 
-def enrich_from_websites(json_path, event_callback=None):
-    """Main entry point. Reads structured JSON, enriches entries, saves to Phase2-Dump."""
+def enrich_from_websites(json_path, event_callback=None, accurate_enrichment: bool = False):
+    """Main entry point. Reads structured JSON, enriches entries, saves to Phase2-Dump.
+
+    accurate_enrichment: when True, forwarded to ddg_search_website as
+    `accurate=True` so missing-website lookups use the verify-by-fetch path
+    (fetches and scores the top 3 candidates against record signals) instead
+    of the default fast word-match. Surfaced as the "More accurate web
+    enrichment" toggle in the Agent and Playground UIs. Default False
+    preserves existing behavior for any caller that doesn't pass it.
+    """
     def log(msg):
         print(msg)
         if event_callback:
             event_callback({"type": "log", "message": msg})
 
-    with open(json_path) as f:
-        members = json.load(f)
+    members = read_members(json_path)
 
     log(f"Loaded {len(members)} members from {os.path.basename(json_path)}")
 
@@ -626,6 +644,65 @@ def enrich_from_websites(json_path, event_callback=None):
     if email_derived:
         log(f"  Derived {email_derived} websites from contact email domains (DDG skipped)")
 
+    # Vertical-aware enrichment: route each record by profession before
+    # falling through to generic DDG. Healthcare records hit NPI Registry
+    # (free CMS API) for phone + address + taxonomy. Lawyer/RE records get
+    # tuned DDG queries that prefer authoritative profile sites. Business
+    # records are passed through unchanged.
+    reset_vertical_cache()
+    # Reset the DDG search kill-switch BEFORE the vertical loop — lawyer/RE
+    # enrichment below uses DDG, so a stale flag from a previous run would
+    # silently skip it. (It used to be reset only later, before the
+    # missing-website search.)
+    reset_search_state()
+    vertical_counts = {VERTICAL_HEALTHCARE: 0, VERTICAL_LAWYER: 0,
+                       VERTICAL_REAL_ESTATE: 0, VERTICAL_BUSINESS: 0}
+    npi_phone_filled = 0
+    lawyer_website_filled = 0
+    realestate_website_filled = 0
+
+    # Iterate over a copy so we can safely move records into has_website.
+    for m in list(no_website):
+        vertical, enrichment = enrich_by_vertical(m, ddg_fetcher=_ddg_fetch_results)
+        vertical_counts[vertical] = vertical_counts.get(vertical, 0) + 1
+
+        if not enrichment:
+            continue
+
+        # Merge enrichment fields, never overwriting non-empty existing values
+        got_phone = False
+        for k, v in enrichment.items():
+            if v and not m.get(k):
+                m[k] = v
+                if k == "phone":
+                    got_phone = True
+
+        if vertical == VERTICAL_HEALTHCARE and got_phone:
+            npi_phone_filled += 1
+
+        # If the vertical lookup produced a website (lawyer/RE paths), move
+        # the record into has_website so the standard enrichment loop runs.
+        if m.get("website"):
+            has_website.append(m)
+            no_website.remove(m)
+            if vertical == VERTICAL_LAWYER:
+                lawyer_website_filled += 1
+            elif vertical == VERTICAL_REAL_ESTATE:
+                realestate_website_filled += 1
+
+    if any(vertical_counts.values()):
+        log(f"  Vertical classification: "
+            f"{vertical_counts[VERTICAL_HEALTHCARE]} healthcare, "
+            f"{vertical_counts[VERTICAL_LAWYER]} lawyer, "
+            f"{vertical_counts[VERTICAL_REAL_ESTATE]} real_estate, "
+            f"{vertical_counts[VERTICAL_BUSINESS]} business")
+    if npi_phone_filled:
+        log(f"  NPI Registry: filled phone for {npi_phone_filled} healthcare records")
+    if lawyer_website_filled:
+        log(f"  Lawyer directories: found website for {lawyer_website_filled} records")
+    if realestate_website_filled:
+        log(f"  Real estate directories: found website for {realestate_website_filled} records")
+
     log(f"  {len(has_website)} have website, {len(no_website)} need Google search, {len(complete)} already complete")
 
     # --- Phase A: Google search for missing websites (sequential to avoid CAPTCHA) ---
@@ -634,9 +711,6 @@ def enrich_from_websites(json_path, event_callback=None):
 
     found_websites = {}  # {company_name: url}
     if no_website:
-        # Reset search-stopped flag from any previous run
-        reset_search_state()
-
         log(f"  Searching DuckDuckGo for {len(no_website)} missing websites...")
         for i, m in enumerate(no_website):
             name = m.get("company_name", "")
@@ -648,6 +722,8 @@ def enrich_from_websites(json_path, event_callback=None):
                 category=m.get("category"),
                 phone=m.get("phone"),
                 source_domain=source_domain,
+                contacts=m.get("contacts"),
+                accurate=accurate_enrichment,
             )
             if found_url:
                 m["website"] = found_url
@@ -788,15 +864,40 @@ def enrich_from_websites(json_path, event_callback=None):
     output_path = os.path.join(PHASE2_DUMP_DIR, basename)
     os.makedirs(PHASE2_DUMP_DIR, exist_ok=True)
 
+    # Wrap output with the same metadata block Phase 1 writes. Coverage counts
+    # are computed over the enriched records, so they reflect post-enrichment
+    # completeness. Carry forward the original scrape time / source / intent
+    # from the Phase 1 file and add Phase-2-specific fields.
+    from datetime import datetime, timezone
+    orig_meta = read_metadata(json_path) or {}
+    extra = {"enriched_at": datetime.now(timezone.utc).isoformat()}
+    if orig_meta.get("scraped_at"):
+        extra["scraped_at"] = orig_meta["scraped_at"]  # preserve original scrape time
+    for key in ("intent_industry", "intent_locations"):
+        if key in orig_meta:
+            extra[key] = orig_meta[key]
+    extra["records_enriched"] = sum(
+        1 for r in results if isinstance(r, dict) and r.get("enrichment_status") == "enriched"
+    )
+    metadata = compute_metadata(results, source_url=orig_meta.get("source_url", ""), **extra)
+
     with open(output_path, "w") as f:
-        json.dump(results, f, indent=4, ensure_ascii=False)
+        json.dump({"metadata": metadata, "members": results}, f, indent=4, ensure_ascii=False)
 
     # Update original structured JSON with discovered websites
     if found_websites:
         log(f"  Updating {len(found_websites)} websites in original JSON...")
         try:
+            # Read preserving metadata if present
             with open(json_path) as f:
-                original = json.load(f)
+                raw = json.load(f)
+            if isinstance(raw, dict) and "members" in raw:
+                original = raw["members"]
+                has_meta = True
+            else:
+                original = raw if isinstance(raw, list) else []
+                has_meta = False
+
             updated = 0
             for m in original:
                 name = m.get("company_name", "")
@@ -805,7 +906,11 @@ def enrich_from_websites(json_path, event_callback=None):
                     updated += 1
             if updated > 0:
                 with open(json_path, "w") as f:
-                    json.dump(original, f, indent=4, ensure_ascii=False)
+                    if has_meta:
+                        raw["members"] = original
+                        json.dump(raw, f, indent=4, ensure_ascii=False)
+                    else:
+                        json.dump(original, f, indent=4, ensure_ascii=False)
                 log(f"  Updated {updated} websites in {os.path.basename(json_path)}")
         except Exception as e:
             log(f"  Failed to update original JSON: {e}")

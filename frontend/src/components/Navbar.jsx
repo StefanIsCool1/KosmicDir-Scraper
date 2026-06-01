@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { Link, useLocation } from 'react-router-dom'
+import { motion } from 'framer-motion'
 import { Menu, X } from 'lucide-react'
 import Button from './Button'
 import { NAV_LINKS } from '../lib/constants'
+import { EASE } from '../lib/motion'
 
 export default function Navbar() {
   const [open, setOpen] = useState(false)
@@ -18,11 +20,16 @@ export default function Navbar() {
   useEffect(() => { setOpen(false) }, [location])
 
   return (
-    <nav className={`fixed top-0 left-0 right-0 z-50 transition-all duration-200 ${scrolled ? 'bg-white/80 backdrop-blur-md border-b border-gray-100' : 'bg-white border-b border-transparent'}`}>
+    <motion.nav
+      initial={{ y: -16, opacity: 0 }}
+      animate={{ y: 0, opacity: 1 }}
+      transition={{ duration: 0.5, ease: EASE }}
+      className={`fixed top-0 left-0 right-0 z-50 transition-all duration-200 ${scrolled ? 'bg-white/80 backdrop-blur-md border-b border-gray-100' : 'bg-white border-b border-transparent'}`}
+    >
       <div className="mx-auto flex max-w-site items-center justify-between px-6 py-4">
-        <Link to="/" className="flex items-center gap-1 text-lg">
-          <span className="font-bold tracking-tighter text-gray-900">Kosmic</span>
-          <span className="font-light text-gray-400">Scraper</span>
+        <Link to="/" className="flex items-center text-lg">
+          <span className="font-bold tracking-tighter text-gray-900">Trawl</span>
+          <span className="font-light text-accent">base</span>
         </Link>
 
         {/* Desktop nav */}
@@ -31,6 +38,7 @@ export default function Navbar() {
             <Link
               key={link.label}
               to={link.href}
+              data-tour={link.label === 'Playground' ? 'nav-playground' : link.label === 'Discover' ? 'nav-agent' : undefined}
               className={`text-sm transition-colors ${link.disabled ? 'pointer-events-none text-gray-300' : 'text-gray-500 hover:text-gray-900'}`}
             >
               {link.label}
@@ -65,6 +73,6 @@ export default function Navbar() {
           </div>
         </div>
       )}
-    </nav>
+    </motion.nav>
   )
 }

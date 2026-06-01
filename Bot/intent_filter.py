@@ -26,6 +26,9 @@ from llm import ask
 # loop bounded even when several sibling categories all look relevant
 # (e.g. "Food", "Dining", "Restaurants" on the same chamber).
 MAX_KEEP_PER_INTENT = 3
+# Inclusive scope can keep a few more — the narrow trade category PLUS umbrella
+# categories (General Contractors, Remodelers, Builders) that also contain it.
+MAX_KEEP_INCLUSIVE = 5
 
 
 def intent_from_plan(plan: dict | None) -> dict | None:
@@ -48,12 +51,19 @@ def intent_from_plan(plan: dict | None) -> dict | None:
         if (a or "").strip()
     ]
     locations = plan.get("locations") or []
+    scope = (plan.get("scope") or "inclusive").lower()
+    if scope not in ("specialist", "inclusive"):
+        scope = "inclusive"
     return {
         "industry_canonical": canonical,
         "industry_aliases": aliases,
         "entity_type": industry.get("entity_type") or "",
         "location_states": [loc.get("state", "") for loc in locations if loc.get("state")],
         "location_cities": [c for loc in locations for c in (loc.get("cities_hint") or [])],
+        # "specialist" = only on-the-nose categories/records; "inclusive" =
+        # also keep general contractors / remodelers who do the work. Set by
+        # the Phase 0 scope gate; defaults to inclusive everywhere else.
+        "scope": scope,
     }
 
 
@@ -69,12 +79,14 @@ def _llm_pick_categories(
     categories: list[dict],
     intent: dict,
     max_keep: int = MAX_KEEP_PER_INTENT,
+    scope: str = "inclusive",
 ) -> list[dict]:
     """One DeepSeek call: pick up to `max_keep` categories that match intent.
 
-    Used when substring matching finds zero hits — catches synonyms
-    ("Dining Out" → restaurants) and broader umbrellas ("Food & Beverage").
-    Returns [] on any failure path; the caller treats that as "fall open".
+    Catches synonyms ("Dining Out" → restaurants) and, in inclusive scope,
+    broader umbrellas ("Food & Beverage", "General Contractors"). Scope tunes
+    breadth: "specialist" excludes umbrella categories, "inclusive" includes
+    them. Returns [] on any failure path; the caller treats that as "fall open".
     """
     if not categories:
         return []
@@ -88,12 +100,27 @@ def _llm_pick_categories(
         for i, cat in enumerate(categories)
     )
 
+    if scope == "specialist":
+        breadth_rule = (
+            f"Pick ONLY labels that specifically and primarily mean {canonical}. "
+            f"Do NOT include broad umbrella categories (e.g. \"General Contractors\", "
+            f"\"Construction\", \"Builders\") unless the label itself essentially means "
+            f"{canonical}."
+        )
+    else:
+        breadth_rule = (
+            f"Include BOTH on-the-nose labels AND broader umbrella categories that would "
+            f"plausibly contain {canonical} (e.g. for \"deck builders\": \"General "
+            f"Contractors\", \"Remodelers\", \"Builders\", \"Carpentry\"; for restaurants: "
+            f"\"Food & Beverage\")."
+        )
+
     prompt = f"""You are picking category labels from a directory listing page.
 
 The user wants entries about: {canonical}{alias_hint}.
 
 Pick up to {max_keep} category labels below that are MOST LIKELY to contain {canonical}.
-Include synonyms and broader umbrella terms (e.g. "Food & Beverage" is relevant for restaurants).
+{breadth_rule}
 If none of the labels could plausibly contain {canonical}, return an empty list.
 
 Categories:
@@ -158,6 +185,7 @@ def filter_categories_by_intent(
     if not intent or not categories:
         return categories
 
+    scope = (intent.get("scope") or "inclusive").lower()
     canonical = (intent.get("industry_canonical") or "").lower()
     aliases = {(a or "").lower() for a in intent.get("industry_aliases", []) if a}
     if canonical:
@@ -165,30 +193,64 @@ def filter_categories_by_intent(
     if not aliases:
         return categories
 
-    matches: list[dict] = []
+    # Cheap layer: on-the-nose substring matches (the NARROW trade categories).
+    substring_matches: list[dict] = []
     for cat in categories:
         text = (cat.get("text") or "").lower()
         if any(a and a in text for a in aliases):
-            matches.append(cat)
+            substring_matches.append(cat)
 
-    if matches:
-        capped = matches[:MAX_KEEP_PER_INTENT]
+    # --- Specialist: keep only the narrow categories. ---
+    # Substring hits are exactly that; only fall to the LLM when substring
+    # found nothing (catches synonyms the substring missed). Cheap path.
+    if scope == "specialist":
+        if substring_matches:
+            capped = substring_matches[:MAX_KEEP_PER_INTENT]
+            print(
+                f"  Intent category filter [specialist]: substring matched "
+                f"{len(capped)}/{len(categories)} for '{canonical}'"
+            )
+            return capped
+        picked = _llm_pick_categories(
+            categories, intent, max_keep=MAX_KEEP_PER_INTENT, scope="specialist"
+        )
+        if picked:
+            print(
+                f"  Intent category filter [specialist]: LLM picked "
+                f"{len(picked)}/{len(categories)} for '{canonical}'"
+            )
+            return picked
         print(
-            f"  Intent category filter: substring matched {len(capped)}/{len(categories)} "
-            f"for '{canonical}'"
+            f"  Intent category filter [specialist]: no matches for '{canonical}' "
+            f"— iterating all {len(categories)} categories"
+        )
+        return categories
+
+    # --- Inclusive: narrow categories PLUS umbrella categories (General
+    # Contractors, Remodelers…) that also contain the trade. One LLM call
+    # gathers umbrellas; union with substring matches (narrow first). ---
+    picked = _llm_pick_categories(
+        categories, intent, max_keep=MAX_KEEP_INCLUSIVE, scope="inclusive"
+    )
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for cat in substring_matches + picked:
+        key = (cat.get("text") or "") + "|" + (cat.get("href") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(cat)
+
+    if merged:
+        capped = merged[:MAX_KEEP_INCLUSIVE]
+        print(
+            f"  Intent category filter [inclusive]: kept {len(capped)}/{len(categories)} "
+            f"for '{canonical}' ({len(substring_matches)} narrow + umbrellas)"
         )
         return capped
 
-    picked = _llm_pick_categories(categories, intent, max_keep=MAX_KEEP_PER_INTENT)
-    if picked:
-        print(
-            f"  Intent category filter: LLM picked {len(picked)}/{len(categories)} "
-            f"for '{canonical}'"
-        )
-        return picked
-
     print(
-        f"  Intent category filter: no matches for '{canonical}' — "
+        f"  Intent category filter [inclusive]: no matches for '{canonical}' — "
         f"iterating all {len(categories)} categories"
     )
     return categories

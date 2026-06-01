@@ -956,7 +956,7 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
 
         # Adaptive throttle: tracks last N response times to adjust delay
         recent_times = []
-        current_delay = DETAIL_CRAWL_DELAY_MAX  # start conservative
+        current_delay = 0.25  # start fast, only back off on rate limits
 
         for i, url in enumerate(remaining_urls):
             try:
@@ -977,16 +977,13 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
                 avg_time = sum(recent_times) / len(recent_times)
                 if consecutive_429s > 0:
                     # Back off: double delay for each consecutive 429, cap at 5s
-                    current_delay = min(5.0, DETAIL_CRAWL_DELAY_MAX * (2 ** consecutive_429s))
-                elif avg_time < 0.3 and len(recent_times) >= 5:
-                    # Server is fast — reduce delay (floor 0.15s)
-                    current_delay = max(0.15, avg_time * 0.5)
-                elif avg_time < 0.8 and len(recent_times) >= 5:
-                    # Server is moderate — use shorter delay
-                    current_delay = max(0.3, avg_time * 0.6)
+                    current_delay = min(5.0, 0.5 * (2 ** consecutive_429s))
+                elif avg_time < 1.0 and len(recent_times) >= 5:
+                    # Server is responsive — crawl at pace (floor 0.15s)
+                    current_delay = max(0.15, avg_time * 0.35)
                 else:
-                    # Server is slow or we don't have enough data yet — stay conservative
-                    current_delay = DETAIL_CRAWL_DELAY_MAX
+                    # Slow server or not enough data — moderate pace
+                    current_delay = 0.5
 
                 consecutive_429s = 0  # reset on success
 
@@ -1015,7 +1012,7 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
                 err_str = str(e).lower()
                 if "429" in err_str or "rate" in err_str or "too many" in err_str:
                     consecutive_429s += 1
-                    current_delay = min(5.0, DETAIL_CRAWL_DELAY_MAX * (2 ** consecutive_429s))
+                    current_delay = min(5.0, 0.5 * (2 ** consecutive_429s))
                     print(f"    Rate limited! Backing off to {current_delay:.1f}s delay")
                     time.sleep(current_delay)
                 elif failed <= 5:

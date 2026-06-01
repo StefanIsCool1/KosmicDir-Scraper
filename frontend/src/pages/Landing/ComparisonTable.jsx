@@ -16,10 +16,10 @@ export default function ComparisonTable() {
     <SectionWrapper gray>
       <div className="text-center">
         <h2 className="text-3xl font-bold tracking-tighter text-gray-900 sm:text-4xl">
-          How Kosmic Scraper compares
+          How Trawlbase compares
         </h2>
         <p className="mx-auto mt-4 max-w-lg text-gray-500">
-          The only tool with built-in enrichment, real-time monitoring, and full anti-bot bypass.
+          The only tool that goes from a plain-English goal to enriched, structured data — on its own.
         </p>
       </div>
 
@@ -40,7 +40,7 @@ export default function ComparisonTable() {
                 <th
                   key={name}
                   className={`pb-4 px-4 text-center text-xs font-semibold uppercase tracking-wide ${
-                    name === 'Kosmic Scraper'
+                    name === 'Trawlbase'
                       ? 'text-accent'
                       : 'text-gray-400'
                   }`}
@@ -60,7 +60,7 @@ export default function ComparisonTable() {
                   <td
                     key={name}
                     className={`py-3.5 px-4 text-center ${
-                      name === 'Kosmic Scraper' ? 'bg-accent-50/40' : ''
+                      name === 'Trawlbase' ? 'bg-accent-50/40' : ''
                     }`}
                   >
                     <div className="flex items-center justify-center">

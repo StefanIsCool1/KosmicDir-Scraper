@@ -2,12 +2,17 @@
 Phase 0 — Intent Parsing
 One LLM call: free-form user goal → structured search plan.
 
-Also acts as the SCOPE GATE for the whole pipeline. The tool scrapes
-directories of businesses/organizations/professionals/members — not jobs,
-news, products, real estate, recipes, events, or individual people.
-Out-of-scope queries return is_actionable=false with a clarification
-explaining the tool's scope, so the user doesn't waste time on a scrape
-whose schema (company_name/phone/address/website) doesn't fit their goal.
+Also acts as the SCOPE GATE for the whole pipeline. The test is simple:
+does an online DIRECTORY or LISTING of these entities exist? The unit may
+be a business, an organization, OR an individual professional/member —
+dentists, lawyers, and real-estate agents are all in scope, because
+directories of them exist (Phase 2 even has dedicated per-vertical lookups
+for them). Out of scope is data that doesn't live in a directory: jobs,
+news, products, real-estate *property* listings, recipes, events, raw
+statistics, a single named private person, or a category of people no
+directory indexes (retail clerks, employees, residents). Those return
+is_actionable=false with a clarification, so the user doesn't waste time on
+a scrape whose schema (company_name/phone/address/website) doesn't fit.
 
 Reuses Bot/llm.py's ask() client (DeepSeek, OpenAI-compatible) without
 modifying it. Falls back to a deterministic plan if the call fails.
@@ -59,7 +64,7 @@ def _build_prompt(goal: str) -> str:
 
 User message: {goal}
 
-This tool scrapes DIRECTORIES of businesses, organizations, professionals, and members. It extracts fields like company_name, phone, address, website, contacts. It does NOT handle jobs, news, products, real estate listings, recipes, events, or individual people.
+This tool scrapes DIRECTORIES and LISTINGS of entities — businesses, organizations, professionals, and members. It extracts fields like company_name, phone, address, website, contacts. The entity CAN be an individual professional: a dentist, lawyer, or real-estate agent is in scope, because directories of them exist. The real test for any goal is: "would I find these on a directory or listing page?" It does NOT handle data that has no such directory — job postings, news, products for sale, real-estate PROPERTY listings (homes/apartments), recipes, events, raw statistics, or a SINGLE named private person.
 
 FIRST decide if this is an actionable goal FOR THIS TOOL.
 
@@ -76,7 +81,7 @@ NOT ACTIONABLE — the user wants something this tool can't produce. Set is_acti
   • PRODUCTS / shopping ("laptops under $1000", "Nike shoes", "buy X")
   • REAL ESTATE listings ("homes for sale", "apartments for rent", "houses in Austin")
   • RECIPES / how-to / blog content
-  • INDIVIDUAL PERSON searches ("find John Smith", "LinkedIn profile of X")
+  • A SINGLE NAMED private person ("find John Smith", "LinkedIn profile of Jane Doe"). NOTE: a CATEGORY of listed professionals is IN scope — "dentists in Austin", "real estate agents in Denver" are ACTIONABLE because directories of them exist.
   • EVENTS ("concerts this weekend", "conferences in 2026")
   • PURE DATA / statistics ("how many X exist", "average salary of Y")
   • Greetings, tool questions, vague requests ("hi", "what can you do", "scrape something", random text)
@@ -88,12 +93,14 @@ DISAMBIGUATION RULE — focus on the PRIMARY thing the user wants:
   • "homes for sale in Austin" → NOT actionable (user wants property listings)
   • "marketing agencies" → ACTIONABLE
   • "marketing jobs" → NOT actionable
+  • "dentists in Austin" → ACTIONABLE (a directory of dentists exists)
+  • "retail stores in Minnesota" → ACTIONABLE; "retail workers/employees in Minnesota" → NOT actionable (no directory of individual store employees)
 If genuinely ambiguous, default to ACTIONABLE.
 
 Return ONLY a JSON object — no markdown fences, no explanation. Use this schema:
 {{
   "is_actionable": <true | false>,
-  "clarification": "<REQUIRED when NOT actionable. 1-2 friendly sentences. For greetings/vague messages: ask what they want to scrape with an example like 'HOAs in Washington' or 'dentists in Austin'. For OUT-OF-SCOPE data types: briefly say this tool scrapes business/member directories (not jobs/products/news/etc.) and suggest a related directory query that WOULD work — e.g. for 'jobs in Austin' suggest 'staffing agencies in Austin'; for 'homes for sale in Austin' suggest 'real estate agencies in Austin'; for 'best restaurants reviews' suggest 'restaurants in <city>'. Omit when actionable.>",
+  "clarification": "<REQUIRED when NOT actionable. 1-2 friendly sentences. For greetings/vague messages: ask what they want to scrape with an example like 'HOAs in Washington' or 'dentists in Austin'. For OUT-OF-SCOPE goals: explain it in terms of whether a DIRECTORY of the thing exists — this tool needs a directory/listing to scrape — then suggest the closest query that WOULD work. Do NOT claim it can't do individual professionals; it can (dentists, lawyers, agents). Examples: 'jobs in Austin' → suggest 'staffing agencies in Austin'; 'homes for sale in Austin' → suggest 'real estate agencies in Austin'; 'retail workers in Minnesota' → suggest 'retail stores in Minnesota'; 'best restaurants reviews' → suggest 'restaurants in <city>'. Omit when actionable.>",
   "industry": {{
     "canonical": "<lowercase canonical name, e.g. 'homeowners associations'>",
     "aliases": ["<2-5 alternate names the directory might use>"],
@@ -105,7 +112,12 @@ Return ONLY a JSON object — no markdown fences, no explanation. Use this schem
   "search_queries": [
     "<3-6 search queries, each under 80 chars, that would find directory pages for this industry + location>"
   ],
-  "platform_hints": ["<known directory platforms or domains, e.g. 'growthzone', 'yourmembership', 'hoa-usa.com'>"]
+  "platform_hints": ["<known directory platforms or domains, e.g. 'growthzone', 'yourmembership', 'hoa-usa.com'>"],
+  "api_vertical": "<'npi' if the goal is US HEALTHCARE PRACTITIONERS the NPI registry covers — dentists, chiropractors, optometrists, podiatrists, physical/occupational/speech therapists, psychologists, audiologists, dietitians, nurse practitioners, midwives, pharmacists, acupuncturists, etc. — AND a US state is given. Otherwise null. Do NOT use 'npi' for veterinarians (not in NPI), hospitals/clinics (use a directory), or broad 'doctors'/'physicians' (too many taxonomies — leave null).>",
+  "api_params": {{"taxonomy": "<the practitioner type, singular, e.g. 'dentist'>", "state": "<2-letter US state>", "city": "<optional single city, or empty string>"}},
+  "scope_ambiguous": <true | false>,
+  "scope_question": "<REQUIRED when scope_ambiguous=true: ONE friendly sentence asking whether they want specialists only, or anyone who does this work. Empty string otherwise.>",
+  "scope_options": ["<short label for the SPECIALISTS-ONLY choice>", "<short label for the ANYONE-WHO-DOES-IT choice>"]
 }}
 
 When is_actionable is false, only "is_actionable" and "clarification" are required — omit the other fields.
@@ -116,6 +128,26 @@ Rules when actionable:
 - "Washington" without other context means WA state, not DC.
 - search_queries should be diverse — mix "<state> <industry> directory", "find a <industry>", "<industry> member list", etc.
 - platform_hints may be [] if you don't know any specific platform for this industry.
+- api_vertical: set "npi" ONLY for the healthcare practitioners listed above with a US state.
+  When unsure, leave it null — a downstream check validates the taxonomy and falls back to
+  normal directory discovery anyway, so a wrong "npi" guess wastes the routing, not the run.
+
+SCOPE AMBIGUITY — decide whether the target is a specific build/remodel/trade CAPABILITY that
+general contractors, remodelers, or broader firms also provide, so "the results" could mean two
+different things to the user:
+- Set scope_ambiguous=TRUE when the industry is a capability generalists also offer and would be
+  found mixed into general builder/contractor directories: decks, fences, kitchens, bathrooms,
+  basements, remodeling, flooring, siding, patios, sunrooms, additions, landscaping, painting,
+  concrete, etc. These directories list both specialists AND general firms that do this work
+  among many other things — so the user must tell us which they want.
+- Set scope_ambiguous=FALSE for self-contained categories where membership is unambiguous: HOAs,
+  dentists, doctors, law firms, restaurants, chambers of commerce, accounting/CPA firms, real
+  estate agencies, staffing agencies, insurance agencies, veterinarians.
+- When TRUE, write scope_question as ONE friendly sentence and scope_options as exactly two short
+  labels [specialists-only, anyone-who-does-it]. Example for "deck builders":
+  scope_question: "Do you want only companies that specialize in decks, or also general contractors and remodelers who build decks among other work?"
+  scope_options: ["Deck specialists only", "Anyone who builds decks"]
+- When FALSE, set scope_question to "" and scope_options to [].
 """
 
 
@@ -161,6 +193,11 @@ def _fallback_plan(goal: str) -> dict:
             f"{goal} association",
         ],
         "platform_hints": [],
+        "scope_ambiguous": False,
+        "scope_question": "",
+        "scope_options": [],
+        "api_vertical": None,
+        "api_params": {},
     }
 
 
@@ -173,6 +210,11 @@ def _clarification_plan(question: str) -> dict:
         "locations": [],
         "search_queries": [],
         "platform_hints": [],
+        "scope_ambiguous": False,
+        "scope_question": "",
+        "scope_options": [],
+        "api_vertical": None,
+        "api_params": {},
     }
 
 
@@ -188,7 +230,8 @@ def _is_trivial(goal: str) -> bool:
 
 
 _DEFAULT_CLARIFICATION = (
-    "This tool scrapes ONLY directory type data of businesses, organizations, and professionals "
+    "This tool scrapes directory-style listings — businesses, organizations, "
+    "and individual professionals (e.g. dentists, lawyers, agents). "
     "What kind of directory are you looking for? "
     "Try something like 'HOAs in Washington' or 'dentists in Austin, TX'."
 )
@@ -241,6 +284,24 @@ def parse_intent(goal: str) -> dict:
     plan.setdefault("industry", {"canonical": goal.lower(), "aliases": [], "entity_type": "business"})
     plan.setdefault("locations", [])
     plan.setdefault("platform_hints", [])
+
+    # Scope refinement: only a clean boolean + question/options survive. If the
+    # LLM marked it ambiguous but gave no usable question/options, treat it as
+    # unambiguous so the gate doesn't ask a blank question.
+    plan["scope_ambiguous"] = bool(plan.get("scope_ambiguous")) and bool(
+        (plan.get("scope_question") or "").strip()
+    )
+    plan.setdefault("scope_question", "")
+    options = plan.get("scope_options")
+    plan["scope_options"] = options if isinstance(options, list) and len(options) == 2 else []
+    if not plan["scope_options"]:
+        plan["scope_ambiguous"] = False
+
+    # API-route normalization: only "npi" is supported today. The real
+    # gate is pipeline._maybe_api_route (it resolves the taxonomy and falls
+    # back to discovery on a miss), so here we just clean the shape.
+    plan["api_vertical"] = plan.get("api_vertical") if plan.get("api_vertical") in ("npi",) else None
+    plan["api_params"] = plan["api_params"] if isinstance(plan.get("api_params"), dict) else {}
 
     # Safety net: catch region keywords the LLM may have ignored
     plan = _expand_regions(goal, plan)

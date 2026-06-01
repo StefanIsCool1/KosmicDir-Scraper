@@ -11,18 +11,17 @@ export default function Footer() {
       <div className="mx-auto grid max-w-site gap-8 md:grid-cols-3">
         <div>
           <Link to="/" className="text-lg">
-            <span className="font-bold tracking-tighter text-gray-900">Kosmic</span>{' '}
-            <span className="font-light text-gray-400">Scraper</span>
+            <span className="font-bold tracking-tighter text-gray-900">Trawl</span><span className="font-light text-accent">base</span>
           </Link>
           <p className="mt-2 text-sm text-gray-400">
-            AI-powered web scraping, enrichment, and automation.
+            Turn any directory into clean, structured data.
           </p>
         </div>
 
         <div className="flex flex-col gap-2">
           <p className="text-xs font-medium uppercase tracking-wide text-gray-400">Product</p>
           <Link to="/#features" className="text-sm text-gray-500 hover:text-gray-900 transition-colors">Features</Link>
-          <Link to="/playground" className="text-sm text-gray-500 hover:text-gray-900 transition-colors">Playground</Link>
+          <Link to="/playground" className="text-sm text-gray-500 hover:text-gray-900 transition-colors">Scraper</Link>
           <span className="text-sm text-gray-300">Docs (coming soon)</span>
           <span className="text-sm text-gray-300">Pricing (coming soon)</span>
         </div>
@@ -42,7 +41,7 @@ export default function Footer() {
 
       <div className="mx-auto mt-10 max-w-site border-t border-gray-100 pt-6">
         <p className="text-xs text-gray-400 text-center">
-          &copy; {new Date().getFullYear()} Kosmic Scraper. Built by Stefan O&apos;Leary.
+          &copy; {new Date().getFullYear()} Trawlbase. Built by Stefan O&apos;Leary.
         </p>
       </div>
     </footer>

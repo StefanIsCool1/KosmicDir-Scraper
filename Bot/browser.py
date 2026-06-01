@@ -6,6 +6,7 @@ Handles: launching browser, capturing responses, human-like scrolling, paginatio
 """
 
 import random
+import re
 import time
 import threading
 import json
@@ -138,6 +139,112 @@ def _find_member_array(data, max_depth: int = 3) -> bool:
             if _find_member_array(value, max_depth - 1):
                 return True
     return False
+
+
+# --- Method 1 (keyword content match) — tokenize-based to kill substring FPs ---
+# The old behavior was `str(data).lower()` + substring check, which had a
+# major false-positive class: keyword "user" matched "userip" inside an
+# unrelated geo JSON; "doctor" matched inside ad-slot paths like
+# "/4020/usn.health/healthcare/doctors/profile/...".
+#
+# Tokenizer below splits text on non-letter chars AND camelCase transitions,
+# so identifiers like memberDirectory / member_directory / Members / "Member
+# Directory" all surface "member"/"members" as standalone tokens, while
+# "userip" / "memberxyz" surface only as themselves and never match.
+
+_NON_LETTER_RE = re.compile(r'[^A-Za-z]+')
+# Splits "memberDirectory" -> ["member", "Directory"] and "XMLParser" -> ["XML", "Parser"]
+_CAMEL_BOUNDARY_RE = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+
+
+def _build_keyword_tokens() -> set[str]:
+    """Build the set of acceptable lowercase tokens, including simple plurals.
+
+    Plural rules cover the common English cases without a real morphology
+    library:
+      consonant + y -> ies     (directory -> directories, company -> companies)
+      vowel + y    -> +s       (attorney -> attorneys, lawyer N/A — ends in r)
+      ends in 's'  -> +es      (business -> businesses)
+      otherwise    -> +s       (member -> members, doctor -> doctors)
+    """
+    vowels = set("aeiou")
+    tokens: set[str] = set()
+    for kw in JSON_DIRECTORY_KEYWORDS:
+        kw_lower = kw.lower().strip()
+        if not kw_lower:
+            continue
+        tokens.add(kw_lower)
+        if kw_lower.endswith('y') and len(kw_lower) > 1:
+            if kw_lower[-2] in vowels:
+                tokens.add(kw_lower + 's')           # attorney -> attorneys
+            else:
+                tokens.add(kw_lower[:-1] + 'ies')    # directory -> directories
+        elif kw_lower.endswith('s'):
+            tokens.add(kw_lower + 'es')              # business -> businesses
+        else:
+            tokens.add(kw_lower + 's')               # member -> members
+    return tokens
+
+
+_DIRECTORY_KEYWORD_TOKENS = _build_keyword_tokens()
+
+
+def _extract_word_tokens(text: str) -> set[str]:
+    """Split text into a lowercased token set for whole-word keyword matching.
+
+    Splits on non-letter chars first (paths, punctuation, separators), then
+    on camelCase boundaries inside each remaining run. The result is a flat
+    set of word-shaped tokens that can be intersected with a keyword set.
+    """
+    tokens: set[str] = set()
+    for part in _NON_LETTER_RE.split(text):
+        if not part:
+            continue
+        for sub in _CAMEL_BOUNDARY_RE.split(part):
+            if sub:
+                tokens.add(sub.lower())
+    return tokens
+
+
+def _is_directory_json(data, url: str) -> bool:
+    """Apply the 4-method directory-data detection to a parsed JSON payload.
+
+    Extracted so both the application/json branch in on_response and the
+    JSON-as-text/html fallback in the pending-response loop share the exact
+    same gate. Mirrors the previous inline logic 1:1 plus the URL-exclude veto.
+    """
+    url_lower = url.lower()
+    is_directory_data = False
+
+    # Method 1: keyword in tokenized data (whole-word + camelCase aware)
+    tokens = _extract_word_tokens(str(data))
+    if tokens & _DIRECTORY_KEYWORD_TOKENS:
+        is_directory_data = True
+
+    # Method 2: URL contains directory-related patterns
+    if not is_directory_data:
+        if any(kw in url_lower for kw in JSON_URL_KEYWORDS):
+            if not any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
+                is_directory_data = True
+
+    # Method 3: JSON structure has member-like fields
+    if not is_directory_data:
+        sample = data[0] if isinstance(data, list) and data else data
+        if isinstance(sample, dict):
+            keys_lower = {k.lower() for k in sample.keys()}
+            matches = keys_lower & set(JSON_STRUCTURE_FIELDS)
+            if len(matches) >= 3:
+                is_directory_data = True
+
+    # Method 4: recursive envelope unwrap
+    if not is_directory_data and _find_member_array(data):
+        is_directory_data = True
+
+    # Final veto: known non-data endpoints even if content matched
+    if is_directory_data and any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
+        is_directory_data = False
+
+    return is_directory_data
 
 
 def find_content_frame(page):
@@ -355,9 +462,15 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
             #   /member-directory/search → OK (same parent)
             #   /member-directory/Details/company-123 → NOT OK (deeper than parent)
             start_parent = start_path.rsplit("/", 1)[0] if "/" in start_path else start_path
-            # The current path must start with the parent AND not go more than
-            # one level deeper. This catches /parent/Details/slug (2 levels deeper).
-            if current_path.startswith(start_parent):
+
+            # Single-segment paths (e.g. /Minnesota) yield empty start_parent,
+            # which matches everything. Anchor on start_path itself instead:
+            # allow /Minnesota → /Minnesota/page-2.html, still block
+            # /Minnesota → /OtherSection.
+            if not start_parent:
+                if current_path.startswith(start_path + "/"):
+                    return False
+            elif current_path.startswith(start_parent):
                 # Count path segments after the parent
                 remainder = current_path[len(start_parent):].strip("/")
                 depth = len(remainder.split("/")) if remainder else 0
@@ -624,7 +737,8 @@ def _save_cookies(page, domain: str):
 def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                       priority_fields: list | None = None,
                       login_callback=None,
-                      intent: dict | None = None) -> tuple[list, list]:
+                      intent: dict | None = None,
+                      is_aggregator: bool = False) -> tuple[list, list]:
     """Main browser automation entry point.
 
     Launches browser, navigates to directory page, captures all responses.
@@ -642,6 +756,13 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         relevant sub-directory links and (b) narrow detected category
         lists before iteration. Playground callers pass None and every
         downstream consumer falls back to existing behavior.
+
+    is_aggregator: True when Phase 0's classifier identified `link` as a
+        cross-vertical business aggregator (AGGREGATOR_DOMAINS in
+        DiscoveryBot/classifier.py). Forwarded to trigger_search so the
+        search box gets the user's intent term instead of a wildcard that
+        would pull every industry. Defaults to False — Playground callers
+        and any non-aggregator URL behave exactly as before.
 
     Returns:
         Tuple of (results, detail_urls):
@@ -710,52 +831,14 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         if "application/json" in content_type:
             try:
                 data = response.json()
-                is_directory_data = False
-
-                # Method 1: keyword in stringified data (original approach)
-                data_str = str(data).lower()
-                if any(key in data_str for key in JSON_DIRECTORY_KEYWORDS):
-                    is_directory_data = True
-
-                # Method 2: URL contains directory-related patterns
-                url_lower = response.url.lower()
-                if not is_directory_data:
-                    if any(kw in url_lower for kw in JSON_URL_KEYWORDS):
-                        # Exclude known non-data endpoints (filters, config, analytics, etc.)
-                        if not any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
-                            is_directory_data = True
-
-                # Method 3: JSON structure has member-like fields
-                # Works for both list-of-dicts and single dict
-                if not is_directory_data:
-                    sample = data[0] if isinstance(data, list) and data else data
-                    if isinstance(sample, dict):
-                        keys_lower = {k.lower() for k in sample.keys()}
-                        matches = keys_lower & set(JSON_STRUCTURE_FIELDS)
-                        if len(matches) >= 3:
-                            is_directory_data = True
-
-                # Method 4: Recursive envelope unwrap — catches GraphQL, Drupal
-                # JSON:API, SharePoint, and other platforms that wrap the member
-                # array in a deeper structure that Method 3 doesn't see.
-                # Purely additive: only fires when Methods 1-3 all said False.
-                if not is_directory_data and _find_member_array(data):
-                    is_directory_data = True
-                    print(f"  Method 4 (envelope unwrap): member array detected")
-
-                # Final veto: exclude known non-data endpoints even if content matched
-                # (e.g. /memberdirectory/Filters contains "member" in data but isn't member data)
-                if is_directory_data and any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
-                    is_directory_data = False
-
-                if is_directory_data:
+                if _is_directory_json(data, response.url):
                     print("Likely directory data at:", response.url)
                     results.append({
                         "url": response.url,
                         "data": data
                     })
                     reset_idle_timer()
-            except:
+            except Exception:
                 pass
 
         # --- HTML/text responses (queued for later reading) ---
@@ -863,7 +946,7 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     # browser-based search/scroll/paginate flow. ~20–50x faster.
     try:
         from url_enumeration import try_url_enumeration_cached
-        if try_url_enumeration_cached(page, domain, link, results):
+        if try_url_enumeration_cached(page, domain, link, results, intent=intent):
             print(f"  URL enumeration captured {len(results)} pages — "
                   f"skipping browser search flow")
             browser.close()
@@ -875,7 +958,9 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         # --- Step 2: Try search strategies ---
         pre_search_count = len(results)
         debug.log("SEARCH", f"Starting search. JSON results so far: {pre_search_count}")
-        search_triggered = trigger_search(page, results)
+        search_triggered = trigger_search(page, results,
+                                          is_aggregator=is_aggregator,
+                                          intent=intent)
         debug.log("SEARCH", f"Search complete. triggered={search_triggered}, "
                   f"results before={pre_search_count} after={len(results)}")
         if search_triggered and len(results) > pre_search_count:
@@ -1049,7 +1134,32 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         idle_timeout_value = DEFAULT_IDLE_TIMEOUT
         reset_idle_timer()
 
-    # Wait until idle timer fires
+    # --- Early exit: cut the dead tail wait when data is already captured ---
+    # JSON results reset the idle timer on each arrival via on_response, so if
+    # the timer is close to firing it means the network has gone quiet.  Three
+    # scenarios, ordered by how much we can safely skip:
+    #   1. HTML + JSON in hand → exit immediately (nothing left to wait for)
+    #   2. HTML only, zero JSON → short grace for straggler network responses
+    #   3. Neither → keep the full timeout (still waiting for first data)
+    _has_json_results = any(
+        isinstance(r.get("data"), (list, dict)) and "raw_html" not in r.get("data", {})
+        for r in results
+    )
+    if all_page_htmls and _has_json_results:
+        # Both sources satisfied — kill the timer and move on
+        if idle_timer:
+            idle_timer.cancel()
+        done.set()
+        print("  Early exit: HTML + JSON captured, skipping idle wait")
+    elif all_page_htmls and not _has_json_results:
+        # Have HTML but JSON might still be in-flight — give it a short window
+        if idle_timer:
+            idle_timer.cancel()
+        page.wait_for_timeout(1500)  # 1.5 s grace for straggler JSON
+        done.set()
+        print("  Early exit: HTML captured (no JSON), short grace period done")
+
+    # Wait until idle timer fires (or already set above)
     done.wait()
 
     # --- Step 6: Add captured page HTML(s) to results ---
@@ -1086,6 +1196,23 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
             text = body.decode("utf-8", errors="ignore")
             if not text:
                 continue
+
+            # Legacy ASP.NET / PHP backends sometimes return JSON with
+            # Content-Type: text/html (or text/plain), so the application/json
+            # gate in on_response misses them. Cheap pre-filter on the first
+            # non-whitespace char keeps the cost negligible — only payloads
+            # that *look* like JSON pay the parse + detection cost.
+            stripped = text.lstrip()
+            if stripped and stripped[0] in "{[":
+                try:
+                    data = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    data = None
+                if data is not None and _is_directory_json(data, r.url):
+                    print(f"JSON-as-text/html detected at: {r.url}")
+                    results.append({"url": r.url, "data": data})
+                    continue  # already routed — don't also try UpdatePanel parse
+
             # Detect ASP.NET UpdatePanel response
             if "updatepanel" in text.lower() and any(
                 kw in text.lower() for kw in ["member", "contact", "directory"]

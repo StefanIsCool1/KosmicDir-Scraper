@@ -39,7 +39,9 @@ Three phases, each in its own top-level package, chained but independently runna
 
 **LLM provider swap** is intentionally single-point: change `_BASE_URL` and `_MODEL` in `Bot/llm.py`. Everything else uses the OpenAI-compatible client through `ask()`.
 
-**Output layout:** Phase 1 writes `Data-dump/{domain}_structured.json`; Phase 2 writes `Phase2-Dump/{domain}_enriched.json` preserving all Phase 1 fields and filling gaps. `.gitignore` excludes `*.json`, so dumps never get committed — be aware that `git status` won't show new output files.
+**Output layout:** Phase 1 writes `Data-dump/{domain}_structured.json` as `{"metadata": {...counts...}, "members": [...]}` — older bare-list dumps still read fine via `Bot/main.py:read_members`/`read_metadata`, which accept both shapes. Phase 2 writes `Phase2-Dump/{domain}_enriched.json` (a bare list) preserving all Phase 1 fields and filling gaps. The Phase 0 **NPI route** and **standalone-site** scrape also write `Data-dump/*_structured.json` in the same metadata+members shape. `.gitignore` excludes `*.json`, so dumps never get committed — `git status` won't show new output files.
+
+**Agent-mode intelligence is layered and Playground-safe.** Everything intent-driven — scope filtering (Stage 1 record filter + Stage 2 source category narrowing), aggregator intent-search, URL-enum category narrowing, and Phase 0 API routing — is gated on a non-`None` `intent`. Playground (`/scrape/single`, `/scrape/csv`) passes `intent=None`, so those paths stay unchanged. Two single-point seams: **API routing** lives in `DiscoveryBot/pipeline.py:_maybe_api_route` + `Phase2Bot/vertical_enrichment.py` (a new vertical = one `resolve_npi_taxonomies`-style entry + one bulk fn), and **scope** flows from the Phase 0 question through `Bot/intent_filter.py:intent_from_plan`. See AGENTS.md → *Beyond the diagram* and *Data Acquisition Strategies* for the full map, and *Roadmap / Known Gaps* for open work.
 
 ## Gotchas
 
@@ -47,3 +49,7 @@ Three phases, each in its own top-level package, chained but independently runna
 - `.env` holds `DEEPSEEK_API_KEY` (loaded by `Bot/config.py` via python-dotenv). The `api_key/` directory is gitignored and is local-only.
 - Playwright cookies persist per-domain in `cookies/` — login state survives across runs, which can mask "logged-out" behavior when testing.
 - README.md is partly aspirational (mentions OpenAI/Claude; actual LLM is DeepSeek V4 Flash). Trust AGENTS.md and the code over the README.
+- `DiscoveryBot/intent.py:_build_prompt` is an **f-string** — every literal `{`/`}` in the embedded JSON schema must be doubled (`{{`/`}}`). A single brace throws at format time and `parse_intent` silently falls back to a keyword-only plan (no scope, no API route) on *every* goal.
+- Phase 0 search has a **sticky kill-switch**: `Phase2Bot/page_fetcher.py:_search_stopped` trips on the first DDG 429/403 and makes all further queries return `[]` for that run (reset at the start of `discover_candidates`). A mid-run block silently truncates discovery — fewer sources, no error surfaced.
+- The **NPI API caps ~1,200 records/query** (limit 200 × skip ≤ 1000); `npi_search_by_taxonomy` returns a `hit_ceiling` flag, so large states are partial. `resolve_npi_taxonomies` returns `[]` for vets / broad "doctors" → those deliberately fall back to scraping.
+- Scope, the directory picker, and standalone-site selection share the **one** blocking `response_event` + `/scrape/respond` round-trip; they run sequentially (each waits, then clears). Don't add a parallel gate without clearing between waits.

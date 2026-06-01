@@ -53,8 +53,7 @@ function PricingCard({ tier, annual }) {
       </ul>
 
       <Button
-        to={tier.name === 'Enterprise' ? undefined : '/playground'}
-        href={tier.name === 'Enterprise' ? 'mailto:hello@kosmic.dev' : undefined}
+        to="/playground"
         variant={isPopular ? 'primary' : 'secondary'}
         className="mt-8 w-full"
       >
@@ -154,6 +153,13 @@ export default function Pricing() {
             <PricingCard key={tier.name} tier={tier} annual={annual} />
           ))}
         </div>
+        <p className="mt-10 text-center text-sm text-gray-500">
+          Need higher volume or a custom vertical?{' '}
+          <a href="mailto:hello@trawlbase.dev" className="text-accent hover:underline">
+            Talk to us
+          </a>
+          .
+        </p>
       </section>
 
       {/* FAQ */}

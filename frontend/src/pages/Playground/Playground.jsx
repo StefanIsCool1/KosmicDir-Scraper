@@ -42,7 +42,7 @@ export default function Playground() {
     })
   }, [])
 
-  const handleRun = useCallback(async ({ urls, taskType, priorityFields }) => {
+  const handleRun = useCallback(async ({ urls, taskType, priorityFields, accurateEnrichment }) => {
     if (!urls || urls.length === 0) {
       runMock()
       return
@@ -59,7 +59,7 @@ export default function Playground() {
     // Scrape each URL sequentially
     for (let i = 0; i < urls.length; i++) {
       setCurrentIndex(i)
-      await sse.startScrape(urls[i], { mode, append: i > 0, priorityFields })
+      await sse.startScrape(urls[i], { mode, append: i > 0, priorityFields, accurateEnrichment })
     }
 
     setCurrentIndex(null)
@@ -78,7 +78,7 @@ export default function Playground() {
       <div className="mx-auto max-w-site px-6 py-8">
         <div className="mb-8 flex items-end justify-between">
           <div>
-            <h1 className="text-2xl font-bold tracking-tighter text-gray-900 sm:text-3xl">Playground</h1>
+            <h1 className="text-2xl font-bold tracking-tighter text-gray-900 sm:text-3xl">Scraper</h1>
             <p className="mt-1 text-sm text-gray-500">
               Add one or more directory URLs and scrape them sequentially. Results stream in real-time.
             </p>

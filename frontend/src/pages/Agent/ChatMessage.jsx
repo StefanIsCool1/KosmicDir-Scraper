@@ -74,7 +74,7 @@ function SelectableDirectoryList({ items, selected, onToggle, locked }) {
         <Folder size={13} className="text-accent" />
         <span>Directories</span>
         <span className="ml-auto rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] font-semibold text-accent">
-          {selected.size}/{items.length}
+          {items.filter((it) => selected.has(it.url)).length}/{items.length}
         </span>
       </div>
       <div className="max-h-52 overflow-y-auto px-2 py-1 flex flex-col">
@@ -121,9 +121,13 @@ function SelectableDirectoryList({ items, selected, onToggle, locked }) {
 }
 
 
-function WebsiteList({ items }) {
-  const [open, setOpen] = useState(false)
+function WebsiteList({ items, selected, onToggle, locked }) {
+  // Standalone single-business sites. Selectable (checkboxes) like the
+  // directory list, but DEFAULT-UNSELECTED — they're optional extras the
+  // user opts into. Starts expanded so the checkboxes are visible.
+  const [open, setOpen] = useState(true)
   if (!items || items.length === 0) return null
+  const selCount = items.filter((it) => selected?.has(it.url)).length
   return (
     <div className="border border-gray-100 rounded-lg overflow-hidden">
       <button
@@ -132,25 +136,50 @@ function WebsiteList({ items }) {
       >
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         <Globe size={13} className="text-accent" />
-        <span>Standalone websites</span>
-        <span className="ml-auto rounded-full bg-gray-200 px-1.5 py-0.5 text-[10px] font-semibold text-gray-600">
-          {items.length}
+        <span>Standalone sites</span>
+        <span className="ml-auto rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] font-semibold text-accent">
+          {selCount}/{items.length}
         </span>
       </button>
       {open && (
-        <div className="max-h-44 overflow-y-auto px-3 py-2 flex flex-col gap-1.5">
-          {items.map((it, i) => (
-            <a
-              key={i}
-              href={it.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-[11px] text-gray-500 hover:text-accent truncate font-mono"
-              title={it.title || it.url}
-            >
-              {it.title ? `${it.title} — ` : ''}{it.url}
-            </a>
-          ))}
+        <div className="max-h-44 overflow-y-auto px-2 py-1 flex flex-col">
+          {items.map((it, i) => {
+            const isSelected = selected?.has(it.url)
+            return (
+              <label
+                key={i}
+                className={`flex items-start gap-2 px-2 py-1.5 rounded cursor-pointer transition-colors ${
+                  locked ? 'cursor-default' : 'hover:bg-gray-50'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-3.5 w-3.5 rounded border-gray-300 text-accent focus:ring-1 focus:ring-accent/30 disabled:opacity-50"
+                  checked={!!isSelected}
+                  disabled={locked}
+                  onChange={() => onToggle && onToggle(it.url)}
+                />
+                <div className="min-w-0 flex-1">
+                  {it.title && (
+                    <div className={`text-[11px] truncate ${isSelected ? 'text-gray-700' : 'text-gray-400'}`}>
+                      {it.title}
+                    </div>
+                  )}
+                  <a
+                    href={it.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`block text-[10px] truncate font-mono ${
+                      isSelected ? 'text-gray-500 hover:text-accent' : 'text-gray-300 hover:text-gray-400'
+                    }`}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {it.url}
+                  </a>
+                </div>
+              </label>
+            )
+          })}
         </div>
       )}
     </div>
@@ -189,9 +218,11 @@ function SourcesBubble({
     <div className="flex flex-col gap-2.5 rounded-2xl rounded-tl-md bg-gray-50 border border-gray-100 px-4 py-3 max-w-[85%]">
       <div className="text-sm text-gray-700">
         {hasAny
-          ? <>I found <span className="font-semibold text-gray-900">{dCount}</span> {dCount === 1 ? 'directory' : 'directories'}
-            {wCount > 0 && <> and <span className="font-semibold text-gray-900">{wCount}</span> standalone {wCount === 1 ? 'website' : 'websites'}</>}.
-            {isSelectable && dCount > 0 && <> Pick which to scrape:</>}
+          ? <>I found{' '}
+            {dCount > 0 && <><span className="font-semibold text-gray-900">{dCount}</span> {dCount === 1 ? 'directory' : 'directories'}</>}
+            {dCount > 0 && wCount > 0 && <> and </>}
+            {wCount > 0 && <><span className="font-semibold text-gray-900">{wCount}</span> standalone {wCount === 1 ? 'site' : 'sites'}</>}.
+            {isSelectable && <> Pick which to scrape:</>}
             </>
           : "I couldn't find any usable sources for that goal."}
         {rejectedCount > 0 && (
@@ -205,9 +236,20 @@ function SourcesBubble({
         onToggle={toggle}
         locked={!isSelectable}
       />
-      <WebsiteList items={websites} />
+      <WebsiteList
+        items={websites}
+        selected={selected}
+        onToggle={toggle}
+        locked={!isSelectable}
+      />
 
-      {isSelectable && dCount > 0 && (
+      {isSelectable && wCount > 0 && (
+        <p className="text-[11px] text-gray-400 -mt-1">
+          Standalone sites are optional — tick any you want scraped &amp; enriched.
+        </p>
+      )}
+
+      {isSelectable && hasAny && (
         <div className="flex items-center gap-2 pt-1">
           <button
             onClick={() => onConfirm && onConfirm([...selected])}
@@ -221,6 +263,39 @@ function SourcesBubble({
             className="rounded-lg border border-gray-200 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white transition-colors"
           >
             Cancel
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+function ScopeBubble({ question, options = [], answered = false, chosenLabel, onChoose }) {
+  // options[0] = specialists-only label, options[1] = anyone-who-does-it label.
+  const specialistLabel = options[0] || 'Specialists only'
+  const inclusiveLabel = options[1] || 'Anyone who does it'
+
+  return (
+    <div className="flex flex-col gap-2.5 rounded-2xl rounded-tl-md bg-gray-50 border border-gray-100 px-4 py-3 max-w-[85%]">
+      <div className="text-sm text-gray-700">{question}</div>
+      {answered ? (
+        <div className="text-xs text-gray-500">
+          You chose: <span className="font-semibold text-gray-900">{chosenLabel}</span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 pt-0.5">
+          <button
+            onClick={() => onChoose && onChoose('specialist', specialistLabel)}
+            className="flex-1 rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-white hover:bg-accent-600 transition-colors"
+          >
+            {specialistLabel}
+          </button>
+          <button
+            onClick={() => onChoose && onChoose('inclusive', inclusiveLabel)}
+            className="flex-1 rounded-lg border border-gray-200 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white transition-colors"
+          >
+            {inclusiveLabel}
           </button>
         </div>
       )}
@@ -245,7 +320,7 @@ function TerminalBubble({ lines = [], isComplete = false, outputFiles = [] }) {
           <div className="h-2 w-2 rounded-full bg-gray-300" />
           <div className="h-2 w-2 rounded-full bg-gray-300" />
           <div className="h-2 w-2 rounded-full bg-gray-300" />
-          <span className="ml-2 text-[11px] text-gray-400 font-mono">kosmic@agent ~ scraping</span>
+          <span className="ml-2 text-[11px] text-gray-400 font-mono">trawlbase ~ scraping</span>
         </div>
         {isComplete && (
           <span className="text-[10px] text-accent font-mono">done</span>
@@ -316,7 +391,7 @@ function ResultBubble({ result }) {
     <div className="flex flex-col gap-1.5 rounded-2xl rounded-tl-md bg-accent-50/40 border border-accent-100 px-4 py-3 max-w-[80%]">
       <div className="text-sm font-medium text-gray-900">
         {records > 0
-          ? `Done — ${records.toLocaleString()} records across ${directories_scraped} ${directories_scraped === 1 ? 'directory' : 'directories'}.`
+          ? `Done — ${records.toLocaleString()} record${records === 1 ? '' : 's'}${directories_scraped > 0 ? ` across ${directories_scraped} ${directories_scraped === 1 ? 'directory' : 'directories'}` : ''}.`
           : 'Done. No records extracted.'}
       </div>
       {totalEnriched > 0 && (
@@ -357,6 +432,21 @@ export default function ChatMessage({ message }) {
           isSelectable={message.isSelectable}
           onConfirm={message.onConfirm}
           onCancel={message.onCancel}
+        />
+      </div>
+    )
+  }
+
+  if (message.type === 'scope') {
+    return (
+      <div className="flex gap-3 animate-fade-in" style={{ animationDelay: '0.05s' }}>
+        <AgentAvatar />
+        <ScopeBubble
+          question={message.question}
+          options={message.options}
+          answered={message.answered}
+          chosenLabel={message.chosenLabel}
+          onChoose={message.onChoose}
         />
       </div>
     )

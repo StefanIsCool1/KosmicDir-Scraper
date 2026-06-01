@@ -56,13 +56,19 @@ STRONG_DIRECTORY_PHRASES = (
 )
 
 # Weak signals — need at least two distinct hits to pass the keyword gate.
+# Both singular AND plural forms must be listed explicitly because the
+# tokenize-based matcher uses exact equality (so "chamber" ≠ "chambers").
+# Missing a plural here = legitimate pages get rejected; missing a singular
+# = same. Keep both.
 WEAK_DIRECTORY_SIGNALS = (
-    "member", "members", "directory", "listing", "listings",
-    "results", "company", "companies",
+    "member", "members", "directory", "directories",
+    "listing", "listings", "results",
+    "company", "companies",
     "provider", "providers", "doctor", "doctors", "dentist", "dentists",
     "restaurant", "restaurants", "attorney", "attorneys", "lawyer", "lawyers",
     "contractor", "contractors", "vendor", "vendors",
-    "association", "associations", "chamber", "registry", "roster",
+    "association", "associations",
+    "chamber", "chambers", "registry", "registries", "roster", "rosters",
 )
 
 # Login-wall phrase signals (used alongside <input type=password> + login form action).
@@ -158,6 +164,36 @@ _PHONE_RE = re.compile(
     r"(?<!\d)(?:\+?1[\s.\-]?)?(?:\(\d{3}\)[\s.\-]?|\d{3}[\s.\-])\d{3}[\s.\-]?\d{4}(?!\d)"
 )
 
+# --- Tokenizer for weak-signal keyword check ---
+# The legacy `any(s in text for s in WEAK_DIRECTORY_SIGNALS)` substring scan
+# matched "member" inside "remembered", "doctor" inside "indoctrinate",
+# "chamber" inside "chambermaid", etc. We tokenize into word-shaped pieces
+# and use set intersection so only whole-word hits count.
+_NON_LETTER_RE = re.compile(r'[^A-Za-z]+')
+_CAMEL_BOUNDARY_RE = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+
+
+def _extract_word_tokens(text: str) -> set[str]:
+    """Split text into lowercased whole-word tokens.
+
+    Splits on non-letter chars first (paths, punctuation, separators), then
+    on camelCase boundaries inside each remaining run. Same shape as the
+    helper in Bot/browser.py — kept local here to avoid a cross-package
+    import (DiscoveryBot already has enough sys.path hacks).
+    """
+    tokens: set[str] = set()
+    for part in _NON_LETTER_RE.split(text):
+        if not part:
+            continue
+        for sub in _CAMEL_BOUNDARY_RE.split(part):
+            if sub:
+                tokens.add(sub.lower())
+    return tokens
+
+
+# Pre-compute the lowercase weak-signal set for O(1) lookups.
+_WEAK_SIGNAL_TOKENS = {s.lower() for s in WEAK_DIRECTORY_SIGNALS}
+
 
 def _visible_text(soup) -> str:
     """Lowercased visible text after stripping inert tags. Used for length,
@@ -204,11 +240,17 @@ def _is_data_broker_profile(text: str) -> bool:
 
 
 def _directory_keyword_pass(text: str) -> bool:
-    """1 strong phrase OR ≥2 distinct weak signals."""
+    """1 strong phrase OR ≥2 distinct weak signals (as whole words).
+
+    Strong phrases are multi-word ("member directory", "find a doctor") so
+    substring match is fine — they're unambiguous. Weak signals are single
+    words and go through the tokenizer so "member" doesn't match "remembered",
+    "doctor" doesn't match "indoctrinated", etc.
+    """
     if any(p in text for p in STRONG_DIRECTORY_PHRASES):
         return True
-    weak_hits = sum(1 for s in WEAK_DIRECTORY_SIGNALS if s in text)
-    return weak_hits >= 2
+    tokens = _extract_word_tokens(text)
+    return len(tokens & _WEAK_SIGNAL_TOKENS) >= 2
 
 
 def _count_detail_links(soup) -> int:

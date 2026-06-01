@@ -7,15 +7,24 @@ os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 # Add the Bot directory to the path so Python can find the scraper modules
 sys.path.append(os.path.join(os.path.dirname(__file__), "Bot"))
 
-from Bot.main import scrape_directory, PHASE2_ONLY_FIELDS
+from Bot.main import scrape_directory, PHASE2_ONLY_FIELDS, read_members, read_metadata
 from Bot.debug import debug
 from Bot.intent_filter import intent_from_plan
 from Phase2Bot.email_extractor import enrich_from_websites
 from DiscoveryBot import run_discovery
 
 app = Flask(__name__)
+
+# CORS: allow localhost dev servers + any custom origins set via env var.
+# When nginx serves frontend and API from the same domain, CORS is a no-op.
+_cors_origins_env = os.environ.get("CORS_ORIGINS", "")
+_cors_origins = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if _cors_origins_env
+    else ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"]
+)
 CORS(app,
-    origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
+    origins=_cors_origins,
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-Custom-Header"],
     supports_credentials=True)
@@ -84,9 +93,8 @@ def _check_fields_from_file(json_path):
     """
     fields = {"name"}
     try:
-        with open(json_path) as f:
-            members = json.load(f)
-        if not isinstance(members, list) or not members:
+        members = read_members(json_path)
+        if not members:
             return fields
         sample = members[:20]
         n = len(sample)
@@ -117,6 +125,7 @@ def scrape_single():
     debug_mode = request.json.get("debug", False)
     scrape_mode = request.json.get("mode", "auto")  # "auto" or "direct"
     priority_fields = request.json.get("priority_fields", ["email", "phone"])
+    accurate_enrichment = bool(request.json.get("accurate_enrichment", False))
     if not link:
         return jsonify({"error": "No link"}), 400
 
@@ -201,9 +210,12 @@ def scrape_single():
                                 "message": "Starting Phase 2 enrichment...",
                                 "category": "LOG",
                             })
-                            output_path = enrich_from_websites(structured_path)
+                            output_path = enrich_from_websites(
+                                structured_path,
+                                accurate_enrichment=accurate_enrichment,
+                            )
                             with open(output_path) as ef:
-                                enriched_results = json.load(ef)
+                                enriched_results = read_members(output_path)
                             enriched_count = sum(
                                 1 for r in enriched_results
                                 if r.get("enrichment_status") == "enriched"
@@ -341,9 +353,8 @@ def scraped_sites():
                 domain = f.replace("_structured.json", "").replace("_", ".")
                 # Read the file to get member count
                 try:
-                    with open(os.path.join(DATA_DUMP, f), "r") as fh:
-                        data = json.load(fh)
-                        count = len(data) if isinstance(data, list) else 0
+                    data = read_members(os.path.join(DATA_DUMP, f))
+                    count = len(data)
                 except Exception:
                     count = 0
                 sites.append({"domain": domain, "file": f, "count": count})
@@ -358,10 +369,9 @@ def phase2_files():
         for f in sorted(os.listdir(DATA_DUMP)):
             if f.endswith("_structured.json") and not f.endswith("_detail_structured.json"):
                 try:
-                    with open(os.path.join(DATA_DUMP, f)) as fh:
-                        data = json.load(fh)
-                        if not isinstance(data, list):
-                            continue
+                    data = read_members(os.path.join(DATA_DUMP, f))
+                    if not data:
+                        continue
                         count = len(data)
                         with_website = sum(1 for m in data if m.get("website"))
                         missing_desc = sum(1 for m in data if m.get("website") and not m.get("description"))
@@ -386,6 +396,7 @@ def phase2_files():
 def phase2_enrich():
     """Run Phase 2 enrichment on a structured JSON file. Streams SSE progress."""
     json_file = request.json.get("json_file", "").strip()
+    accurate_enrichment = bool(request.json.get("accurate_enrichment", False))
     if not json_file:
         return jsonify({"error": "No file specified"}), 400
 
@@ -417,9 +428,12 @@ def phase2_enrich():
 
         builtins.print = captured_print
         try:
-            output_path = enrich_from_websites(json_path)
+            output_path = enrich_from_websites(
+                json_path,
+                accurate_enrichment=accurate_enrichment,
+            )
             with open(output_path) as f:
-                results = json.load(f)
+                results = read_members(output_path)
             enriched_count = sum(1 for r in results if r.get("enrichment_status") == "enriched")
             event_queue.put({
                 "type": "complete",
@@ -469,6 +483,7 @@ def discover():
     """
     goal = (request.json.get("goal") or "").strip()
     priority_fields = request.json.get("priority_fields") or ["email", "phone"]
+    accurate_enrichment = bool(request.json.get("accurate_enrichment", False))
     if not goal:
         return jsonify({"error": "No goal provided"}), 400
 
@@ -500,14 +515,114 @@ def discover():
             """Push a structured event into the SSE queue."""
             event_queue.put(event)
 
+        def ask_scope(plan):
+            """Blocking frontend prompt: specialists-only vs anyone-who-does-it.
+
+            Asked AFTER discovery (so searching never waits on it) and only when
+            intent parsing flagged the goal as scope-ambiguous. Reuses the same
+            response_event + /scrape/respond plumbing as the directory-selection
+            gate. The frontend posts the literal token "specialist" or
+            "inclusive". Anything else (timeout, tab closed, garbage) falls open
+            to "inclusive".
+            """
+            session_obj = active_sessions.get(session_id)
+            event_queue.put({
+                "type": "scope_refinement_required",
+                "question": plan.get("scope_question")
+                or "Do you want specialists only, or anyone who does this work?",
+                "options": plan.get("scope_options")
+                or ["Specialists only", "Anyone who does it"],
+            })
+            if not session_obj:
+                return "inclusive"
+            got = session_obj["response_event"].wait(timeout=600)
+            rv = (session_obj.get("response_value") or "").strip().lower()
+            session_obj["response_event"].clear()
+            session_obj["response_value"] = None
+            if got and rv == "specialist":
+                return "specialist"
+            return "inclusive"
+
         try:
-            # --- Phase 0: Discovery ---
+            # --- Phase 0: Discovery (independent of scope — see run_discovery) ---
             result = run_discovery(goal, event_cb=emit)
 
             # If intent parsing said the message wasn't actionable, the
             # pipeline already emitted a needs_clarification event. Stop
             # cleanly so the stream closes and the user can reply again.
             if result.get("needs_clarification"):
+                return
+
+            # --- API route: authoritative data, no scraping ---
+            # Phase 0 decided this goal is answerable by a public registry
+            # (currently NPI for US healthcare practitioners). No DDG, no
+            # browser, no source picker — fetch, save in the standard
+            # structured format, emit complete.
+            if result.get("api_vertical") == "npi":
+                from Phase2Bot.vertical_enrichment import npi_search_by_taxonomy
+                from datetime import datetime as _dt, timezone as _tz
+                ap = result.get("api_params") or {}
+                term = ap.get("term") or "providers"
+                state = ap.get("state") or ""
+                city = ap.get("city")
+
+                def _npi_progress(n):
+                    event_queue.put({
+                        "type": "stage", "stage": "api_route",
+                        "message": f"NPI registry: {n} {term} found so far...",
+                    })
+
+                try:
+                    members, hit_ceiling = npi_search_by_taxonomy(
+                        ap.get("taxonomy_queries") or [], state, city=city,
+                        progress_cb=_npi_progress,
+                    )
+                except Exception as e:
+                    event_queue.put({"type": "error", "message": f"NPI lookup failed: {e}"})
+                    return
+
+                if hit_ceiling:
+                    event_queue.put({
+                        "type": "stage", "stage": "api_route",
+                        "message": (f"Hit the NPI API's ~1,200-record cap for {term} in "
+                                    f"{state} — results are partial. Narrow by city for the rest."),
+                    })
+
+                loc_slug = (f"{state}_{city}" if city else state).replace(" ", "_")
+                fname = f"npi_{term}_{loc_slug}_structured.json".lower().replace(" ", "_")
+                struct_path = os.path.join(DATA_DUMP, fname)
+                os.makedirs(DATA_DUMP, exist_ok=True)
+                metadata = {
+                    "scraped_at": _dt.now(_tz.utc).isoformat(),
+                    "source_url": "npi_registry_api",
+                    "total_members": len(members),
+                    "with_name": sum(1 for m in members if m.get("company_name")),
+                    "with_phone": sum(1 for m in members if m.get("phone")),
+                    "with_address": sum(1 for m in members
+                                        if m.get("street_address") or m.get("mailing_address")),
+                    "with_category": sum(1 for m in members if m.get("category")),
+                    "partial_results": hit_ceiling,
+                }
+                with open(struct_path, "w") as f:
+                    json.dump({"metadata": metadata, "members": members}, f, indent=4)
+
+                where = f"{term} in {state}" + (f", {city}" if city else "")
+                event_queue.put({
+                    "type": "complete",
+                    "success": len(members) > 0,
+                    "records": len(members),
+                    "directories_scraped": 0,
+                    "websites_found": 0,
+                    "websites": [],
+                    "output_files": [fname],
+                    "per_site": [{
+                        "url": f"NPI registry — {where}",
+                        "records": len(members),
+                        "enriched": 0,
+                        "output_file": fname,
+                    }],
+                    "stats": {"rejected_count": 0, "reject_reasons": {}},
+                })
                 return
 
             directories = result.get("directories", [])
@@ -529,13 +644,27 @@ def discover():
                 })
                 return
 
+            # --- Scope refinement (AFTER discovery) ---
+            # Only ask once we know there are directories to scrape, and only
+            # when the goal was scope-ambiguous. Stored on the plan so it flows
+            # into Phase 1 via intent_from_plan. Asked before the directory
+            # picker so the sequence reads: "here's what I found → specialists
+            # or anyone? → pick which to scrape".
+            plan = result.get("plan") or {}
+            if directories and plan.get("scope_ambiguous"):
+                plan["scope"] = ask_scope(plan)
+
             # --- User confirmation gate ---
             # Even when Phase 0 finds directories, give the user a chance to
             # deselect ones they don't want before we burn time and tokens
             # scraping them. We reuse the existing /scrape/respond plumbing
             # (session_id + response_event) — the frontend posts the list of
             # approved URLs as a JSON-encoded string in `value`.
-            if directories:
+            # Standalone (single-business) sites the user opts to scrape.
+            # Populated from the same confirmation gate as directories.
+            selected_web_urls: list[str] = []
+
+            if directories or websites:
                 session_obj = active_sessions.get(session_id)
                 event_queue.put({
                     "type": "confirmation_required",
@@ -565,28 +694,33 @@ def discover():
 
                 # Parse the response. Expected shapes:
                 #   "skip" / "cancel" / "" → user bailed
-                #   "all"                  → scrape every directory
-                #   JSON list of URLs      → scrape just those
+                #   "all"                  → every directory + every site
+                #   JSON list of URLs      → just those. The list mixes
+                #     directory and standalone-site URLs; we partition each
+                #     URL by which set it came from.
                 rv = (response_value or "").strip()
-                selected_urls: set[str] | None = None
+                dir_url_set = {d["url"] for d in directories}
+                web_url_set = {w["url"] for w in websites}
 
                 if rv.lower() in ("skip", "cancel", "", "n", "no"):
-                    selected_urls = set()
+                    selected: set[str] = set()
                 elif rv.lower() in ("all", "y", "yes"):
-                    selected_urls = {d["url"] for d in directories}
+                    selected = dir_url_set | web_url_set
                 else:
                     try:
                         parsed = json.loads(rv)
-                        if isinstance(parsed, list):
-                            selected_urls = {str(u) for u in parsed}
+                        selected = {str(u) for u in parsed} if isinstance(parsed, list) else set()
                     except (json.JSONDecodeError, TypeError):
-                        selected_urls = set()
+                        selected = set()
 
-                if not selected_urls:
+                directories = [d for d in directories if d["url"] in selected]
+                selected_web_urls = [w["url"] for w in websites if w["url"] in selected]
+
+                if not directories and not selected_web_urls:
                     event_queue.put({
                         "type": "complete",
                         "success": False,
-                        "message": "Cancelled — no directories selected.",
+                        "message": "Cancelled — nothing selected.",
                         "directories_scraped": 0,
                         "records": 0,
                         "output_files": [],
@@ -599,10 +733,9 @@ def discover():
                     })
                     return
 
-                directories = [d for d in directories if d["url"] in selected_urls]
                 event_queue.put({
                     "type": "confirmation_accepted",
-                    "selected_count": len(directories),
+                    "selected_count": len(directories) + len(selected_web_urls),
                 })
 
             # --- Phase 1: Auto-scrape each directory ---
@@ -621,8 +754,24 @@ def discover():
             total_records = 0
             per_site_results = []
 
-            def auto_decline(detail_url_count, message=None):
-                return False
+            def auto_detail_crawl(detail_url_count, message=None):
+                """Agent mode auto-accepts detail crawling.
+
+                This callback is only reached after main.py's existing guards
+                decide a crawl is warranted: detail links were detected AND a
+                priority field is still missing ("no new data → don't crawl" is
+                handled there, main.py:529). crawl_detail_pages keeps its own
+                fallbacks too (API fast-path, selector validation, regex
+                fallback, abort-on-junk). Detail data merges in BEFORE the
+                Stage 1 intent filter, so a crawled category/description can
+                rescue or reject an otherwise name-only record.
+                """
+                event_queue.put({
+                    "type": "log",
+                    "message": f"Auto-crawling {detail_url_count} member detail pages for missing fields...",
+                    "category": "LOG",
+                })
+                return True
 
             def _check_skip():
                 """Check if the user requested a skip via the frontend."""
@@ -666,10 +815,11 @@ def discover():
                 try:
                     members = scrape_directory(
                         url,
-                        prompt_callback=auto_decline,
+                        prompt_callback=auto_detail_crawl,
                         mode=scrape_mode,
                         priority_fields=priority_fields,
                         intent=intent,
+                        is_aggregator=d.get("is_aggregator", False),
                     )
 
                     from urllib.parse import urlparse as _urlparse
@@ -697,10 +847,13 @@ def discover():
                                 "category": "LOG",
                             })
                             try:
-                                enriched_path = enrich_from_websites(structured_path)
+                                enriched_path = enrich_from_websites(
+                                    structured_path,
+                                    accurate_enrichment=accurate_enrichment,
+                                )
                                 output_file = os.path.basename(enriched_path)
                                 with open(enriched_path) as ef:
-                                    enriched_results = json.load(ef)
+                                    enriched_results = read_members(enriched_path)
                                 enriched_count = sum(
                                     1 for r in enriched_results
                                     if r.get("enrichment_status") == "enriched"
@@ -738,6 +891,123 @@ def discover():
                         "error": str(e),
                     })
 
+            # --- Standalone sites the user selected --------------------------
+            # Phase 0 found these as single-business WEBSITEs, not directories.
+            # We treat each as a one-row member and run the same website
+            # enrichment that fills contact details — that IS "scraping" a
+            # standalone site here (visit the homepage, extract email/phone/
+            # address). No-op when the user ticked none.
+            if selected_web_urls and not _check_skip():
+                import time as _time
+                from datetime import datetime as _dt, timezone as _tz
+                title_by_url = {w["url"]: w.get("title", "") for w in websites}
+                site_members = [
+                    {"company_name": title_by_url.get(u, ""), "website": u}
+                    for u in selected_web_urls
+                ]
+                site_fname = f"standalone_sites_{int(_time.time())}_structured.json"
+                site_struct_path = os.path.join(DATA_DUMP, site_fname)
+                os.makedirs(DATA_DUMP, exist_ok=True)
+                with open(site_struct_path, "w") as sf:
+                    json.dump({
+                        "metadata": {
+                            "scraped_at": _dt.now(_tz.utc).isoformat(),
+                            "source_url": "phase0_standalone_websites",
+                            "total_members": len(site_members),
+                        },
+                        "members": site_members,
+                    }, sf, indent=4)
+
+                event_queue.put({
+                    "type": "log",
+                    "message": f"Scraping {len(site_members)} standalone site(s) via website enrichment...",
+                    "category": "LOG",
+                })
+                try:
+                    site_enriched_path = enrich_from_websites(
+                        site_struct_path,
+                        event_callback=lambda ev: event_queue.put(ev),
+                        accurate_enrichment=accurate_enrichment,
+                    )
+                    site_results = read_members(site_enriched_path)
+                    site_enriched_n = sum(
+                        1 for r in site_results
+                        if r.get("enrichment_status") == "enriched"
+                    )
+                    total_records += len(site_results)
+                    output_files.append(os.path.basename(site_enriched_path))
+                    per_site_results.append({
+                        "url": f"{len(selected_web_urls)} standalone site(s)",
+                        "records": len(site_results),
+                        "enriched": site_enriched_n,
+                        "output_file": os.path.basename(site_enriched_path),
+                    })
+                except Exception as e:
+                    event_queue.put({
+                        "type": "log",
+                        "message": f"Standalone-site enrichment failed: {e}",
+                        "category": "ERROR",
+                    })
+
+            # --- Merge all output files into one combined JSON ---
+            merged_file = None
+            if len(output_files) > 1:
+                all_members = []
+                all_sources = []
+                seen_names = set()
+                for fname in output_files:
+                    fpath = os.path.join(DATA_DUMP, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    try:
+                        members = read_members(fpath)
+                        meta = read_metadata(fpath) or {}
+                        src = meta.get("source_url", fname)
+                        for m in members:
+                            key = (m.get("company_name") or "").lower().strip()
+                            if key and key not in seen_names:
+                                seen_names.add(key)
+                                all_members.append(m)
+                        all_sources.append(src)
+                    except Exception:
+                        continue
+
+                if all_members:
+                    from datetime import datetime, timezone
+                    total = len(all_members)
+                    merged_meta = {
+                        "scraped_at": datetime.now(timezone.utc).isoformat(),
+                        "source_urls": all_sources,
+                        "total_members": total,
+                        "with_name": sum(1 for m in all_members if m.get("company_name")),
+                        "with_phone": sum(1 for m in all_members if m.get("phone")),
+                        "with_email": sum(1 for m in all_members if m.get("contacts") and any(c.get("email") for c in m["contacts"])),
+                        "with_website": sum(1 for m in all_members if m.get("website")),
+                        "with_address": sum(1 for m in all_members if m.get("street_address") or m.get("mailing_address")),
+                        "with_description": sum(1 for m in all_members if m.get("description")),
+                        "with_category": sum(1 for m in all_members if m.get("category")),
+                        "with_contacts": sum(1 for m in all_members if m.get("contacts") and any(c.get("name") or c.get("email") for c in m["contacts"])),
+                    }
+                    intent = result.get("plan", {}).get("industry", {})
+                    locations = result.get("plan", {}).get("locations", [])
+                    if intent.get("canonical"):
+                        merged_meta["intent_industry"] = intent["canonical"]
+                    if locations:
+                        merged_meta["intent_locations"] = [loc.get("state", "") for loc in locations]
+
+                    industry = intent.get("canonical", "").replace(" ", "_")[:40] if intent.get("canonical") else "results"
+                    states = "_".join(loc.get("state", "") for loc in (locations or [])[:3])
+                    merged_fname = f"{industry}_{states}_merged.json" if states else f"{industry}_merged.json"
+                    merged_path = os.path.join(DATA_DUMP, merged_fname)
+                    with open(merged_path, "w") as mf:
+                        json.dump({"metadata": merged_meta, "members": all_members}, mf, indent=4)
+                    merged_file = merged_fname
+                    event_queue.put({
+                        "type": "log",
+                        "message": f"Merged {len(output_files)} files → {merged_fname} ({total} unique members, deduped across sources)",
+                        "category": "CLEAN",
+                    })
+
             event_queue.put({
                 "type": "complete",
                 "success": total_records > 0,
@@ -746,6 +1016,7 @@ def discover():
                 "websites_found": len(websites),
                 "websites": [w["url"] for w in websites],
                 "output_files": output_files,
+                "merged_file": merged_file,
                 "per_site": per_site_results,
                 "stats": {
                     "rejected_count": result.get("rejected_count", 0),
@@ -883,16 +1154,16 @@ def download_file(filename):
         return jsonify({"error": f"File not found: {filename}"}), 404
 
     try:
-        with open(file_path) as f:
-            data = json.load(f)
+        members = read_members(file_path)
+        metadata = read_metadata(file_path)
     except Exception as e:
         return jsonify({"error": f"Failed to read file: {e}"}), 500
 
-    if not isinstance(data, list):
+    if not members:
         return jsonify({"error": "File does not contain a list of records"}), 400
 
     if fmt == "csv":
-        csv_content = _records_to_csv(data)
+        csv_content = _records_to_csv(members)
         csv_filename = filename.rsplit(".", 1)[0] + ".csv"
         return Response(
             csv_content,
@@ -900,12 +1171,17 @@ def download_file(filename):
             headers={"Content-Disposition": f"attachment; filename={csv_filename}"},
         )
     else:
+        output: dict = {"members": members}
+        if metadata:
+            output["metadata"] = metadata
         return Response(
-            json.dumps(data, indent=2, ensure_ascii=False),
+            json.dumps(output, indent=2, ensure_ascii=False),
             mimetype="application/json",
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
 
 if __name__ == "__main__":
-    app.run(host="localhost", port=5000, debug=False, threaded=True)
+    host = os.environ.get("FLASK_HOST", "localhost")
+    port = int(os.environ.get("FLASK_PORT", "5000"))
+    app.run(host=host, port=port, debug=False, threaded=True)

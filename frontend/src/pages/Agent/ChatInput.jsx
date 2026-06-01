@@ -29,7 +29,7 @@ export default function ChatInput({ onSend, disabled }) {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="flex items-end gap-2 border-t border-gray-100 bg-white px-4 py-3">
+    <form data-tour="agent-chat-input" onSubmit={handleSubmit} className="flex items-end gap-2 border-t border-gray-100 bg-white px-4 py-3">
       <textarea
         ref={textareaRef}
         value={value}

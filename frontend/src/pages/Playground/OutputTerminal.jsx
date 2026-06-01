@@ -44,14 +44,14 @@ export default function OutputTerminal({ lines, isComplete, awaitingInput, onInp
   }
 
   return (
-    <div className="flex flex-col overflow-hidden rounded-xl border border-gray-200 bg-[#FAFAFA]">
+    <div data-tour="playground-terminal" className="flex flex-col overflow-hidden rounded-xl border border-gray-200 bg-[#FAFAFA]">
       {/* Title bar */}
       <div className="flex items-center justify-between border-b border-gray-200 px-4 py-2.5">
         <div className="flex items-center gap-2">
           <div className="h-2.5 w-2.5 rounded-full bg-gray-300" />
           <div className="h-2.5 w-2.5 rounded-full bg-gray-300" />
           <div className="h-2.5 w-2.5 rounded-full bg-gray-300" />
-          <span className="ml-2 text-xs text-gray-400 font-mono">kosmic@scraper ~ output</span>
+          <span className="ml-2 text-xs text-gray-400 font-mono">trawlbase ~ output</span>
         </div>
       </div>
 

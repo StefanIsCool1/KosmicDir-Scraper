@@ -42,10 +42,11 @@ def is_layout_class(cls_string: str) -> bool:
     return False
 
 
-# Strong card-class hints: when an element's class contains one of these
-# substrings, treat it as a likely content card even if it has no <a> link.
-# Subset of CARD_CLASS_HINTS, intentionally narrower — excludes generic
-# words like "row" / "item" / "entry" that match layout grid cells too.
+# Strong card-class hints: when an element's class name contains one of these
+# tokens (whole-word, camelCase-aware), treat it as a likely content card
+# even if it has no <a> link. Subset of CARD_CLASS_HINTS, intentionally
+# narrower — excludes generic words like "row" / "item" / "entry" that match
+# layout grid cells too.
 _STRONG_CARD_CLASS_HINTS = {
     "member", "listing", "card", "result", "company", "directory",
     "profile", "vendor", "supplier", "contractor", "provider",
@@ -54,11 +55,64 @@ _STRONG_CARD_CLASS_HINTS = {
     "firm", "practice", "organization",
 }
 
+# --- Tokenizer for class-name word matching ---
+# Splits CSS class strings into whole-word tokens (kebab-case, snake_case,
+# camelCase, PascalCase, multi-class space-separated). Used for both the
+# hint match AND the chrome exclude check below.
+_CSS_NON_LETTER_RE = re.compile(r'[^A-Za-z]+')
+_CSS_CAMEL_BOUNDARY_RE = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+
+
+def _class_word_tokens(class_string: str) -> set[str]:
+    """Split a CSS class string into lowercased whole-word tokens."""
+    tokens: set[str] = set()
+    for part in _CSS_NON_LETTER_RE.split(class_string):
+        if not part:
+            continue
+        for sub in _CSS_CAMEL_BOUNDARY_RE.split(part):
+            if sub:
+                tokens.add(sub.lower())
+    return tokens
+
+
+# UI-chrome / notification tokens that override a hint match. Pages bury
+# "card", "result", "listing" inside class names for non-content UI: cookie
+# banners, error dialogs, modals, toasts. When any of these appear alongside
+# a hint, the element is chrome, not a member card.
+_CARD_HINT_EXCLUDE_TOKENS = {
+    # Cookie / consent / privacy
+    "cookie", "consent", "privacy", "gdpr", "cmp",
+    # Notifications / alerts
+    "banner", "notice", "notification", "alert", "warning", "error",
+    "toast", "message", "snackbar", "flash",
+    # Modals / overlays
+    "modal", "popup", "popover", "dialog", "tooltip", "overlay",
+    "dropdown", "lightbox",
+    # Empty / loading states
+    "skeleton", "placeholder", "empty", "loading", "spinner",
+}
+
 
 def _class_matches_strong_card_hint(el) -> bool:
-    """True if any of the element's classes contain a strong card-class hint."""
-    classes = " ".join(el.get("class") or []).lower()
-    return any(hint in classes for hint in _STRONG_CARD_CLASS_HINTS)
+    """True if the element's class tokens hit a card hint AND no exclude token.
+
+    Two-layer check:
+      1. Tokenize the class string (handles kebab/snake/camel/Pascal case)
+      2. Reject if any UI-chrome token is present (cookie, banner, alert,
+         modal, toast, message, etc.) — those classes use "card"/"result"/
+         "listing" for UI containers, not member content
+      3. Otherwise, accept if at least one hint token matches
+
+    Kills false positives like "cookieCard" (cookie banner), "result-message"
+    (no-results status), "alert-card" (warning dialog), "modal-listing"
+    (dropdown overlay), while still catching "member-card", "doctorListing",
+    "vendor_profile", etc.
+    """
+    classes = " ".join(el.get("class") or [])
+    tokens = _class_word_tokens(classes)
+    if tokens & _CARD_HINT_EXCLUDE_TOKENS:
+        return False
+    return bool(tokens & _STRONG_CARD_CLASS_HINTS)
 
 
 def has_card_structure(el) -> bool:

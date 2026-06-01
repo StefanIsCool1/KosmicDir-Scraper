@@ -2,11 +2,12 @@ import { motion } from 'framer-motion'
 import * as Icons from 'lucide-react'
 import SectionWrapper from '../../components/SectionWrapper'
 import { HOW_IT_WORKS } from '../../lib/constants'
+import { EASE } from '../../lib/motion'
 
 const ICON_ANIMATIONS = {
-  MousePointerClick: {
-    animate: { scale: [1, 0.85, 1] },
-    transition: { duration: 1.6, repeat: Infinity, repeatDelay: 2.4, ease: 'easeInOut' },
+  MessageSquare: {
+    animate: { scale: [1, 1.08, 1] },
+    transition: { duration: 2, repeat: Infinity, repeatDelay: 1.5, ease: 'easeInOut' },
   },
   Cog: {
     animate: { rotate: 360 },
@@ -30,7 +31,7 @@ export default function HowItWorks() {
           How it works
         </h2>
         <p className="mx-auto mt-4 max-w-md text-gray-500">
-          Four steps from URL to structured data.
+          Four steps from a directory to structured data.
         </p>
       </div>
 
@@ -48,7 +49,7 @@ export default function HowItWorks() {
                 initial={{ opacity: 0, y: 20 }}
                 whileInView={{ opacity: 1, y: 0 }}
                 viewport={{ once: true }}
-                transition={{ delay: i * 0.15, duration: 0.5 }}
+                transition={{ delay: i * 0.12, duration: 0.5, ease: EASE }}
                 className="relative flex flex-col items-center text-center"
               >
                 <div className="relative z-10 flex h-20 w-20 items-center justify-center rounded-2xl border border-gray-100 bg-white shadow-sm">

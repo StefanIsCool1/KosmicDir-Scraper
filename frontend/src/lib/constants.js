@@ -1,7 +1,7 @@
 export const NAV_LINKS = [
   { label: 'Features', href: '/#features' },
-  { label: 'Playground', href: '/playground' },
-  { label: 'Agent', href: '/agent' },
+  { label: 'Scraper', href: '/playground' },
+  { label: 'Discover', href: '/agent' },
   { label: 'Docs', href: '/docs' },
   { label: 'Pricing', href: '/pricing' },
 ]
@@ -9,110 +9,110 @@ export const NAV_LINKS = [
 export const FEATURES = [
   {
     icon: 'Brain',
-    title: 'Learns page structure',
+    title: 'Learns any page',
     description:
-      'Reads 3 sample cards, figures out the selectors, then extracts every record on the site. No setup required.',
-  },
-  {
-    icon: 'Globe',
-    title: 'Handles JavaScript sites',
-    description:
-      'Full browser under the hood. Infinite scroll, AJAX loading, SPAs, paginated results — it just works.',
-  },
-  {
-    icon: 'ShieldCheck',
-    title: 'Gets past bot detection',
-    description:
-      'Rotates browser TLS fingerprints and patches every detection vector. Most sites can\'t tell it apart from a real visitor.',
+      'It reads a few sample cards, works out the selectors, and extracts every record. No templates, no setup.',
   },
   {
     icon: 'Layers',
-    title: 'Enriches from company sites',
+    title: 'Enriches each record',
     description:
-      'After scraping the directory, visits each company\'s website to pull emails, social links, descriptions, and team info.',
+      'It visits each company\'s own site for the emails, socials, and hours the directory left out.',
   },
   {
-    icon: 'Search',
-    title: 'Finds missing websites',
+    icon: 'Globe',
+    title: 'Handles JavaScript',
     description:
-      'No website listed? Searches by company name and address to find it, then enriches like the rest.',
+      'A full browser runs under the hood. Infinite scroll, AJAX, SPAs, pagination — all of it.',
+  },
+  {
+    icon: 'ShieldCheck',
+    title: 'Gets past blocks',
+    description:
+      'Rotating TLS fingerprints and a patched browser. Sites can\'t tell it from a real visitor.',
+  },
+  {
+    icon: 'Sparkles',
+    title: 'Finds the directory',
+    description:
+      'No URL? Name the niche — an HOA roster, a local chamber, a trade-association member list — and Discover finds and qualifies it for you.',
   },
   {
     icon: 'FileJson',
-    title: 'Clean JSON and CSV output',
+    title: 'Clean JSON & CSV',
     description:
-      'Every scrape produces a normalized file. Names, emails, phones, addresses, social profiles — one row per company.',
-  },
-  {
-    icon: 'Zap',
-    title: 'Fast on repeat scrapes',
-    description:
-      'Selectors are cached per domain. Second scrape of the same site is instant — zero AI calls, zero cost.',
-  },
-  {
-    icon: 'Navigation',
-    title: 'Finds the directory for you',
-    description:
-      'Paste any URL on the site. The bot navigates to the directory page, finds the search form, and starts extracting.',
-  },
-  {
-    icon: 'Terminal',
-    title: 'See everything live',
-    description:
-      'Watch the bot work in real-time. Every click, every extraction, every enrichment — streamed to your terminal.',
-  },
-  {
-    icon: 'Users',
-    title: 'Crawls profile pages',
-    description:
-      'When the listing page only shows names, the bot clicks into each profile to get the full contact details.',
+      'One tidy row per company — names, emails, phones, addresses, socials. Ready for your spreadsheet.',
   },
 ]
 
 export const COMPARISON_FEATURES = [
-  'AI-powered extraction',
-  'No-code UI + API',
+  'Autonomous agent (describe → data)',
+  'Plain-English goals',
   'Built-in data enrichment',
+  'Official registry fast-path',
+  'AI-powered extraction',
   'TLS fingerprint rotation',
   'Real-time terminal output',
-  'Self-hosted / open source',
-  'Directory-optimized',
-  'Detail page crawling',
   'Website discovery (search)',
+  'Detail page crawling',
+  'Directory-optimized',
+  'No-code UI + API',
+  'Self-hosted / open source',
 ]
 
 export const COMPARISON_DATA = {
-  'Kosmic Scraper': [true, true, true, true, true, true, true, true, true],
-  Firecrawl: [true, 'API only', false, true, false, true, false, false, false],
-  'Browse AI': [true, 'No-code only', false, 'Partial', false, false, false, false, false],
-  Crawl4AI: [true, 'Code only', false, false, false, true, false, false, false],
-  Octoparse: [false, 'No-code only', false, 'Partial', false, false, false, false, false],
+  Trawlbase: [true, true, true, true, true, true, true, true, true, true, true, true],
+  Firecrawl: [false, false, false, false, true, true, false, false, false, false, 'API only', true],
+  'Browse AI': [false, false, false, false, true, 'Partial', false, false, false, false, 'No-code only', false],
+  Crawl4AI: [false, false, false, false, true, false, false, false, false, false, 'Code only', true],
+  Octoparse: [false, false, false, false, false, 'Partial', false, false, false, false, 'No-code only', false],
 }
 
 export const HOW_IT_WORKS = [
   {
     step: 1,
-    title: 'Paste a URL',
-    description: 'Any page on the site. The bot finds the directory itself.',
-    icon: 'MousePointerClick',
+    title: 'Point it at a directory',
+    description: 'Paste a directory URL — or describe what you need and let Discover find one.',
+    icon: 'MessageSquare',
   },
   {
     step: 2,
-    title: 'Bot extracts everything',
-    description: 'Navigates, paginates, and pulls every record. Learns the page layout on its own.',
+    title: 'It learns the page',
+    description: 'It reads a few sample cards, works out the selectors, and extracts every record.',
     icon: 'Cog',
   },
   {
     step: 3,
-    title: 'Enrich from websites',
-    description: 'Visits each company site for emails, social links, and descriptions.',
+    title: 'Scrape and enrich',
+    description: 'Every record pulled, then filled in from each company\'s own site.',
     icon: 'Layers',
   },
   {
     step: 4,
-    title: 'Export JSON or CSV',
-    description: 'One row per company. Ready for your CRM, spreadsheet, or database.',
+    title: 'Export clean data',
+    description: 'One row per company. Download JSON or CSV.',
     icon: 'Download',
+  },
+]
+
+export const WHY_TRAWLBASE = [
+  {
+    icon: 'Layers',
+    title: 'It doesn\'t stop at the listing',
+    description:
+      'Most scrapers hand you whatever the directory shows. Trawlbase visits each company\'s own site to fill in the emails, socials, and hours that were missing.',
+  },
+  {
+    icon: 'Brain',
+    title: 'No selectors to write',
+    description:
+      'No templates, no point-and-click recorder. It reads the page, learns its structure, and extracts every record on its own.',
+  },
+  {
+    icon: 'ShieldCheck',
+    title: 'It gets in',
+    description:
+      'Rotating TLS fingerprints and a patched browser sail past the bot detection that stops simpler tools cold.',
   },
 ]
 
@@ -120,47 +120,45 @@ export const PRICING_TIERS = [
   {
     name: 'Free',
     price: { monthly: 0, annual: 0 },
-    description: 'Try it out. Scrape a few directories.',
-    cta: 'Get Started',
+    description: 'Scrape real directories. No time limit.',
+    cta: 'Start Scraping',
     features: [
-      '3 scrapes per month',
-      'Phase 1 directory extraction',
-      'Up to 200 records per scrape',
-      'Basic fields (name, phone, email, address)',
-      'Web UI access',
-      'JSON export',
+      '10 scrapes per month',
+      'Directory extraction (Phase 1)',
+      'Up to 500 records per scrape',
+      'Core fields — name, phone, address, website',
+      'JSON & CSV export',
     ],
   },
   {
     name: 'Pro',
-    price: { monthly: 49, annual: 39 },
+    price: { monthly: 9, annual: 7 },
     popular: true,
-    description: 'Scrape + enrich. The full pipeline.',
+    description: 'Full pipeline for indie hackers and small teams.',
     cta: 'Start Free Trial',
     features: [
-      '30 scrapes per month',
-      'Phase 1 + Phase 2 enrichment',
+      '50 scrapes per month',
+      'Scrape + enrich (Phase 1 + 2)',
       'Up to 2,000 records per scrape',
-      'All fields (social, description, category)',
-      'CSV batch upload (10 URLs)',
-      'Export to CSV & JSON',
+      'Emails, socials, hours, category, description',
       'Website discovery via search',
-      'Email & phone extraction',
+      'CSV batch upload (25 URLs)',
+      'JSON & CSV export',
+      '14-day free trial, no card required',
     ],
   },
   {
-    name: 'Enterprise',
-    price: { monthly: 199, annual: 159 },
-    description: 'No limits. Scrape everything.',
-    cta: 'Contact Sales',
+    name: 'Scale',
+    price: { monthly: 29, annual: 23 },
+    description: 'For teams that scrape at volume.',
+    cta: 'Get Started',
     features: [
-      'Unlimited scrapes',
-      'Phase 1 + Phase 2 enrichment',
-      'Unlimited records',
-      'All fields + team, services, hours',
-      'CSV batch upload (unlimited)',
+      '200 scrapes per month',
+      'Scrape + enrich (Phase 1 + 2)',
+      'Up to 5,000 records per scrape',
+      'Accurate enrichment (verify-by-fetch)',
+      'CSV batch upload (100 URLs)',
       'API access',
-      '8 parallel enrichment workers',
       'Priority support',
     ],
   },
@@ -190,19 +188,12 @@ export const PRICING_FAQ = [
 ]
 
 export const HERO_TERMINAL_LINES = [
-  { text: '→ Stealth: TLS fingerprint chrome136, WebGL patched', color: '#6C5CE7' },
-  { text: '→ Navigating to https://members.example.org', color: '#888' },
-  { text: '→ AI found directory page (depth 2)', color: '#6C5CE7' },
-  { text: '→ Search: blank query → 847 results', color: '#888' },
-  { text: '→ Learning selectors from 3 sample cards...', color: '#6C5CE7' },
-  { text: '→ Learned: name, email, phone, address, category ✓', color: '#22C55E' },
-  { text: '→ Paginating... page 4 of 17', color: '#888' },
-  { text: '→ Captured 847 member records', color: '#22C55E' },
-  { text: '', color: '#555' },
-  { text: '→ Phase 2: Enriching from company websites (8 workers)', color: '#6C5CE7' },
-  { text: '→ Searching for 69 missing websites...', color: '#888' },
-  { text: '→ Found 42 websites via DuckDuckGo', color: '#22C55E' },
-  { text: '→ Enriched 683/847 — emails, social, services', color: '#22C55E' },
-  { text: '', color: '#555' },
-  { text: '✓ Saved to members_example_org_enriched.json', color: '#22C55E' },
+  { text: '$ trawlbase scrape hoa-directory.org/members', color: '#6C5CE7' },
+  { text: '→ Reading 3 sample cards...', color: '#888' },
+  { text: '→ Selectors learned ✓', color: '#22C55E' },
+  { text: '→ Stealth: TLS chrome136, WebGL patched', color: '#6C5CE7' },
+  { text: '→ Paginating... captured 912 records', color: '#22C55E' },
+  { text: '→ Enriching from company sites (8 workers)', color: '#6C5CE7' },
+  { text: '→ Filled 814/912 — emails, social, hours', color: '#22C55E' },
+  { text: '✓ Saved hoa_members.json (912 rows)', color: '#22C55E' },
 ]

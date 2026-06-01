@@ -192,7 +192,9 @@ def is_member_list(data: list) -> bool:
 
 
 def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
-                           detail_members: list | None = None) -> list:
+                           detail_members: list | None = None,
+                           intent: dict | None = None,
+                           source_url: str = "") -> list:
     """Parse all captured responses, save both raw and structured data.
 
     Handles:
@@ -281,6 +283,16 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
         delete_cached_selectors(domain)
         return []
 
+    # --- Intent filter (Agent mode only) ---
+    # Trim the validated members to the user's actual target — e.g. deck
+    # builders, not every trade listed in a general builders association.
+    # No-op when intent is None (Playground Direct/Auto/CSV paths). Runs after
+    # the garbage gate so junk detection still sees the full population, and
+    # is fail-open so a flaky classifier never silently empties a real scrape.
+    if intent:
+        from intent_record_filter import filter_records_by_intent
+        all_members = filter_records_by_intent(all_members, intent)
+
     # --- Sanity checks ---
     if len(all_members) < 3:
         print(f"WARNING: Only {len(all_members)} members extracted for {domain} — scrape likely failed")
@@ -294,11 +306,81 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
 
     # --- Save structured output ---
     structured_path = os.path.join(data_dump_dir, f"{domain}_structured.json")
+
+    # Compute metadata (shared shape with Phase 2 enrichment — see compute_metadata)
+    total = len(all_members)
+    metadata = compute_metadata(all_members, source_url=source_url, intent=intent)
+
     with open(structured_path, "w") as f:
-        json.dump(all_members, f, indent=4)
-    print(f"Saved {len(all_members)} structured members to {structured_path}")
+        json.dump({"metadata": metadata, "members": all_members}, f, indent=4)
+    print(f"Saved {total} structured members to {structured_path}")
 
     return all_members
+
+
+def read_members(json_path: str) -> list:
+    """Read members from a structured or enriched JSON file.
+
+    Handles both formats:
+      - New:  {"metadata": {...}, "members": [...]}
+      - Old:  [...]  (plain list, no metadata)
+    Returns the member list in both cases.
+    """
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "members" in data:
+        return data["members"]
+    return []
+
+
+def read_metadata(json_path: str) -> dict | None:
+    """Read metadata from a structured or enriched JSON file.
+
+    Returns the metadata dict, or None if the file is old-format (plain list).
+    """
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "metadata" in data:
+        return data["metadata"]
+    return None
+
+
+def compute_metadata(members: list, source_url: str = "", intent: dict | None = None, **extra) -> dict:
+    """Build the standard coverage-metadata block for a member list.
+
+    Shared by Phase 1 (structured dumps) and Phase 2 (enriched dumps) so both
+    files carry the same shape. Counts are computed over `members` as given, so
+    when Phase 2 passes its enriched list the numbers reflect post-enrichment
+    coverage. `extra` is merged last, so a caller can add fields (e.g.
+    enriched_at) or override defaults like scraped_at.
+    """
+    from datetime import datetime, timezone
+    metadata = {
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "source_url": source_url,
+        "total_members": len(members),
+        "with_name": sum(1 for m in members if m.get("company_name")),
+        "with_phone": sum(1 for m in members if m.get("phone")),
+        "with_email": sum(1 for m in members
+                          if m.get("contacts") and any(c.get("email") for c in m["contacts"])),
+        "with_website": sum(1 for m in members if m.get("website")),
+        "with_address": sum(1 for m in members
+                            if m.get("street_address") or m.get("mailing_address")),
+        "with_description": sum(1 for m in members if m.get("description")),
+        "with_category": sum(1 for m in members if m.get("category")),
+        "with_contacts": sum(1 for m in members
+                             if m.get("contacts") and any(
+                                 c.get("name") or c.get("email") for c in m["contacts"])),
+    }
+    if intent:
+        metadata["intent_industry"] = intent.get("canonical") or ""
+        metadata["intent_locations"] = [
+            loc.get("state", "") for loc in (intent.get("locations") or [])
+        ]
+    metadata.update(extra)
+    return metadata
 
 
 def _detect_login_wall(results: list) -> bool:
@@ -452,7 +534,8 @@ def _check_fields(members: list) -> set:
 
 def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                      priority_fields: list | None = None,
-                     intent: dict | None = None) -> list:
+                     intent: dict | None = None,
+                     is_aggregator: bool = False) -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
@@ -468,6 +551,10 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                 Agent (/discover) entry point sets this. Forwarded to the
                 browser/navigator so the AI picks intent-relevant links and
                 the category iterator only walks matching tabs.
+        is_aggregator: True when Phase 0 classified this URL as a cross-vertical
+                       business aggregator (SuperPages, YellowPages, BBB, etc.).
+                       Combined with `intent`, makes the search box use the
+                       industry term instead of a wildcard. Defaults to False.
     """
     if priority_fields is None:
         priority_fields = []
@@ -487,6 +574,7 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
             priority_fields=priority_fields,
             login_callback=_login_interactive,
             intent=intent,
+            is_aggregator=is_aggregator,
         )
 
     # --- Step 2: Save raw responses ---
@@ -536,7 +624,9 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
 
     # --- Step 4: Parse, clean, and save structured data ---
     members = parse_and_save_results(results, data_dump_dir, domain,
-                                     detail_members=detail_members)
+                                     detail_members=detail_members,
+                                     intent=intent,
+                                     source_url=url)
 
     # --- Step 5: If zero results, warn (login gate already handled in browser) ---
     if len(members) == 0:

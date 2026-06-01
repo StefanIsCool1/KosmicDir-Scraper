@@ -1,0 +1,28 @@
+[Unit]
+Description=Trawlbase Scraper Backend
+After=network.target
+
+[Service]
+Type=notify
+User=trawlbase
+Group=trawlbase
+WorkingDirectory=/home/trawlbase/KosmicDir-Scraper
+Environment="PATH=/home/trawlbase/.local/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/trawlbase/KosmicDir-Scraper/.env
+ExecStart=/home/trawlbase/.local/bin/gunicorn -c deploy/gunicorn_config.py app:app
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/Data-dump
+ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/Phase2-Dump
+ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/cookies
+ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/Bot/selector_cache.json
+
+[Install]
+WantedBy=multi-user.target

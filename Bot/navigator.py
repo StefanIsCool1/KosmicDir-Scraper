@@ -1098,7 +1098,9 @@ def try_form_search_query(page, search_input, submit_btn, query: str) -> int:
         return -1
 
 
-def trigger_search(page, results_list: list) -> bool:
+def trigger_search(page, results_list: list,
+                   is_aggregator: bool = False,
+                   intent: dict | None = None) -> bool:
     """Smart search strategy with result count awareness.
 
     Flow:
@@ -1106,10 +1108,21 @@ def trigger_search(page, results_list: list) -> bool:
     2. Detect search method: prefer form-based search (more specific) over
        generic site-wide search inputs when both exist
     3. Pre-search: check visible results (skip for form pages)
-    4. Search "a" → check starts-with → ask AI for count
-    5. If "all" or ≥600: stop
-       If "unknown" (no counter): search blank, stop
-       If low number: try more strategies ("all", "", "*", "%")
+    4. INTENT-FIRST (aggregator + intent only): try industry_canonical +
+       aliases BEFORE wildcards, so SuperPages/YellowPages/etc. return only
+       the vertical the user asked for instead of every Minneapolis business.
+    5. Search "" (blank) → check count
+    6. If "all" or ≥STOP_THRESHOLD: stop
+       If low: try "%", "all", "a"
+
+    Args:
+        is_aggregator: True when Phase 0's classifier identified this URL as
+            a cross-vertical business aggregator (AGGREGATOR_DOMAINS in
+            DiscoveryBot/classifier.py). Only the Agent (/discover) entry
+            point sets this. Playground callers default to False and behave
+            identically to before.
+        intent: Optional dict from intent_filter.intent_from_plan. Used only
+            when is_aggregator=True. None for Playground callers.
     """
     # --- Detect search method ---
     # Try form-based search FIRST (more specific: Name/Company/City + Submit).
@@ -1194,12 +1207,17 @@ def trigger_search(page, results_list: list) -> bool:
 
     # --- Pre-search: check if page already shows lots of results ---
     # Only use visible count — no AI call. Skip for form pages (form not submitted yet).
+    # On an aggregator with intent, do NOT short-circuit on visible count:
+    # the displayed results are likely cross-vertical noise we want to replace.
     if not is_form_search:
         pre_visible = count_visible_results(page)
         print(f"  Pre-search: {pre_visible} visible results")
         if pre_visible >= STOP_THRESHOLD:
-            print(f"  Page already showing {pre_visible} results, no search needed")
-            return True
+            if is_aggregator and intent:
+                print(f"  Aggregator + intent: ignoring pre-loaded results, will narrow by intent")
+            else:
+                print(f"  Page already showing {pre_visible} results, no search needed")
+                return True
     else:
         print(f"  Form-based search — skipping pre-search check")
 
@@ -1257,6 +1275,57 @@ def trigger_search(page, results_list: list) -> bool:
     # Track the best query to re-execute at the end
     best_visible = 0
     best_query = ""
+
+    # ─────────────────────────────────────────────────
+    #  STEP 0: INTENT-FIRST (aggregator + intent only)
+    # ─────────────────────────────────────────────────
+    # Cross-vertical aggregators (SuperPages, YellowPages, BBB, ...) return
+    # every industry on blank/wildcard searches. When Phase 0 flagged this
+    # URL as an aggregator AND we have a user intent, try the industry name
+    # FIRST so we capture only the vertical the user asked for.
+    #
+    # Fall through to the existing wildcard chain if intent queries return
+    # too few results (e.g. the aggregator doesn't recognize the term, or
+    # there genuinely are no matches in this geography).
+    if is_aggregator and intent:
+        canonical = (intent.get("industry_canonical") or "").strip()
+        aliases = [
+            (a or "").strip()
+            for a in (intent.get("industry_aliases") or [])
+            if (a or "").strip()
+        ]
+        # Dedupe (case-insensitive) and cap aliases — keep wall time bounded.
+        intent_queries: list[str] = []
+        seen_lower: set[str] = set()
+        for q in [canonical] + aliases[:3]:
+            if q and q.lower() not in seen_lower:
+                intent_queries.append(q)
+                seen_lower.add(q.lower())
+
+        if intent_queries:
+            print(f"  Aggregator + intent: trying {len(intent_queries)} intent queries first ({intent_queries})")
+            for iq in intent_queries:
+                if not go_back_to_form():
+                    print(f"  Could not return to form, stopping intent-first chain")
+                    break
+                print(f"  Trying intent query '{iq}'...")
+                visible = execute_query(iq)
+                if visible < 0:
+                    print(f"  Intent query '{iq}' failed, trying next")
+                    continue
+                if visible > best_visible:
+                    best_visible = visible
+                    best_query = iq
+                if visible >= STOP_THRESHOLD:
+                    print(f"  Intent query '{iq}': {visible} visible — stopping (intent-narrowed)")
+                    return True
+
+            # If intent narrowed to something usable, stop here — wildcards
+            # would re-pollute the result set with off-vertical records.
+            if best_visible >= 3:
+                print(f"  Intent queries best: '{best_query}' ({best_visible} visible) — using, skipping wildcards")
+                return True
+            print(f"  Intent queries yielded only {best_visible} visible — falling through to wildcard chain")
 
     # ─────────────────────────────────────────────────
     #  STEP 1: Search "" (blank) — most sites return all results

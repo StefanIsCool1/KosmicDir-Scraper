@@ -182,6 +182,34 @@ JSON_JUNK_DOMAINS = [
     "launchdarkly.com",                                 # feature flags
     "unpkg.com", "cdnjs.cloudflare.com", "jsdelivr.net", # CDN
     "fontawesome.com", "fonts.googleapis.com",          # fonts
+    # --- Publisher analytics / session recording / heatmaps ---
+    "crazyegg.com",                                     # heatmaps + session recording
+    "chartbeat.com", "chartbeat.net",                   # publisher real-time analytics
+    "scorecardresearch.com", "comscore.com",            # audience measurement
+    "quantcast.com", "quantserve.com",                  # audience data
+    "piwik.pro", "matomo.cloud",                        # analytics (alternative to GA)
+    "parsely.com", "parsely.net",                       # publisher analytics
+    "adobedtm.com", "demdex.net", "omtrdc.net",         # Adobe Analytics / Audience Manager
+    "krxd.net",                                         # Salesforce / Krux DMP
+    # --- Ad bidders / exchanges / SSPs ---
+    "atmtd.com", "automatad.com",                       # header bidding (floor prices)
+    "adsrvr.org",                                       # The Trade Desk
+    "criteo.com", "criteo.net",                         # retargeting
+    "indexww.com",                                      # Index Exchange
+    "openx.net",                                        # OpenX SSP
+    "pubmatic.com",                                     # PubMatic SSP
+    "rubiconproject.com",                               # Magnite / Rubicon SSP
+    "bidswitch.net",                                    # ad cookie sync
+    "adnxs.com", "adnxs.net",                           # Xandr / AppNexus
+    "casalemedia.com",                                  # Index Exchange affiliate
+    "smartadserver.com",                                # Smart AdServer
+    "taboola.com", "outbrain.com",                      # content recommendation widgets
+    "moatads.com",                                      # ad verification (Oracle)
+    "adsafeprotected.com",                              # IAS ad verification
+    "doubleverify.com",                                 # ad verification
+    # --- B2B / intent data (returns JSON but never directory members) ---
+    "6sc.co", "6sense.com",                             # B2B intent data
+    "bizible.com", "marketo.com",                       # marketing attribution
 ]
 
 JSON_DIRECTORY_KEYWORDS = [

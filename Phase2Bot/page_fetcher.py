@@ -237,8 +237,6 @@ def _resolve_url(href: str, base_url: str) -> str | None:
 
 
 # --- DUCKDUCKGO SEARCH FOR MISSING WEBSITES ---
-
-# --- DUCKDUCKGO SEARCH FOR MISSING WEBSITES ---
 # Uses curl_cffi with browser TLS impersonation to scrape DDG HTML results.
 # The duckduckgo-search library gets blocked because it lacks TLS fingerprinting.
 
@@ -562,12 +560,237 @@ def _match_from_results(
     return None
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Verify-by-fetch scoring
+# ────────────────────────────────────────────────────────────────────────────
+# Replaces the legacy domain-word match (_match_from_results) for picking
+# which DDG result is actually the company's website. Instead of trusting
+# that "smith" in the domain proves it's the right Smith, we fetch the top
+# candidates and check whether other record signals (phone, email, address,
+# name in heading) actually appear on the page.
+#
+# Only the page DDG returned is fetched — no subpage crawl, no link
+# following. The user's signals are expected to be on the home/main page.
+
+_MIN_VERIFY_SCORE = 3
+# Tiebreaker bonus by DDG rank. Added AFTER threshold check so it can't
+# push a weak candidate over the bar — it only decides between qualified ones.
+_RANK_BONUS = (0.5, 0.25, 0.0)
+
+
+def _digits_only(s: str | None) -> str:
+    """Strip everything but digits. Returns '' for None/empty."""
+    if not s:
+        return ""
+    return re.sub(r"\D", "", s)
+
+
+def _page_has_phone(page_text_digits: str, phone: str | None) -> bool:
+    """True if a 10-digit US phone appears anywhere on the page in any format.
+
+    Both sides are pre-stripped to digits-only, so (612) 555-1234 on the
+    record matches 612.555.1234, 6125551234, or +1 612 555 1234 on the page.
+    Returns False for non-US shapes — international numbers vary too much
+    in format for a substring match to be reliable.
+    """
+    digits = _digits_only(phone)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return False
+    return digits in page_text_digits
+
+
+def _page_has_email(text_lower: str, mailto_emails: set[str],
+                    contacts: list[dict]) -> bool:
+    """True if ANY contact email (excluding free providers) appears on the page.
+
+    Checks both plain-text occurrence and mailto: anchor hrefs. Free-provider
+    addresses (gmail, yahoo, etc.) are skipped — an unrelated page mentioning
+    a gmail address would coincidentally match too easily.
+    """
+    if not contacts:
+        return False
+    for c in contacts:
+        email = (c.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        domain = email.rsplit("@", 1)[-1]
+        if domain in _FREE_EMAIL_PROVIDERS:
+            continue
+        if email in mailto_emails or email in text_lower:
+            return True
+    return False
+
+
+def _page_has_location(text_lower: str, street_address: str | None) -> bool:
+    """True if BOTH city and state tokens from the address appear on the page.
+
+    Uses _extract_search_location to parse city + state from the record's
+    address (it already handles PO boxes, zip-only addresses, etc.). State-
+    only locations are too weak to count — any business in MN would match.
+    """
+    if not street_address:
+        return False
+    location = _extract_search_location(street_address)
+    if not location:
+        return False
+    parts = [p.lower() for p in location.split() if p]
+    if len(parts) < 2:
+        # Only state code parsed out — not enough on its own
+        return False
+    return all(p in text_lower for p in parts)
+
+
+def _page_has_name_in_heading(soup: BeautifulSoup, company_words: set[str]) -> bool:
+    """True if at least one company word (≥4 chars) appears in <title> or any <h1>.
+
+    Headings are where a business actually identifies itself — much
+    higher-signal than a substring anywhere on the page.
+    """
+    if not company_words:
+        return False
+    significant = {w for w in company_words if len(w) >= 4}
+    if not significant:
+        return False
+
+    chunks: list[str] = []
+    title = soup.find("title")
+    if title and title.get_text():
+        chunks.append(title.get_text().lower())
+    for h1 in soup.find_all("h1"):
+        chunks.append(h1.get_text(separator=" ").lower())
+
+    heading_text = " ".join(chunks)
+    if not heading_text.strip():
+        return False
+    return any(w in heading_text for w in significant)
+
+
+def _score_candidate(
+    fetch_url: str,
+    phone: str | None,
+    contacts: list[dict] | None,
+    street_address: str | None,
+    company_words: set[str],
+) -> tuple[int, bool]:
+    """Fetch the URL once and score signal matches against the record.
+
+    Returns (raw_score, fetch_ok). fetch_ok=False means fetch_page returned
+    no soup — caller should drop this candidate entirely (per user spec).
+    """
+    soup, _ = fetch_page(fetch_url)
+    if soup is None:
+        return 0, False
+
+    text_lower = soup.get_text(separator=" ").lower()
+    text_digits = _digits_only(text_lower)
+
+    # Collect mailto: hrefs once — cheaper than scanning text for "mailto:"
+    mailto_emails: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not isinstance(href, str):
+            continue
+        if href.lower().startswith("mailto:"):
+            addr = href[7:].split("?", 1)[0].strip().lower()
+            if addr:
+                mailto_emails.add(addr)
+
+    score = 0
+    if _page_has_phone(text_digits, phone):
+        score += 2
+    if _page_has_email(text_lower, mailto_emails, contacts or []):
+        score += 2
+    if _page_has_location(text_lower, street_address):
+        score += 1
+    if _page_has_name_in_heading(soup, company_words):
+        score += 1
+    return score, True
+
+
+def _verify_and_pick_website(
+    results: list[dict[str, str]],
+    company_words: set[str],
+    source_root: str | None,
+    phone: str | None = None,
+    contacts: list[dict] | None = None,
+    street_address: str | None = None,
+) -> str | None:
+    """Take top 3 viable DDG results, fetch+score each, return the best match.
+
+    Selection pipeline:
+      1. Apply basic skip filters (mirrors _match_from_results): non-http,
+         _SKIP_DOMAINS, source root, duckduckgo, document extensions.
+      2. Take the first 3 survivors in DDG rank order.
+      3. Fetch + score each. Fetch failures are excluded — they don't compete.
+      4. Filter to candidates with raw_score >= _MIN_VERIFY_SCORE.
+      5. Among survivors, return the URL with the highest
+         (raw_score + rank_bonus). Bonus only breaks ties; doesn't qualify.
+
+    Returns None if no candidate qualified (including the case where all
+    three fetches failed). The caller's existing 3-attempt cascade will
+    then try the next query variant.
+    """
+    # Step 1+2: collect up to 3 viable candidates in rank order
+    candidates: list[tuple[str, str]] = []  # (fetch_url, return_url)
+    for r in results:
+        if len(candidates) >= 3:
+            break
+        href = (r.get("href") or "").strip()
+        if not href or not href.startswith("http"):
+            continue
+        try:
+            parsed = urlparse(href)
+            domain = parsed.netloc.lower().replace("www.", "")
+        except Exception:
+            continue
+        if any(domain == skip or domain.endswith("." + skip) for skip in _SKIP_DOMAINS):
+            continue
+        if "duckduckgo" in domain:
+            continue
+        if source_root:
+            dom_root = ".".join(domain.rsplit(".", 2)[-2:]) if domain.count(".") >= 2 else domain
+            if source_root == dom_root:
+                continue
+        if parsed.path.lower().endswith((".pdf", ".doc", ".docx", ".xls")):
+            continue
+        candidates.append((href, f"{parsed.scheme}://{parsed.netloc}"))
+
+    if not candidates:
+        return None
+
+    # Step 3+4: fetch and score; keep only those that fetched AND cleared threshold
+    qualified: list[tuple[float, int, str]] = []  # (effective_score, rank_idx, return_url)
+    for rank_idx, (fetch_url, return_url) in enumerate(candidates):
+        raw_score, fetch_ok = _score_candidate(
+            fetch_url, phone, contacts, street_address, company_words
+        )
+        if not fetch_ok:
+            # Per spec: unfetchable candidates are thrown out entirely
+            continue
+        if raw_score < _MIN_VERIFY_SCORE:
+            continue
+        bonus = _RANK_BONUS[rank_idx] if rank_idx < len(_RANK_BONUS) else 0.0
+        qualified.append((raw_score + bonus, rank_idx, return_url))
+
+    if not qualified:
+        return None
+
+    # Step 5: highest effective score wins; rank index is the natural tiebreaker
+    # (lower index = higher DDG rank = preferred when raw scores are equal)
+    qualified.sort(key=lambda x: (-x[0], x[1]))
+    return qualified[0][2]
+
+
 def ddg_search_website(
     company_name: str,
     street_address: str | None = None,
     category: str | None = None,
     phone: str | None = None,
     source_domain: str | None = None,
+    contacts: list[dict] | None = None,
+    accurate: bool = False,
 ) -> tuple[str | None, str]:
     """Search DuckDuckGo for a company's website using all available signal.
 
@@ -576,6 +799,16 @@ def ddg_search_website(
       2. Cleaned name words (no suffixes) + location + category — broader.
       3. Quoted phone number — a uniquely formatted phone often nails the
          company's own pages because they display it in headers/footers.
+
+    Each attempt's DDG results are filtered to a single best URL by the
+    match strategy chosen by `accurate`:
+      - accurate=False (default): _match_from_results — fast, domain-word
+        match. Higher FP rate but no extra HTTP fetches.
+      - accurate=True (opt-in via UI toggle): _verify_and_pick_website —
+        fetches the top 3 candidate pages and scores them against the
+        record's phone / email / address / name. Lower FP rate, ~3-9 extra
+        HTTP fetches per record. Surfaced as "More accurate web enrichment"
+        in the Agent and Playground UIs.
 
     Email-domain shortcuts run BEFORE this function in enrich_from_websites
     (see website_from_emails) — records with a usable contact-email domain
@@ -596,6 +829,18 @@ def ddg_search_website(
     source_root = _extract_source_root(source_domain)
     location = _extract_search_location(street_address)
 
+    def _pick(results: list[dict[str, str]]) -> str | None:
+        """Pick a single URL from a result set, honoring the `accurate` flag.
+        Default path (fast): legacy domain-word match.
+        Accurate path (opt-in): fetch + score the top 3 candidates.
+        """
+        if accurate:
+            return _verify_and_pick_website(
+                results, company_words, source_root,
+                phone=phone, contacts=contacts, street_address=street_address,
+            )
+        return _match_from_results(results, company_words, source_root)
+
     # --- Attempt 1: Quoted exact name + context ---
     # Quoting forces DDG to treat the name as a phrase, not a bag of words.
     # Strip nested quotes defensively (e.g. 'Joe "The Builder" Inc') so we
@@ -611,7 +856,7 @@ def ddg_search_website(
 
     results1 = _ddg_fetch_results(query1)
     if results1:
-        match = _match_from_results(results1, company_words, source_root)
+        match = _pick(results1)
         if match:
             return match, query1
 
@@ -632,7 +877,7 @@ def ddg_search_website(
         last_query = query2
         results2 = _ddg_fetch_results(query2)
         if results2:
-            match = _match_from_results(results2, company_words, source_root)
+            match = _pick(results2)
             if match:
                 return match, query2
 
@@ -647,7 +892,7 @@ def ddg_search_website(
         last_query = phone_query
         results3 = _ddg_fetch_results(phone_query)
         if results3:
-            match = _match_from_results(results3, company_words, source_root)
+            match = _pick(results3)
             if match:
                 return match, phone_query
 

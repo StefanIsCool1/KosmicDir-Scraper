@@ -2,25 +2,17 @@ import { motion } from 'framer-motion'
 import * as Icons from 'lucide-react'
 import SectionWrapper from '../../components/SectionWrapper'
 import { FEATURES } from '../../lib/constants'
-
-const cardVariants = {
-  hidden: { opacity: 0, y: 20 },
-  visible: (i) => ({
-    opacity: 1,
-    y: 0,
-    transition: { delay: i * 0.06, duration: 0.5 },
-  }),
-}
+import { fadeUpStagger as cardVariants } from '../../lib/motion'
 
 export default function FeaturesGrid() {
   return (
     <SectionWrapper id="features">
       <div className="text-center">
         <h2 className="text-3xl font-bold tracking-tighter text-gray-900 sm:text-4xl">
-          Everything you need to scrape any directory
+          Everything a scraper should do
         </h2>
         <p className="mx-auto mt-4 max-w-lg text-gray-500">
-          One tool. Paste a URL, get structured data.
+          Point it at a directory. Get back clean, complete data.
         </p>
       </div>
 
