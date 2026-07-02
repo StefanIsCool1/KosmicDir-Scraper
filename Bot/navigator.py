@@ -844,18 +844,35 @@ def find_form_search(page):
 
 
 def count_visible_results(page) -> int:
-    """Quick estimate of how many member cards are currently visible on the page."""
+    """Estimate how many member cards are currently visible on the page.
+
+    Counts only elements that plausibly ARE cards: rendered (non-zero rect)
+    with at least 15 chars of text. Takes the MAX across selectors instead of
+    the first selector with >=3 — '[class*="card"]' matching 3 promo tiles
+    must not shadow a real 40-row listing under a later selector. This count
+    gates search skipping, category iteration, scroll growth, and pagination
+    skipping, so false positives here cascade through the whole scrape.
+    """
+    best = 0
     for sel in RESULT_COUNT_SELECTORS:
         try:
-            count = page.locator(sel).count()
-            if count >= 3:
-                return count
-        except:
+            count = page.eval_on_selector_all(sel, """els => els.filter(el => {
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const t = (el.innerText || '').trim();
+                return t.length >= 15;
+            }).length""")
+            if count > best:
+                best = count
+        except Exception:
             continue
+
+    if best >= 3:
+        return best
 
     try:
         return page.locator(RESULT_LINK_SELECTORS).count()
-    except:
+    except Exception:
         return 0
 
 
@@ -882,15 +899,19 @@ def is_starts_with_site(page) -> bool:
     return False
 
 
-def search_all_letters(page, search_input, submit_btn=None):
+def search_all_letters(page, search_input, submit_btn=None, html_collector=None):
     """Iterate through the alphabet + digits for starts-with search engines.
-    The response listener in browser.py captures results from each search.
+    The response listener in browser.py captures JSON results from each search.
 
     Args:
         page: Playwright page object
         search_input: The input locator to type into
         submit_btn: Optional submit button locator. If provided, clicks it
                     instead of pressing Enter.
+        html_collector: Optional list to capture each letter's rendered HTML
+                    into. Without it, HTML-only sites (no JSON XHR) lose every
+                    letter except the last — the final capture in browser.py
+                    only sees the page state after the last query.
     """
     chars = "abcdefghijklmnopqrstuvwxyz0123456789"
     print(f"  Iterating alphabet search ({len(chars)} queries)...")
@@ -908,6 +929,11 @@ def search_all_letters(page, search_input, submit_btn=None):
             except:
                 pass
             page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+            if html_collector is not None:
+                try:
+                    html_collector.append(page.content())
+                except Exception:
+                    pass
         except Exception as e:
             print(f"  Error searching '{char}': {e}")
             continue
@@ -1014,6 +1040,33 @@ Reply ONLY: a number, "all", or "unknown".
 STOP_THRESHOLD = 600
 
 
+def _find_submit_near(page, search_input):
+    """Find a submit/search button for a single search input.
+
+    Looks inside the input's own <form> first, then falls back to the first
+    button (or input[type=submit]) that follows the input in document order.
+    Used when pressing Enter demonstrably did nothing — React/Vue search UIs
+    often only wire a click handler on the button.
+    """
+    try:
+        form = search_input.locator("xpath=ancestor::form[1]")
+        if form.count() > 0:
+            btn = form.first.locator(FORM_SUBMIT_SELECTORS).first
+            if btn.is_visible(timeout=500):
+                return btn
+    except Exception:
+        pass
+    try:
+        btn = search_input.locator(
+            "xpath=following::button[1] | following::input[@type='submit'][1]"
+        ).first
+        if btn.is_visible(timeout=500):
+            return btn
+    except Exception:
+        pass
+    return None
+
+
 def try_search_query(page, search_input, query: str, submit_btn=None) -> int:
     """Execute a single search query and return the visible result count.
 
@@ -1038,7 +1091,17 @@ def try_search_query(page, search_input, query: str, submit_btn=None) -> int:
         if submit_btn:
             submit_btn.click()
         else:
+            url_before = page.url
+            count_before = count_visible_results(page)
             search_input.press("Enter")
+            page.wait_for_timeout(1000)
+            # Enter did nothing (no navigation, no new results) — React/Vue
+            # search UIs often only respond to a button click. Find and click
+            # a submit button near the input.
+            if page.url == url_before and count_visible_results(page) <= count_before:
+                btn = _find_submit_near(page, search_input)
+                if btn:
+                    btn.click()
 
         try:
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
@@ -1100,7 +1163,8 @@ def try_form_search_query(page, search_input, submit_btn, query: str) -> int:
 
 def trigger_search(page, results_list: list,
                    is_aggregator: bool = False,
-                   intent: dict | None = None) -> bool:
+                   intent: dict | None = None,
+                   html_collector: list | None = None) -> bool:
     """Smart search strategy with result count awareness.
 
     Flow:
@@ -1123,6 +1187,9 @@ def trigger_search(page, results_list: list,
             identically to before.
         intent: Optional dict from intent_filter.intent_from_plan. Used only
             when is_aggregator=True. None for Playground callers.
+        html_collector: Optional list (browser.py passes all_page_htmls).
+            Only consumed by the starts-with alphabet iteration, which must
+            capture each letter's rendered HTML as it goes.
     """
     # --- Detect search method ---
     # Try form-based search FIRST (more specific: Name/Company/City + Submit).
@@ -1399,7 +1466,8 @@ def trigger_search(page, results_list: list,
         # --- Special handling for "a": check starts-with ---
         if strat_query == "a" and visible >= 3 and is_starts_with_site(page):
             print(f"  Detected starts-with site, iterating alphabet")
-            search_all_letters(page, search_input, submit_btn=submit_btn)
+            search_all_letters(page, search_input, submit_btn=submit_btn,
+                               html_collector=html_collector)
             return True
 
         # Check visible count threshold

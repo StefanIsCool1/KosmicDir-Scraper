@@ -419,6 +419,17 @@ CATEGORY_SKIP_VISIBLE_THRESHOLD = 3
 _BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
+def launch_browser(playwright):
+    """Launch Chromium for scraping. Single point for all three launch sites
+    (browser.py, detail_crawler.py x2).
+
+    Default is HEADED — the interactive login flow needs a visible window.
+    Set SCRAPER_HEADLESS=1 to run headless (servers / CI, where headed
+    Chromium crashes on a missing display)."""
+    headless = os.environ.get("SCRAPER_HEADLESS", "").strip() == "1"
+    return playwright.chromium.launch(headless=headless)
+
+
 def block_unnecessary_resources(page):
     """Block images, fonts, and media to speed up page loads.
     Call AFTER stealth setup, BEFORE navigation.

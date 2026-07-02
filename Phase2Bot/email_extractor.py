@@ -601,6 +601,38 @@ def _needs_enrichment(member):
     return not (has_desc and has_phone and has_email)
 
 
+def _passthrough_enriched_dump(json_path, members, orig_meta, entity_type, name_field):
+    """Write a Phase-2-format dump for a NON-business directory without running any
+    business enrichment. Records pass through unchanged (fail-open).
+
+    Used when the structured dump's entity_type isn't 'business': products, vehicles,
+    events, etc. have no per-record website or public registry that Phase 2's lookups
+    (email-domain derivation, DDG website-find, NPI) can use, and forcing those would
+    attach wrong data. We still emit a well-formed _enriched.json so the download/UI
+    flow is identical to the business case."""
+    from datetime import datetime, timezone
+    basename = os.path.basename(json_path).replace("_structured.json", "_enriched.json")
+    output_path = os.path.join(PHASE2_DUMP_DIR, basename)
+    os.makedirs(PHASE2_DUMP_DIR, exist_ok=True)
+
+    extra = {
+        "enriched_at": datetime.now(timezone.utc).isoformat(),
+        "enrichment_skipped": f"entity_type={entity_type}",
+        "records_enriched": 0,
+    }
+    if orig_meta.get("scraped_at"):
+        extra["scraped_at"] = orig_meta["scraped_at"]  # preserve original scrape time
+    for key in ("intent_industry", "intent_locations"):
+        if key in orig_meta:
+            extra[key] = orig_meta[key]
+
+    metadata = compute_metadata(members, source_url=orig_meta.get("source_url", ""),
+                                entity_type=entity_type, name_field=name_field, **extra)
+    with open(output_path, "w") as f:
+        json.dump({"metadata": metadata, "members": members}, f, indent=4, ensure_ascii=False)
+    return output_path
+
+
 def enrich_from_websites(json_path, event_callback=None, accurate_enrichment: bool = False):
     """Main entry point. Reads structured JSON, enriches entries, saves to Phase2-Dump.
 
@@ -619,6 +651,23 @@ def enrich_from_websites(json_path, event_callback=None, accurate_enrichment: bo
     members = read_members(json_path)
 
     log(f"Loaded {len(members)} members from {os.path.basename(json_path)}")
+
+    # Entity-type gate. Phase 2 enrichment is built for businesses/people — it finds a
+    # record's own website, derives a domain from a contact email, or hits the NPI
+    # registry for a practitioner. A non-"business" directory (products, vehicles,
+    # events, …) has no per-record website or registry to enrich from, and running
+    # those person/business lookups against it would bolt on WRONG data (e.g. a random
+    # company site onto a GPU). Fail OPEN: pass records through unchanged and still
+    # write a well-formed enriched dump so the download/UI flow is unaffected.
+    _orig_meta = read_metadata(json_path) or {}
+    _entity_type = (_orig_meta.get("entity_type") or "business")
+    if _entity_type != "business":
+        log(f"  entity_type='{_entity_type}' — Phase 2 business enrichment does not "
+            f"apply; passing {len(members)} records through unchanged")
+        return _passthrough_enriched_dump(
+            json_path, members, _orig_meta, _entity_type,
+            _orig_meta.get("name_field") or "company_name",
+        )
 
     enrichable = [m for m in members if _needs_enrichment(m)]
     complete = [m for m in members if not _needs_enrichment(m)]

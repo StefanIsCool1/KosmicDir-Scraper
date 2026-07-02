@@ -3,6 +3,7 @@ HTTP page fetcher with rate limiting and subpage discovery.
 Uses curl_cffi with browser TLS fingerprint impersonation.
 """
 
+import base64
 import random
 import re
 import time
@@ -358,8 +359,59 @@ def _build_phone_query(phone: str | None) -> str | None:
     return f'"{formatted}"'
 
 
-# Search rate limiting — reset per run, not global
+# Search rate limiting — reset per run, not global.
+# When DDG blocks (429/403), this flips and all subsequent queries are routed
+# to the Bing HTML fallback instead of returning [] — a mid-run DDG block
+# used to silently truncate discovery and Phase 2 website-finding.
 _search_stopped = False
+
+
+def _bing_fetch_results(query: str) -> list[dict[str, str]]:
+    """Bing HTML search fallback — same result shape as _ddg_fetch_results
+    ({'href', 'title', 'snippet'}). Used once DDG rate-limits for the run.
+    Returns [] on any failure, which matches the old dead-engine behavior."""
+    search_url = f"https://www.bing.com/search?q={quote_plus(query)}&count=25"
+    time.sleep(random.uniform(0.8, 1.6))
+    browser = random.choice(_IMPERSONATE_TARGETS)
+    try:
+        session = _get_session(browser)
+        resp = session.get(search_url,
+                           headers={**_BROWSER_HEADERS,
+                                    "Referer": "https://www.bing.com/"},
+                           allow_redirects=True, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        for block in soup.select("li.b_algo"):
+            a = block.select_one("h2 a")
+            if not a:
+                continue
+            href = str(a.get("href", ""))
+            # Bing wraps organic links: /ck/a?...&u=a1<base64url-of-target>
+            if href.startswith("https://www.bing.com/ck/"):
+                m = re.search(r"[?&]u=a1([A-Za-z0-9_\-]+)", href)
+                if not m:
+                    continue
+                try:
+                    pad = "=" * (-len(m.group(1)) % 4)
+                    href = base64.urlsafe_b64decode(
+                        m.group(1) + pad).decode("utf-8", "ignore")
+                except Exception:
+                    continue
+            if not href.startswith("http"):
+                continue
+            snippet_el = block.select_one(".b_caption p") or block.select_one("p")
+            results.append({
+                "href": href,
+                "title": a.get_text(strip=True),
+                "snippet": snippet_el.get_text(" ", strip=True) if snippet_el else "",
+            })
+        return results
+
+    except Exception:
+        return []
 
 
 def _build_company_words(company_name: str) -> set[str]:
@@ -430,7 +482,8 @@ def _ddg_fetch_results(query: str) -> list[dict[str, str]]:
     """
     global _search_stopped
     if _search_stopped:
-        return []
+        # DDG already blocked this run — go straight to the Bing fallback.
+        return _bing_fetch_results(query)
 
     search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
 
@@ -448,9 +501,9 @@ def _ddg_fetch_results(query: str) -> list[dict[str, str]]:
                            allow_redirects=True, timeout=REQUEST_TIMEOUT)
 
         if resp.status_code in (429, 403):
-            print("    Search blocked, stopping website discovery")
+            print("    DDG blocked — switching to Bing for the rest of this run")
             _search_stopped = True
-            return []
+            return _bing_fetch_results(query)
 
         if resp.status_code != 200:
             return []
@@ -817,11 +870,10 @@ def ddg_search_website(
     Returns (url_or_none, best_query_used). The query string in the failure
     case is whichever attempt ran last, useful for debugging which strategies
     were tried.
-    """
-    global _search_stopped
-    if _search_stopped:
-        return None, ""
 
+    Note: a DDG rate-limit no longer aborts the search — _ddg_fetch_results
+    transparently falls back to Bing for the rest of the run.
+    """
     company_words = _build_company_words(company_name)
     if not company_words:
         return None, ""
@@ -862,9 +914,6 @@ def ddg_search_website(
 
     # --- Attempt 2: Cleaned name (no suffixes) + context ---
     # Strips "INC", "LLC", "OF WPB" etc. but keeps location + category.
-    if _search_stopped:
-        return None, last_query
-
     broad_words = sorted(company_words, key=len, reverse=True)[:4]
     parts2 = broad_words[:]
     if location:
@@ -884,9 +933,6 @@ def ddg_search_website(
     # --- Attempt 3: Quoted phone number ---
     # A formatted phone like "(512) 555-1234" is often a near-unique
     # identifier — DDG indexes the business's own header/footer pages.
-    if _search_stopped:
-        return None, last_query
-
     phone_query = _build_phone_query(phone)
     if phone_query:
         last_query = phone_query

@@ -22,6 +22,7 @@ from config import (
     SCROLL_BATCH_SIZE, SCROLL_STALE_THRESHOLD,
     CATEGORY_SKIP_VISIBLE_THRESHOLD,
     block_unnecessary_resources,
+    launch_browser,
 )
 from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all
 from intent_filter import filter_categories_by_intent
@@ -245,6 +246,35 @@ def _is_directory_json(data, url: str) -> bool:
         is_directory_data = False
 
     return is_directory_data
+
+
+# Name-like keys that mark a JSON list as member records (same set the
+# trigger_search member-data check and main.py's is_member_list use).
+_MEMBER_NAME_KEYS = {
+    "name", "companyname", "company_name", "businessname",
+    "organizationname", "title", "nam", "displayname",
+    "providername", "practicename", "firmname",
+    "restaurantname", "doctorname", "fullname",
+    "entityname", "officename", "attorneyname",
+}
+
+
+def _looks_like_member_records(lst) -> bool:
+    """True if `lst` is a list of dicts whose entries carry a name-like key.
+
+    Used by the skip-pagination gate: counting EVERY list in captured JSON
+    (the old behavior) let a 60-entry i18n bundle or config array suppress
+    pagination on a site whose real member data is paginated.
+    """
+    if not isinstance(lst, list) or len(lst) < 3 or not isinstance(lst[0], dict):
+        return False
+    keys = {k.lower() for k in lst[0].keys()}
+    if keys & _MEMBER_NAME_KEYS:
+        return True
+    # Airtable shape: {"id": ..., "fields": {"Name": ...}}
+    if "fields" in keys and isinstance(lst[0].get("fields"), dict):
+        return bool({k.lower() for k in lst[0]["fields"].keys()} & _MEMBER_NAME_KEYS)
+    return False
 
 
 def find_content_frame(page):
@@ -545,10 +575,13 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
         return current_page_num
 
     def _content_snapshot() -> str:
-        """Quick hash of visible text to detect if page actually changed."""
+        """Length + tail-hash of body text. The tail (not the head) is where
+        paginated results actually change — the first 2000 chars are usually
+        static header/nav, which made SPA pagination (results swap, no URL
+        change) look 'unchanged' and stop after one page."""
         try:
-            text = page.inner_text("body")[:2000]
-            return str(hash(text))
+            text = page.inner_text("body")
+            return f"{len(text)}:{hash(text[-2000:])}"
         except:
             return ""
 
@@ -781,7 +814,7 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
 
     domain = urlparse(link).netloc.replace(".", "_")
 
-    browser = playwright.chromium.launch(headless=False)
+    browser = launch_browser(playwright)
     page = browser.new_page()
 
     # Apply stealth patches to avoid bot detection (Cloudflare, DataDome, etc.)
@@ -843,10 +876,25 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
 
         # --- HTML/text responses (queued for later reading) ---
         elif "text/plain" in content_type or "text/html" in content_type:
-            pending_html_responses.append(response)
             url_lower = response.url.lower()
             if any(kw in url_lower for kw in DIRECTORY_URL_KEYWORDS):
+                # Directory-shaped URL — read the body NOW. Playwright drops
+                # response bodies on navigation, and pagination navigates up
+                # to 50 times; reading at the end lost the ASP.NET
+                # UpdatePanel payloads this queue exists for.
+                try:
+                    text = response.body().decode("utf-8", errors="ignore")
+                    pending_html_responses.append(
+                        {"url": response.url, "text": text})
+                except Exception:
+                    pending_html_responses.append(
+                        {"url": response.url, "response": response})
                 reset_idle_timer()
+            else:
+                # Non-keyword URLs are rarely read later — keep them lazy to
+                # avoid buffering every page document.
+                pending_html_responses.append(
+                    {"url": response.url, "response": response})
 
     page.on("response", on_response)
 
@@ -960,12 +1008,19 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         debug.log("SEARCH", f"Starting search. JSON results so far: {pre_search_count}")
         search_triggered = trigger_search(page, results,
                                           is_aggregator=is_aggregator,
-                                          intent=intent)
+                                          intent=intent,
+                                          html_collector=all_page_htmls)
         debug.log("SEARCH", f"Search complete. triggered={search_triggered}, "
                   f"results before={pre_search_count} after={len(results)}")
         if search_triggered and len(results) > pre_search_count:
             idle_timeout_value = SEARCH_IDLE_TIMEOUT
             print(f"Idle timeout set to: {idle_timeout_value}s (search mode)")
+        if search_triggered:
+            # Search results frequently lazy-load below the fold (Algolia-
+            # style grids, "infinite" result lists). Without this scroll, a
+            # searched directory captures exactly one viewport — there was
+            # previously NO code path where search and scrolling both ran.
+            human_scroll(page, done, scroll_target="body", adaptive=True)
 
     # Enable and start the idle timer AFTER search/scroll decision.
     timer_enabled = True
@@ -1102,11 +1157,11 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         json_record_count = 0
         for r in results:
             data = r.get("data", {})
-            if isinstance(data, list):
+            if isinstance(data, list) and _looks_like_member_records(data):
                 json_record_count += len(data)
             elif isinstance(data, dict) and "raw_html" not in data:
                 for val in data.values():
-                    if isinstance(val, list):
+                    if isinstance(val, list) and _looks_like_member_records(val):
                         json_record_count += len(val)
         if json_record_count >= 50:
             print(f"  Skipping pagination — already have {json_record_count} JSON records")
@@ -1189,11 +1244,17 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
             print(f"Error capturing page HTML: {e}")
 
     # --- Step 7: Read pending HTML responses (ASP.NET UpdatePanel etc.) ---
+    # Entries are dicts: {"url", "text"} for eagerly-read bodies (directory-
+    # keyword URLs), {"url", "response"} for lazily-kept ones whose bodies
+    # may already be gone after navigation.
     print(f"Processing {len(pending_html_responses)} pending HTML responses...")
     for r in pending_html_responses:
         try:
-            body = r.body()
-            text = body.decode("utf-8", errors="ignore")
+            r_url = r["url"]
+            text = r.get("text")
+            if text is None:
+                body = r["response"].body()
+                text = body.decode("utf-8", errors="ignore")
             if not text:
                 continue
 
@@ -1208,22 +1269,22 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                     data = json.loads(stripped)
                 except (json.JSONDecodeError, ValueError):
                     data = None
-                if data is not None and _is_directory_json(data, r.url):
-                    print(f"JSON-as-text/html detected at: {r.url}")
-                    results.append({"url": r.url, "data": data})
+                if data is not None and _is_directory_json(data, r_url):
+                    print(f"JSON-as-text/html detected at: {r_url}")
+                    results.append({"url": r_url, "data": data})
                     continue  # already routed — don't also try UpdatePanel parse
 
             # Detect ASP.NET UpdatePanel response
             if "updatepanel" in text.lower() and any(
                 kw in text.lower() for kw in ["member", "contact", "directory"]
             ):
-                print("ASP.NET UpdatePanel response detected at:", r.url)
+                print("ASP.NET UpdatePanel response detected at:", r_url)
                 # Extract HTML chunk from pipe-delimited format
                 # Format: length|#||type|length|updatePanel|id|<HTML>
                 parts = text.split("|", 7)
                 html_content = parts[7] if len(parts) >= 8 else text
                 results.append({
-                    "url": r.url,
+                    "url": r_url,
                     "data": {"raw_html": html_content}
                 })
         except Exception as e:

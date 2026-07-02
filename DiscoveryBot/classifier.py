@@ -295,6 +295,19 @@ def classify_one(qualified: dict) -> dict:
     if soup is None:
         return {**qualified, "classification": "REJECT", "reason": "no_soup"}
 
+    # Client-rendered shell: the static fetch has no cards to detect, but
+    # Phase 1's Playwright session is the renderer — let it try. Without this
+    # branch these fall through to "no_contact_info" REJECT and every
+    # JS-rendered directory is structurally excluded from Agent mode.
+    if qualified.get("js_rendered"):
+        return {
+            **qualified,
+            "classification": "DIRECTORY",
+            "card_selector": None,
+            "needs_navigation": True,
+            "reason": "js_rendered",
+        }
+
     raw_html = str(soup)
 
     # extract_sample_html is no-AI — it returns a card_selector when it finds

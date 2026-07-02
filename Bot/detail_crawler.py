@@ -29,10 +29,10 @@ from config import (
     DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX,
     DETAIL_SAMPLE_COUNT, DETAIL_URL_KEYWORDS,
     NETWORK_IDLE_TIMEOUT, EXTERNAL_SKIP_DOMAINS,
-    block_unnecessary_resources,
+    block_unnecessary_resources, launch_browser,
 )
 from llm import ask
-from html_parser import strip_junk, regex_extract_from_card, _merge_member_data
+from html_parser import strip_junk, regex_extract_from_card, _merge_member_data, _LABEL_PREFIX_RE
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
 
 
@@ -469,8 +469,8 @@ def apply_detail_selectors(raw_html: str, selectors: dict) -> dict:
             if not el:
                 return None
             text = el.get_text(strip=True)
-            # Strip common label prefixes like "Phone:" or "Website:"
-            text = re.sub(r'^[\w\s]+:\s*', '', text)
+            # Strip known label prefixes like "Phone:" or "Website:"
+            text = _LABEL_PREFIX_RE.sub('', text)
             return text or None
         except Exception:
             return None
@@ -649,7 +649,7 @@ def _detect_detail_api(sample_urls: list) -> dict | None:
     print(f"  Probing for API endpoint (navigating to first detail page)...")
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        browser = launch_browser(playwright)
         page = browser.new_page()
         try:
             from playwright_stealth import Stealth
@@ -834,7 +834,7 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
     is_hash_route = any("#" in url for url in detail_urls[:3])
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        browser = launch_browser(playwright)
         page = browser.new_page()
         try:
             from playwright_stealth import Stealth
@@ -880,20 +880,57 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
                 except Exception:
                     pass
 
-        # ── Phase 1: Learn selectors from sample pages ──
-        if not cached:
+        # ── Phase 0.5: Validate cached selectors on a small sample ──
+        # A stale cache (site redesign) used to burn the WHOLE crawl:
+        # every page fetched, zero members extracted, bad cache kept.
+        if cached:
             sample_urls = detail_urls[:DETAIL_SAMPLE_COUNT]
-            print(f"  Phase 1: Crawling {len(sample_urls)} sample pages for selector learning...")
-
+            print(f"  Validating cached detail selectors on {len(sample_urls)} sample page(s)...")
             for i, url in enumerate(sample_urls):
                 try:
                     _navigate_detail(url)
-                    html = page.content()
-                    sample_htmls.append(html)
-                    print(f"    Sample {i + 1}/{len(sample_urls)}: OK")
+                    sample_htmls.append(page.content())
                     time.sleep(random.uniform(DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX))
                 except Exception as e:
                     print(f"    Sample {i + 1}/{len(sample_urls)}: FAILED — {e}")
+
+            if not sample_htmls:
+                # Site unreachable — don't punish the cache for a network
+                # failure, and don't crawl a site we can't fetch.
+                print("  ERROR: No sample pages loaded — aborting detail crawl")
+                browser.close()
+                return []
+
+            cached_sample = [apply_detail_selectors(h, cached) for h in sample_htmls]
+            if is_detail_extraction_valid(cached_sample):
+                selectors = cached
+                all_members.extend(cached_sample)
+                remaining_urls = detail_urls[DETAIL_SAMPLE_COUNT:]
+                print(f"  Cached detail selectors validated "
+                      f"({len(all_members)} members from samples)")
+            else:
+                print("  Cached detail selectors FAILED validation — re-learning")
+                delete_cached_selectors(cache_key)
+                cached = None  # fall through to the learning path below
+
+        # ── Phase 1: Learn selectors from sample pages ──
+        if not cached:
+            sample_urls = detail_urls[:DETAIL_SAMPLE_COUNT]
+            if not sample_htmls:
+                print(f"  Phase 1: Crawling {len(sample_urls)} sample pages for selector learning...")
+
+                for i, url in enumerate(sample_urls):
+                    try:
+                        _navigate_detail(url)
+                        html = page.content()
+                        sample_htmls.append(html)
+                        print(f"    Sample {i + 1}/{len(sample_urls)}: OK")
+                        time.sleep(random.uniform(DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX))
+                    except Exception as e:
+                        print(f"    Sample {i + 1}/{len(sample_urls)}: FAILED — {e}")
+            else:
+                # Cache validation already fetched these pages — reuse them.
+                print(f"  Reusing {len(sample_htmls)} sample page(s) from cache validation")
 
             if len(sample_htmls) < 2:
                 print("  ERROR: Not enough sample pages loaded, aborting detail crawl")
@@ -941,10 +978,6 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
 
             remaining_urls = detail_urls[DETAIL_SAMPLE_COUNT:]
             print(f"  Selectors validated! {len(all_members)} members from samples.")
-        else:
-            selectors = cached
-            remaining_urls = detail_urls
-            print(f"  Using cached detail selectors for {domain}")
 
         # ── Phase 2: Crawl all remaining pages ──
         remaining_count = len(remaining_urls)

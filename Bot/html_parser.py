@@ -201,6 +201,16 @@ _STATE_ZIP_RE = re.compile(
 _HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5"]
 _BOLD_TAGS = ["strong", "b"]
 
+# Known field-label prefixes to strip from extracted values ("Phone: 555-1234"
+# → "555-1234"). Deliberately a closed list: the old pattern ^[\w\s]+:\s*
+# stripped ANY leading "Words:" — turning "Studio 54: NYC" into "NYC" and
+# mangling names/descriptions containing a colon.
+_LABEL_PREFIX_RE = re.compile(
+    r'^(?:phone|tel|telephone|fax|email|e-mail|website|web|url|address|'
+    r'street address|mailing address|category|type|specialty)\s*:\s*',
+    re.I,
+)
+
 
 def _extract_company_name(element) -> str | None:
     """Extract company name from a card/detail element.
@@ -528,6 +538,33 @@ def _has_schema_markup(el) -> bool:
     ])
 
 
+def _selector_for_container(el) -> str | None:
+    """Short stable CSS path for a container element.
+
+    Prefers #id, then tag.class, else walks up to 3 plain-tag hops. Used to
+    address classless rows (<tr>, <li>) via their parent, since the rows
+    themselves have nothing to select on.
+    """
+    parts: list[str] = []
+    node = el
+    for _ in range(3):
+        if node is None or not getattr(node, "name", None) \
+                or node.name in ("html", "body", "[document]"):
+            break
+        el_id = node.get("id")
+        if el_id and re.match(r'^[A-Za-z][\w-]*$', el_id):
+            parts.append(f"{node.name}#{el_id}")
+            return " > ".join(reversed(parts))
+        classes = [c for c in (node.get("class") or [])
+                   if c and not is_layout_class(c) and re.match(r'^[A-Za-z][\w-]*$', c)]
+        if classes:
+            parts.append(f"{node.name}.{classes[0]}")
+            return " > ".join(reversed(parts))
+        parts.append(node.name)
+        node = node.parent
+    return " > ".join(reversed(parts)) if parts else None
+
+
 def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
     """Extract a small sample of member cards for selector learning.
 
@@ -631,6 +668,51 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
                 "sample": structured[:4],
             })
 
+    # --- Strategy 2: parent-based sibling grouping (classless tables/lists) ---
+    # Plain <table><tr> and unclassed <li> listings — the dominant format on
+    # older association sites — never form a class group above, so without
+    # this they fall through to the blind densest-chunk sample. Group
+    # same-tag siblings under one container and address them with a
+    # positional selector built from the container.
+    if not candidates:
+        for parent in soup.find_all(["table", "tbody", "ul", "ol"]):
+            rows = [c for c in parent.find_all(recursive=False)
+                    if getattr(c, "name", None) in ("tr", "li")]
+            if len(rows) < 4:
+                continue
+            # Real data rows have some text and inner structure; this filters
+            # header rows ("NamePhone") and one-link nav items.
+            structured = [r for r in rows
+                          if len(r.get_text(strip=True)) > 15
+                          and len(r.find_all()) >= 2]
+            if len(structured) < MIN_CARDS_FOR_LEARNING:
+                continue
+            container_sel = _selector_for_container(parent)
+            if not container_sel:
+                continue
+            selector = f"{container_sel} > {structured[0].name}"
+            try:
+                matched = soup.select(selector)
+            except Exception:
+                continue
+            # Under-matching means the selector missed rows; wild over-
+            # matching means it hit every table/list on the page.
+            if len(matched) < len(structured) or len(matched) > len(rows) * 3:
+                continue
+            score = score_candidate_group(soup, structured[0].name,
+                                          "(classless)", structured)
+            candidates.append({
+                "tag": structured[0].name,
+                "class": "(classless)",
+                "selector": selector,
+                "count": len(structured),
+                "score": score,
+                "sample": structured[:4],
+            })
+        if candidates:
+            print(f"  Sample: classless sibling grouping found "
+                  f"{len(candidates)} candidate group(s)")
+
     if not candidates:
         print("  Sample: no repeating card candidates found, scanning for densest content region")
         # Find the region with the most links and contact signals instead of
@@ -673,36 +755,73 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
 def learn_selectors(raw_html: str, domain: str) -> dict:
     """Ask Haiku to identify CSS selectors from a small sample.
     Called ONCE per domain, then the result is cached permanently."""
-    sample, _card_selector = extract_sample_html(raw_html)
+    sample, detected_card_selector = extract_sample_html(raw_html)
 
-    prompt = f"""Analyze this directory listing HTML sample and return CSS selectors for extracting data.
-This could be any type of directory (businesses, doctors, restaurants, attorneys, providers, etc.).
+    # When structural detection found the card container, tell the model.
+    # Classless rows (plain <tr>/<li> samples) give it nothing to anchor a
+    # card_selector on otherwise, and it answers with a bare tag name.
+    card_hint = ""
+    if detected_card_selector:
+        card_hint = (
+            f"\n- The repeating card container on this page matches the CSS selector: "
+            f"{detected_card_selector}\n  Use this EXACT selector as card_selector "
+            f"unless it is clearly wrong."
+        )
 
-Return ONLY a JSON object (no markdown) with these keys:
-- card_selector: CSS selector for each listing card (the repeating container element)
-- company_name: selector for the primary name (company, person, practice, restaurant, etc.)
-- description: selector for description/about text
-- category: selector for category, specialty, or classification
-- website: selector for website link or text
-- phone: selector for phone number
-- fax: selector for fax number
-- street_address: selector for street address block
-- mailing_address: selector for mailing address block
-- contact_card: selector for individual contact blocks within a card (or null)
-- contact_name: selector for contact name (relative to contact_card)
-- contact_email: selector for contact email (relative to contact_card)
+    # NOTE: f-string — every literal brace in the JSON schema below is doubled.
+    prompt = f"""Analyze this directory listing HTML sample. FIRST classify the entity each
+card represents, THEN return CSS selectors for extracting each card's data.
 
-Rules:
+STEP 1 — entity_type. What does ONE card describe?
+- "business" — a company, organization, professional, practice, firm, restaurant, agency,
+  or any contactable person/org (has a name and usually phone/website/address). This is the
+  DEFAULT: directories of doctors, lawyers, HOAs, restaurants, vendors, etc. are ALL "business".
+- Otherwise a short lowercase noun for the listed thing: "product", "vehicle", "event",
+  "property", "book", "course", etc. Use a non-business type ONLY when cards describe physical
+  items or listings, NOT contactable organizations. When in doubt, choose "business".
+
+STEP 2 — selectors.
+
+If entity_type is "business", return ONLY this JSON (no markdown):
+{{
+  "entity_type": "business",
+  "card_selector": "CSS selector for each repeating card (absolute)",
+  "company_name": "selector for the primary name",
+  "description": "selector for description/about text",
+  "category": "selector for category/specialty/classification",
+  "website": "selector for website link or text",
+  "phone": "selector for phone number",
+  "fax": "selector for fax number",
+  "street_address": "selector for street address block",
+  "mailing_address": "selector for mailing address block",
+  "contact_card": "selector for individual contact blocks within a card, or null",
+  "contact_name": "selector for contact name relative to contact_card, or null",
+  "contact_email": "selector for contact email relative to contact_card, or null"
+}}
+
+If entity_type is NOT "business", return ONLY this JSON (no markdown):
+{{
+  "entity_type": "<the type>",
+  "card_selector": "CSS selector for each repeating card (absolute)",
+  "name_field": "<the key from fields[] that is the primary identifier>",
+  "fields": [
+    {{"key": "<snake_case name you choose for this datum>", "selector": "<relative CSS>", "role": "<role>"}}
+  ]
+}}
+- role is one of: identity, category, price, location, url, phone, email, spec, description, other
+- EXACTLY ONE field has role "identity", and its key MUST equal name_field
+- invent as many "spec" fields as the card exposes (e.g. a graphics card: chipset, memory, tdp, interface)
+- omit a datum entirely if it is not present (do NOT emit empty/null entries in fields[])
+
+Rules (both modes):
 - Use class-based selectors where possible e.g. "div.listingBox"
-- Selectors for fields inside a card should be relative to the card element
-- If a field doesn't exist in the sample, use null
-- card_selector must be an absolute selector (not relative)
-- Never use :contains() pseudo-selectors as they are not supported by BeautifulSoup
-- For phone/fax: target the most specific parent div that contains only the phone number e.g. "div.phoneWrapper" not a broad container
+- card_selector must be ABSOLUTE; field selectors RELATIVE to the card
+- Never use :contains() pseudo-selectors — BeautifulSoup does not support them
+- For phone/price/spec: target the most specific element holding just that value{card_hint}
 
 HTML SAMPLE:
 {sample}"""
-    raw = ask(prompt, max_tokens=1000).strip()
+    raw = ask(prompt, max_tokens=1200).strip()
     # Strip markdown fences if the model wrapped the response
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -715,10 +834,50 @@ HTML SAMPLE:
         print(f"  LLM returned non-JSON selectors for {domain}: {e}")
         return {}
 
-    # Don't cache useless selectors — Haiku couldn't find anything
+    if not isinstance(selectors, dict):
+        return {}
+
+    # Don't cache useless selectors — the model couldn't find a card container
     if not selectors.get("card_selector"):
-        print(f"  Haiku returned no card_selector for {domain}, skipping cache")
+        print(f"  Model returned no card_selector for {domain}, skipping cache")
         return selectors
+
+    # A bare tag as card_selector ("tr", "li", "div") matches every such
+    # element on the page — nav tables, menus, footers. When structural
+    # detection produced a scoped selector, prefer it over the model's
+    # unanchored guess.
+    _model_sel = str(selectors.get("card_selector") or "").strip().lower()
+    if detected_card_selector and _model_sel in (
+            "tr", "li", "div", "article", "section", "table",
+            "table tr", "tbody tr", "table > tr", "tbody > tr",
+            "ul li", "ol li", "ul > li", "ol > li"):
+        print(f"  Overriding generic card_selector '{_model_sel}' with "
+              f"detected '{detected_card_selector}'")
+        selectors["card_selector"] = detected_card_selector
+
+    entity_type = (selectors.get("entity_type") or "business").strip().lower() or "business"
+    selectors["entity_type"] = entity_type
+
+    # Non-business: validate the free-form field/role shape before caching. If it's
+    # incomplete, don't cache garbage — let the caller fall through (returns no members
+    # for non-business, since the contact-regex fallback can't help product/spec data).
+    if entity_type != "business":
+        valid_fields = [
+            f for f in (selectors.get("fields") or [])
+            if isinstance(f, dict) and f.get("key") and f.get("selector")
+        ]
+        name_field = selectors.get("name_field")
+        if not valid_fields:
+            print(f"  Non-business schema for {domain} has no usable fields, skipping cache")
+            return selectors
+        selectors["fields"] = valid_fields
+        keys = {f["key"] for f in valid_fields}
+        if not name_field or name_field not in keys:
+            # Fall back to the identity-role field, else the first field.
+            ident = next((f["key"] for f in valid_fields if (f.get("role") or "").lower() == "identity"), None)
+            selectors["name_field"] = ident or valid_fields[0]["key"]
+        print(f"  Detected entity_type='{entity_type}' for {domain} "
+              f"({len(valid_fields)} fields, identity='{selectors['name_field']}')")
 
     set_cached_selectors(domain, selectors)
     return selectors
@@ -728,7 +887,15 @@ HTML SAMPLE:
 
 def apply_selectors(raw_html: str, selectors: dict) -> list:
     """Apply learned CSS selectors to extract all members.
-    Pure BeautifulSoup — no AI calls."""
+    Pure BeautifulSoup — no AI calls.
+
+    Dispatches on entity_type: a non-"business" schema (free-form, role-tagged
+    fields) goes through _apply_dynamic_selectors; everything else (the default,
+    incl. all legacy cached entries without an entity_type) uses the unchanged
+    fixed business path below."""
+    if (selectors.get("entity_type") or "business") != "business":
+        return _apply_dynamic_selectors(raw_html, selectors)
+
     soup = BeautifulSoup(raw_html, "html.parser")
     members = []
 
@@ -753,8 +920,8 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
                 # Collapse multiple separators and whitespace
                 if separator:
                     text = re.sub(r'(\s*' + re.escape(separator) + r'\s*)+', separator + ' ', text)
-                # Strip common label prefixes like "Phone:" or "Website:"
-                text = re.sub(r'^[\w\s]+:\s*', '', text)
+                # Strip known label prefixes like "Phone:" or "Website:"
+                text = _LABEL_PREFIX_RE.sub('', text)
                 # Replace non-breaking spaces with regular spaces
                 text = text.replace('\u00a0', ' ')
                 return text.strip() or None
@@ -826,19 +993,227 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
     return members
 
 
+# --- DYNAMIC (NON-BUSINESS) SELECTOR APPLICATION ---
+
+def _dyn_get_text(card, sel) -> str | None:
+    """Text of the first match of `sel` within `card` (dynamic-schema path)."""
+    if not sel or not str(sel).strip():
+        return None
+    try:
+        el = card.select_one(sel)
+        if not el:
+            return None
+        text = el.get_text(separator=" ", strip=True)
+        text = re.sub(r'\s+', ' ', text)  # folds runs incl. non-breaking spaces
+        return text.strip() or None
+    except Exception:
+        return None
+
+
+def _dyn_get_href(card, sel) -> str | None:
+    """href (or text fallback) of the first match of `sel` (dynamic url role)."""
+    if not sel or not str(sel).strip():
+        return None
+    try:
+        el = card.select_one(sel)
+        if not el:
+            return None
+        return el.get("href") or (el.get_text(strip=True) or None)
+    except Exception:
+        return None
+
+
+def _apply_dynamic_selectors(raw_html: str, selectors: dict) -> list:
+    """Apply free-form, role-tagged selectors for a non-"business" entity_type.
+
+    Builds one record per card using the AI-chosen field keys (e.g. a graphics
+    card → {chipset, memory, tdp, price}). Pure BeautifulSoup, no AI cost.
+    `url`-role fields read href; everything else reads text."""
+    card_selector = selectors.get("card_selector") or ""
+    if not card_selector:
+        return []
+    soup = BeautifulSoup(raw_html, "html.parser")
+    try:
+        cards = soup.select(card_selector)
+    except Exception:
+        return []
+    if not cards:
+        return []
+
+    fields = selectors.get("fields") or []
+    members = []
+    for card in cards:
+        rec = {}
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            key = f.get("key")
+            sel = f.get("selector")
+            role = (f.get("role") or "other").lower()
+            if not key:
+                continue
+            rec[key] = _dyn_get_href(card, sel) if role == "url" else _dyn_get_text(card, sel)
+        members.append(rec)
+    return members
+
+
+def _dynamic_extraction_valid(members: list, name_field: str) -> bool:
+    """Validity check for a dynamic extraction: most cards yielded an identity."""
+    if not members:
+        return False
+    if not name_field:
+        return False
+    with_name = sum(1 for m in members if m.get(name_field))
+    return with_name >= max(3, int(len(members) * 0.5))
+
+
+def _selectors_valid(selectors: dict, members: list) -> bool:
+    """Dispatch validity check by entity_type (business → SCALAR_KEYS)."""
+    if isinstance(selectors, dict) and (selectors.get("entity_type") or "business") != "business":
+        return _dynamic_extraction_valid(members, selectors.get("name_field") or "")
+    return is_extraction_valid(members)
+
+
+# --- JSON-LD STRUCTURED DATA (zero AI cost) ---
+
+# @type values that are page furniture, not member entities.
+_JSONLD_SKIP_TYPES = {
+    "website", "webpage", "breadcrumblist", "searchaction",
+    "sitenavigationelement", "imageobject", "article", "newsarticle",
+    "blogposting", "event", "product", "faqpage", "question", "answer",
+    "review", "aggregaterating", "itemlist", "listitem", "videoobject",
+}
+# Generic entity types — not useful as a category label.
+_JSONLD_GENERIC_TYPES = {"localbusiness", "organization", "person", "place", "thing"}
+
+
+def _jsonld_iter_entities(node, depth=0):
+    """Yield candidate entity dicts from a parsed JSON-LD document.
+    Unwraps @graph, ItemList/itemListElement/item wrappers, and plain lists."""
+    if depth > 4 or node is None:
+        return
+    if isinstance(node, list):
+        for item in node:
+            yield from _jsonld_iter_entities(item, depth + 1)
+        return
+    if not isinstance(node, dict):
+        return
+    for key in ("@graph", "itemListElement"):
+        if isinstance(node.get(key), list):
+            yield from _jsonld_iter_entities(node[key], depth + 1)
+    if isinstance(node.get("item"), dict):
+        yield from _jsonld_iter_entities(node["item"], depth + 1)
+    yield node
+
+
+def _jsonld_address(addr) -> str | None:
+    """Flatten a schema.org address (string or PostalAddress dict)."""
+    if isinstance(addr, str):
+        return addr.strip() or None
+    if isinstance(addr, dict):
+        parts = [addr.get(k) for k in ("streetAddress", "addressLocality",
+                                       "addressRegion", "postalCode")]
+        parts = [str(p).strip() for p in parts if p]
+        return ", ".join(parts) or None
+    return None
+
+
+def extract_jsonld_members(raw_html: str) -> list[dict]:
+    """Extract members from <script type="application/ld+json"> blocks.
+
+    Zero AI cost and immune to CSS drift. Returns [] unless the page carries
+    3+ distinct entities that have a name AND a contact signal (phone, email,
+    or address) — a single blob is almost always the site describing itself,
+    and name+url alone matches WebSite-style furniture.
+    """
+    soup = BeautifulSoup(raw_html, "html.parser")
+    members: list[dict] = []
+    seen_names: set[str] = set()
+
+    for script in soup.find_all("script",
+                                type=lambda t: bool(t and "ld+json" in t.lower())):
+        payload = script.string or script.get_text()
+        if not payload or not payload.strip():
+            continue
+        try:
+            doc = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        for ent in _jsonld_iter_entities(doc):
+            name = ent.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            types = ent.get("@type") or []
+            if isinstance(types, str):
+                types = [types]
+            types_lower = {str(t).lower() for t in types}
+            if types_lower & _JSONLD_SKIP_TYPES:
+                continue
+
+            phone = ent.get("telephone")
+            email = ent.get("email")
+            address = _jsonld_address(ent.get("address"))
+            if not (phone or email or address):
+                continue
+
+            key = name.strip().lower()
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+
+            email_str = str(email).strip() if isinstance(email, (str, int)) else None
+            if email_str and email_str.lower().startswith("mailto:"):
+                email_str = email_str[7:].strip()
+            url = ent.get("url")
+            fax = ent.get("faxNumber")
+            desc = ent.get("description")
+            specific_types = [t for t in types
+                              if str(t).lower() not in _JSONLD_GENERIC_TYPES]
+
+            members.append({
+                "company_name":    name.strip(),
+                "description":     str(desc).strip() if isinstance(desc, str) and desc.strip() else None,
+                "category":        str(specific_types[0]) if specific_types else None,
+                "website":         str(url).strip() if isinstance(url, str) and url.strip() else None,
+                "phone":           str(phone).strip() if isinstance(phone, (str, int)) else None,
+                "fax":             str(fax).strip() if isinstance(fax, str) and fax.strip() else None,
+                "street_address":  address,
+                "mailing_address": None,
+                "contacts":        [{"name": None, "email": email_str}] if email_str else [],
+            })
+
+    return members
+
+
 # --- EXTRACTION VALIDATION ---
 
 def is_extraction_valid(members: list) -> bool:
     """Check if selector-based extraction produced real results.
-    Returns False if too many fields are null (selectors probably wrong)."""
+
+    Two ways to pass:
+      1. Name-dominant: >=80% of cards yielded a company_name. Name-only
+         listings (contact info lives on detail pages) are real and common —
+         the old null-ratio test rejected correct selectors on them, purged
+         the cache, and forced a regex re-learn on every page.
+      2. Field coverage: <70% of all scalar fields are null (original test).
+
+    Downstream safety nets (cleaner label/false-positive filters and the
+    is_extraction_garbage gate in main.py) still catch nav-menu extractions
+    that pass the name-dominant check.
+    """
     if not members:
         return False
+    n = len(members)
+    with_name = sum(1 for m in members if m.get("company_name"))
+    if with_name >= max(3, int(n * 0.8)):
+        return True
     null_counts = sum(
         1 for m in members
         for k in SCALAR_KEYS
         if not m.get(k)
     )
-    total = len(members) * len(SCALAR_KEYS)
+    total = n * len(SCALAR_KEYS)
     return (null_counts / total) < EXTRACTION_NULL_THRESHOLD if total else False
 
 
@@ -860,15 +1235,34 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
     if cached:
         print(f"  Using cached selectors for {domain}")
         members = apply_selectors(raw_html, cached)
-        if is_extraction_valid(members):
+        if _selectors_valid(cached, members):
             debug.log("PARSE", f"Step 1 (cached selectors): extracted {len(members)} members")
             return members
         print(f"  Cached selectors invalid for {domain}, re-learning...")
         debug.log("PARSE", "Cached selectors failed validation, re-learning", level="warn")
         delete_cached_selectors(domain)
 
+    # Step 1.5: schema.org JSON-LD — zero AI cost, no CSS dependence.
+    # Only trusted when it covers at least as much as the visible card
+    # structure: partial markup (5 blobs on a 50-card page) must not
+    # short-circuit selector learning.
+    jsonld_members = extract_jsonld_members(raw_html)
+    if len(jsonld_members) >= MIN_CARDS_FOR_LEARNING:
+        card_count = 0
+        try:
+            _, _card_sel = extract_sample_html(raw_html)
+            if _card_sel:
+                card_count = len(BeautifulSoup(raw_html, "html.parser").select(_card_sel))
+        except Exception:
+            card_count = 0
+        if len(jsonld_members) >= max(MIN_CARDS_FOR_LEARNING, int(card_count * 0.8)):
+            print(f"  JSON-LD: extracted {len(jsonld_members)} members (zero AI cost)")
+            debug.log("PARSE", f"JSON-LD tier: {len(jsonld_members)} members")
+            return jsonld_members
+
     # Step 2: learn selectors from a small sample
     selector_members = []
+    selectors = {}
     print(f"  Learning selectors for {domain}...")
     try:
         selectors = learn_selectors(raw_html, domain)
@@ -876,7 +1270,7 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
             k: v for k, v in selectors.items() if v
         })
         selector_members = apply_selectors(raw_html, selectors)
-        if is_extraction_valid(selector_members):
+        if _selectors_valid(selectors, selector_members):
             print(f"SUCCESS: Selector learned for {domain}!")
             debug.log("PARSE", f"Step 2 success: {len(selector_members)} members extracted")
             return selector_members
@@ -885,6 +1279,15 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
     except Exception as e:
         print(f"  WARNING: Selector learning error for {domain}: {e}")
         debug.log("PARSE", f"Step 2 error: {e}", level="error")
+
+    # Non-business directories (product/spec/etc.) have no contact-regex fallback —
+    # the regex layer below only finds phone/email/address/name. Return the best
+    # selector result we have (possibly empty) instead of business-shaped garbage.
+    _etype = (selectors.get("entity_type") if isinstance(selectors, dict) else None) \
+        or (cached.get("entity_type") if cached else None) or "business"
+    if _etype != "business":
+        debug.log("PARSE", f"Non-business ({_etype}) — skipping regex fallback", level="warn")
+        return selector_members or []
 
     # Step 3: regex fallback
     print(f"  Attempting regex fallback for {domain}...")

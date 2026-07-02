@@ -39,6 +39,50 @@ _DESC_TRUNCATE = 160
 # in one run) reuse the decision.
 _RECORD_CACHE: dict[tuple, bool] = {}
 
+# --- Location filtering (deterministic, no LLM) ---
+_US_STATE_CODES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID",
+    "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS",
+    "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK",
+    "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+    "WI", "WY", "DC",
+}
+# High-precision state parsing: a state code immediately before a ZIP, or a
+# trailing ", XX". A bare \b[A-Z]{2}\b scan would read "123 Main CT" (Court)
+# as Connecticut and wrongly drop the record.
+_ADDR_STATE_ZIP_RE = re.compile(r'\b([A-Z]{2})\s+\d{5}(?:-\d{4})?\b')
+_ADDR_TRAILING_STATE_RE = re.compile(r',\s*([A-Z]{2})\s*$')
+
+
+def _filter_by_location(records: list[dict], intent: dict) -> tuple[list[dict], int]:
+    """Drop a record ONLY when its address contains a confidently-parsed US
+    state that is NOT one of the intent's states.
+
+    Fail-open, same governing rule as the industry filter: no address, or no
+    parseable state, means KEEP. Returns (kept_records, dropped_count).
+    """
+    want = {(s or "").strip().upper() for s in (intent.get("location_states") or [])}
+    want &= _US_STATE_CODES
+    if not want:
+        return records, 0
+
+    kept: list[dict] = []
+    dropped = 0
+    for r in records:
+        addr = " ".join(
+            str(r.get(k) or "") for k in ("street_address", "mailing_address")
+        ).strip()
+        found = set(_ADDR_STATE_ZIP_RE.findall(addr)) & _US_STATE_CODES
+        if not found:
+            m = _ADDR_TRAILING_STATE_RE.search(addr)
+            if m and m.group(1) in _US_STATE_CODES:
+                found = {m.group(1)}
+        if found and not (found & want):
+            dropped += 1
+            continue
+        kept.append(r)
+    return kept, dropped
+
 
 def reset_record_cache():
     """Clear the classification cache. Call between distinct runs if you want
@@ -66,9 +110,16 @@ def _chunks(seq: list, n: int):
 
 
 def _classify_batch(records: list[dict], canonical: str, aliases: list[str],
-                    scope: str) -> list[bool]:
+                    scope: str, location_states: list | None = None) -> list[bool]:
     """Return a keep-flag per record. Fail-open: any error → keep everything."""
     alias_hint = f" (also known as: {', '.join(aliases[:5])})" if aliases else ""
+    location_line = ""
+    if location_states:
+        location_line = (
+            f"\nThe user's target location: {', '.join(location_states[:8])}. "
+            f"Location is context only — do NOT drop rows for location alone; "
+            f"a separate deterministic filter handles that."
+        )
 
     if scope == "specialist":
         scope_rule = (
@@ -98,7 +149,7 @@ def _classify_batch(records: list[dict], canonical: str, aliases: list[str],
 
     prompt = f"""You are filtering a business directory down to {canonical}{alias_hint}.
 
-{scope_rule}
+{scope_rule}{location_line}
 
 IMPORTANT: Only drop rows you are CONFIDENT are non-matches. If a row has too
 little information to judge (e.g. just a company name with no obvious trade), DO
@@ -144,6 +195,16 @@ def filter_records_by_intent(records: list[dict], intent: dict | None) -> list[d
     if scope not in ("specialist", "inclusive"):
         scope = "inclusive"
     aliases = intent.get("industry_aliases") or []
+    location_states = [s for s in (intent.get("location_states") or []) if s]
+
+    # Deterministic location pass first — "dentists in Austin" scraped off a
+    # national directory must not return every state. Fail-open: records
+    # without a confidently-parsed state are kept.
+    records, loc_dropped = _filter_by_location(records, intent)
+    if loc_dropped:
+        print(f"  Intent record filter: dropped {loc_dropped} out-of-state record(s)")
+    if not records:
+        return records
 
     keep_by_index: dict[int, bool] = {}
     to_classify: list[tuple[int, dict]] = []
@@ -156,7 +217,8 @@ def filter_records_by_intent(records: list[dict], intent: dict | None) -> list[d
 
     for batch in _chunks(to_classify, _BATCH_SIZE):
         recs = [r for _, r in batch]
-        flags = _classify_batch(recs, canonical, aliases, scope)
+        flags = _classify_batch(recs, canonical, aliases, scope,
+                                location_states=location_states)
         for (idx, rec), keep in zip(batch, flags):
             keep_by_index[idx] = keep
             _RECORD_CACHE[_cache_key(rec, scope)] = keep

@@ -160,6 +160,18 @@ def scrape_single():
         session["response_value"] = None  # reset for next prompt
         return answer.lower() in ("y", "yes")
 
+    def login_via_frontend(page, domain):
+        """Login-wall handler for the web UI. The old default called terminal
+        input(), which hangs the scrape — nobody is at the server's stdin.
+        The (headed) browser window runs on the backend machine, so the user
+        logs in there and confirms through the frontend terminal."""
+        return prompt_via_frontend(
+            0,
+            f"Login wall detected on {domain.replace('_', '.')}. "
+            f"Log in using the browser window that opened, then respond "
+            f"'y' to continue (or 'n' to skip this site).",
+        )
+
     def bot_thread():
         original_print = builtins.print
         debug.enabled = debug_mode
@@ -180,6 +192,7 @@ def scrape_single():
             members = scrape_directory(
                 link, prompt_callback=prompt_via_frontend,
                 mode=scrape_mode, priority_fields=priority_fields,
+                login_callback=login_via_frontend,
             )
 
             phase1_records = len(members)
@@ -820,6 +833,9 @@ def discover():
                         priority_fields=priority_fields,
                         intent=intent,
                         is_aggregator=d.get("is_aggregator", False),
+                        # Batch mode: skip login-gated sites instead of
+                        # hanging on the terminal input() default.
+                        login_callback=lambda page, domain: False,
                     )
 
                     from urllib.parse import urlparse as _urlparse
@@ -1065,7 +1081,7 @@ _CSV_COLUMNS = [
 ]
 
 
-def _flatten_record(record: dict) -> dict:
+def _flatten_record(record: dict, dynamic: bool = False) -> dict:
     """Flatten a nested member record into a single-level dict for CSV.
     Contacts get merged into contact_name/contact_email (semicolon-separated if multiple).
     Social media gets flattened from nested dict to top-level keys.
@@ -1114,19 +1130,42 @@ def _flatten_record(record: dict) -> dict:
     else:
         row["team"] = ""
 
+    if dynamic:
+        # Pass through AI-chosen fields (e.g. model, chipset, vram, price) that
+        # aren't part of the fixed business layout. Nested values are JSON-encoded.
+        for k, v in record.items():
+            if k in row or k in ("contacts", "social_media", "services", "team"):
+                continue
+            if isinstance(v, (dict, list)):
+                row[k] = json.dumps(v, ensure_ascii=False) if v else ""
+            else:
+                row[k] = str(v).strip() if v not in (None, "") else ""
+
     return row
 
 
-def _records_to_csv(records: list) -> str:
-    """Convert a list of member records to CSV string."""
+def _records_to_csv(records: list, entity_type: str = "business") -> str:
+    """Convert a list of member records to CSV string.
+
+    For a non-"business" entity_type the records carry AI-chosen field keys, so
+    columns are the union of the business layout (for any that have data) plus the
+    extra dynamic keys, in first-seen order. Business output is unchanged."""
     output = io.StringIO()
+    dynamic = entity_type != "business"
 
     # Determine which columns actually have data (skip empty columns)
     columns_with_data = []
-    flat_records = [_flatten_record(r) for r in records]
+    flat_records = [_flatten_record(r, dynamic=dynamic) for r in records]
     for col in _CSV_COLUMNS:
         if any(row.get(col) for row in flat_records):
             columns_with_data.append(col)
+
+    if dynamic:
+        # Append AI-chosen columns that carry data, in first-seen order.
+        for row in flat_records:
+            for k in row:
+                if k not in columns_with_data and any(rr.get(k) for rr in flat_records):
+                    columns_with_data.append(k)
 
     writer = csv.DictWriter(output, fieldnames=columns_with_data, extrasaction="ignore")
     writer.writeheader()
@@ -1163,7 +1202,7 @@ def download_file(filename):
         return jsonify({"error": "File does not contain a list of records"}), 400
 
     if fmt == "csv":
-        csv_content = _records_to_csv(members)
+        csv_content = _records_to_csv(members, entity_type=(metadata or {}).get("entity_type", "business"))
         csv_filename = filename.rsplit(".", 1)[0] + ".csv"
         return Response(
             csv_content,

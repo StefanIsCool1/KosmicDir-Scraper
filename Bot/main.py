@@ -21,9 +21,9 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from browser import capture_responses
 from html_parser import parse_member_html
-from cleaner import clean_members, is_extraction_garbage
+from cleaner import clean_members, is_extraction_garbage, is_extraction_garbage_dynamic
 from detail_crawler import crawl_detail_pages
-from cache import delete_cached_selectors
+from cache import delete_cached_selectors, get_cached_selectors
 
 # Fields that can only be found via Phase 2 (website enrichment), not detail pages.
 PHASE2_ONLY_FIELDS = {"social_media"}
@@ -270,14 +270,31 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
             except Exception as e:
                 print(f"  Failed to parse: {e}")
 
+    # Determine the detected schema for this domain (set during selector learning).
+    # Defaults to the business schema when absent — legacy cache entries, regex-only
+    # extractions, and JSON-API paths all stay on the unchanged business path.
+    _sel = get_cached_selectors(domain) or {}
+    entity_type = (_sel.get("entity_type") or "business")
+    name_field = _sel.get("name_field") or "company_name"
+    is_dynamic = entity_type != "business"
+    field_roles = (
+        {f["key"]: (f.get("role") or "other")
+         for f in _sel.get("fields", []) if isinstance(f, dict) and f.get("key")}
+        if is_dynamic else None
+    )
+
     # Clean and deduplicate all members
-    all_members = clean_members(all_members)
+    all_members = clean_members(all_members, name_field=name_field,
+                                is_dynamic=is_dynamic, field_roles=field_roles)
 
     # --- Quality gate: reject garbage extractions ---
     # When the extractor scrapes navigation / content sections (not real
-    # member records), every "member" lacks contact data. Detect this and
-    # invalidate the cached selectors so future scrapes don't reuse them.
-    if is_extraction_garbage(all_members):
+    # member records), every "member" lacks data. Detect this and invalidate the
+    # cached selectors so future scrapes don't reuse them. Business keys on contact
+    # data; the dynamic gate keys on identity + at least one other populated field.
+    garbage = (is_extraction_garbage_dynamic(all_members, name_field)
+               if is_dynamic else is_extraction_garbage(all_members))
+    if garbage:
         print(f"WARNING: Extraction appears to be garbage for {domain} — "
               f"purging cached selectors and returning 0 members")
         delete_cached_selectors(domain)
@@ -289,18 +306,21 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
     # No-op when intent is None (Playground Direct/Auto/CSV paths). Runs after
     # the garbage gate so junk detection still sees the full population, and
     # is fail-open so a flaky classifier never silently empties a real scrape.
+    intent_dropped = 0
     if intent:
         from intent_record_filter import filter_records_by_intent
+        pre_intent = len(all_members)
         all_members = filter_records_by_intent(all_members, intent)
+        intent_dropped = pre_intent - len(all_members)
 
     # --- Sanity checks ---
     if len(all_members) < 3:
         print(f"WARNING: Only {len(all_members)} members extracted for {domain} — scrape likely failed")
 
-    empty_names = sum(1 for m in all_members if not m.get("company_name"))
+    empty_names = sum(1 for m in all_members if not m.get(name_field))
     if all_members and empty_names > len(all_members) * 0.3:
         print(
-            f"WARNING: {empty_names}/{len(all_members)} members missing company name "
+            f"WARNING: {empty_names}/{len(all_members)} members missing {name_field} "
             f"in {domain} — extraction may be wrong"
         )
 
@@ -309,7 +329,9 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
 
     # Compute metadata (shared shape with Phase 2 enrichment — see compute_metadata)
     total = len(all_members)
-    metadata = compute_metadata(all_members, source_url=source_url, intent=intent)
+    metadata = compute_metadata(all_members, source_url=source_url, intent=intent,
+                                entity_type=entity_type, name_field=name_field,
+                                **({"intent_dropped": intent_dropped} if intent else {}))
 
     with open(structured_path, "w") as f:
         json.dump({"metadata": metadata, "members": all_members}, f, indent=4)
@@ -347,7 +369,9 @@ def read_metadata(json_path: str) -> dict | None:
     return None
 
 
-def compute_metadata(members: list, source_url: str = "", intent: dict | None = None, **extra) -> dict:
+def compute_metadata(members: list, source_url: str = "", intent: dict | None = None,
+                     entity_type: str = "business", name_field: str = "company_name",
+                     **extra) -> dict:
     """Build the standard coverage-metadata block for a member list.
 
     Shared by Phase 1 (structured dumps) and Phase 2 (enriched dumps) so both
@@ -355,8 +379,36 @@ def compute_metadata(members: list, source_url: str = "", intent: dict | None = 
     when Phase 2 passes its enriched list the numbers reflect post-enrichment
     coverage. `extra` is merged last, so a caller can add fields (e.g.
     enriched_at) or override defaults like scraped_at.
+
+    For a non-"business" entity_type the named business counts don't apply, so the
+    block instead carries `entity_type`, `name_field`, and a generic per-field
+    `field_coverage` map. The business branch is left byte-for-byte unchanged.
     """
     from datetime import datetime, timezone
+    if entity_type != "business":
+        keys: list = []
+        for m in members:
+            if isinstance(m, dict):
+                for k in m.keys():
+                    if k not in keys:
+                        keys.append(k)
+        metadata = {
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "source_url": source_url,
+            "entity_type": entity_type,
+            "name_field": name_field,
+            "total_members": len(members),
+            "with_name": sum(1 for m in members if m.get(name_field)),
+            "field_coverage": {k: sum(1 for m in members if m.get(k)) for k in keys},
+        }
+        if intent:
+            metadata["intent_industry"] = intent.get("canonical") or ""
+            metadata["intent_locations"] = [
+                loc.get("state", "") for loc in (intent.get("locations") or [])
+            ]
+        metadata.update(extra)
+        return metadata
+
     metadata = {
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "source_url": source_url,
@@ -535,7 +587,8 @@ def _check_fields(members: list) -> set:
 def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                      priority_fields: list | None = None,
                      intent: dict | None = None,
-                     is_aggregator: bool = False) -> list:
+                     is_aggregator: bool = False,
+                     login_callback=None) -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
@@ -543,6 +596,12 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
         prompt_callback: Optional callback for interactive prompts (e.g. detail crawl y/n).
                          If None, falls back to terminal input() for CLI usage.
                          Signature: prompt_callback(detail_url_count, message=None) -> bool
+        login_callback: Optional callable(page, domain) -> bool for login walls.
+                        If None, falls back to the terminal input() handler —
+                        which HANGS in server contexts (Flask/SSE) because
+                        nobody is at the server's stdin. app.py passes a
+                        frontend-prompt handler (Playground) or an auto-skip
+                        (Agent batch mode).
         mode: "auto" = find directory page + search (default)
               "direct" = skip navigation/search, scrape the page as-is
         priority_fields: List of field names the user wants (e.g. ["email", "phone", "address"]).
@@ -572,7 +631,7 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
         results, detail_urls = capture_responses(
             playwright, url, mode=mode,
             priority_fields=priority_fields,
-            login_callback=_login_interactive,
+            login_callback=login_callback or _login_interactive,
             intent=intent,
             is_aggregator=is_aggregator,
         )

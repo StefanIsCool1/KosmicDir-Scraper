@@ -206,13 +206,14 @@ The project does not yet have a test suite. When adding tests:
 - The `api_key/` directory is gitignored — it contains the original key file for local use only.
 - Phase 2 uses `curl_cffi` with rotating TLS fingerprints to avoid bot detection. Respect `DETAIL_CRAWL_DELAY_MIN/MAX` timing constants in `config.py` to avoid overwhelming target servers.
 - The LLM module (`Bot/llm.py`) uses DeepSeek V4 Flash via the OpenAI-compatible protocol; swap `_BASE_URL` and `_MODEL` to change providers without touching any other code.
+- Playwright launches **headed** by default (the login flow needs a visible window). Set `SCRAPER_HEADLESS=1` to run headless on servers/CI — all three launch sites go through `Bot/config.py:launch_browser`.
 - Phase 0 also uses `curl_cffi` (via Phase 2's `fetch_page`) for pre-flight qualification. Same TLS fingerprint rotation applies.
 
 ## Roadmap / Known Gaps
 
 Open work, roughly by leverage:
 
-- **Search resilience.** `Phase2Bot/page_fetcher.py:_ddg_fetch_results` hard-stops *all* queries on the first DDG 429/403 (`_search_stopped`), silently truncating discovery. Add a fallback engine / search API, and surface "search blocked" vs "no sources".
+- **Search resilience.** ~~Hard-stop on first DDG 429/403~~ — `_ddg_fetch_results` now falls back to Bing HTML search (`_bing_fetch_results`) for the rest of the run when DDG blocks. Still open: surface "search blocked / running on fallback engine" as an SSE event, and a real search API for when both HTML endpoints break.
 - **Phase 2 accuracy.** The DDG website-find writes unverified matches → false positives. Score the DDG snippet/title/domain against the record's **phone** (the join key) *before* fetching; fail **closed** (a blank field beats a wrong company); attach a per-record confidence label. The `accurate` verify-by-fetch mode exists but is slow (3–9 fetches/record).
 - **More API verticals.** NPI proved the pattern; clean next sources are the IRS exempt-org file (nonprofits), FDIC/NCUA (banks/credit unions), SEC EDGAR, FEC. Route on canonical industry + taxonomy, not the coarse `entity_type`.
 - **NPI completeness.** The public API caps at ~1,200 records/query (surfaced via `hit_ceiling`); the monthly NPPES bulk file is the real path for "every X in a large state".

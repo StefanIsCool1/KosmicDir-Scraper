@@ -235,10 +235,16 @@ def _prune_shared_emails(members: list) -> int:
     return removed
 
 
-def clean_members(members: list) -> list:
+def clean_members(members: list, name_field: str = "company_name",
+                  is_dynamic: bool = False, field_roles: dict | None = None) -> list:
     """Clean and deduplicate extracted member data.
 
-    Operations:
+    Business path (default, is_dynamic=False) is unchanged. For a non-"business"
+    entity_type, is_dynamic=True routes to _clean_members_dynamic, which dedups on
+    `name_field` and applies role-based normalization (phone/url/email) using
+    `field_roles` ({field_key: role}) instead of the fixed business keys.
+
+    Operations (business):
     - Reject false-positive names (nav text, CTA, FAQ headings, etc.)
     - Deduplicate by company name (case-insensitive)
     - Normalize phone/fax to (XXX) XXX-XXXX format
@@ -247,6 +253,9 @@ def clean_members(members: list) -> list:
     - Deduplicate contacts by email within each card
     - Remove redundant mailing addresses that match street addresses
     """
+    if is_dynamic:
+        return _clean_members_dynamic(members, name_field, field_roles or {})
+
     seen_companies = set()
     cleaned = []
     dropped_false_positives = 0
@@ -338,6 +347,77 @@ def clean_members(members: list) -> list:
     _prune_shared_emails(cleaned)
 
     return cleaned
+
+
+def _clean_members_dynamic(members: list, name_field: str, field_roles: dict) -> list:
+    """Clean + dedup a non-business (free-form, role-tagged) member list.
+
+    Dedups on `name_field`, applies role-based normalization to the fields whose
+    role is phone/url/email, and passes everything else through verbatim. Does NOT
+    apply the business-specific false-positive name heuristics (those are tuned for
+    company directories and would mislabel product/spec names)."""
+    seen = set()
+    cleaned = []
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        name = " ".join((m.get(name_field) or "").split())
+        if not name:
+            continue  # no identity → drop
+        m[name_field] = name
+        name_key = _normalize_name_key(name)
+        if not name_key or name_key in seen:
+            continue
+        seen.add(name_key)
+
+        for key, role in field_roles.items():
+            val = m.get(key)
+            if not val or not isinstance(val, str):
+                continue
+            role = (role or "").lower()
+            if role == "phone":
+                digits = re.sub(r'\D', '', val)
+                if len(digits) == 10:
+                    m[key] = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+                elif len(digits) == 11 and digits[0] == "1":
+                    m[key] = f"({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
+            elif role == "url":
+                if not val.startswith("http") and re.match(r'^[\w.-]+\.[a-z]{2,}', val):
+                    m[key] = "https://" + val
+            elif role == "email":
+                m[key] = val.strip().lower()
+
+        cleaned.append(m)
+
+    return cleaned
+
+
+def is_extraction_garbage_dynamic(members: list, name_field: str,
+                                  min_populated_ratio: float = 0.3) -> bool:
+    """Quality gate for a non-business extraction.
+
+    Business `is_extraction_garbage` keys on contact data (phone/email/address),
+    which products legitimately lack. Here "valid" means: most records have the
+    identity field AND at least one other populated field. Returns True (garbage)
+    when fewer than `min_populated_ratio` of records meet that bar."""
+    if not members:
+        return True
+    n = len(members)
+    good = 0
+    for m in members:
+        if not isinstance(m, dict) or not m.get(name_field):
+            continue
+        has_extra = any(
+            k != name_field and v not in (None, "", [], {})
+            for k, v in m.items()
+        )
+        if has_extra:
+            good += 1
+    if (good / n) < min_populated_ratio:
+        print(f"  Cleaner: dynamic extraction is garbage — only {good}/{n} "
+              f"records have identity + data ({good / n:.1%})")
+        return True
+    return False
 
 
 def is_extraction_garbage(members: list, min_contact_ratio: float = 0.05) -> bool:

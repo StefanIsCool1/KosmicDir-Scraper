@@ -38,6 +38,28 @@ LLM_SANITY_CHECK_ENABLED = True
 # 50KB SPA with a 2-char body would otherwise sail through.
 MIN_VISIBLE_TEXT_CHARS = 1500
 
+# Framework fingerprints for client-rendered pages. When a thin page carries
+# one of these (or a heavy script payload), it's an SPA shell that curl_cffi
+# can't render — but Phase 1's Playwright session CAN. Those pass preflight
+# tagged js_rendered instead of being rejected as thin_content, which used to
+# structurally exclude every JS-rendered directory from Agent mode.
+# NOTE: matched against str(soup).lower() — BeautifulSoup normalizes attribute
+# quotes to double quotes, so only double-quoted forms are needed.
+_JS_SHELL_MARKERS = (
+    'id="root"', 'id="app"', 'id="___gatsby"',
+    "data-reactroot", "__next_data__", "window.__nuxt__",
+    "ng-version=", "data-server-rendered",
+    "wix-viewer-model", "squarespace",
+)
+
+
+def _looks_js_rendered(raw_html_lower: str) -> bool:
+    """Thin visible text + framework markers or a heavy script payload =
+    client-rendered shell, not a dead page."""
+    if any(m in raw_html_lower for m in _JS_SHELL_MARKERS):
+        return True
+    return raw_html_lower.count("<script") >= 8
+
 # Number of detail-link-shaped anchors that counts as evidence of a listing
 # whose contact info lives one click away (instead of inline on the listing).
 MIN_DETAIL_LINKS = 3
@@ -385,10 +407,20 @@ Return ONLY a JSON object — no markdown fences, no explanation:
 
 
 def _qualify_soup(soup, url: str = "", title: str = "") -> tuple[bool, str | None]:
-    """Apply reject rules. Returns (passed, reason_if_rejected). Cheapest checks first."""
+    """Apply reject rules. Returns (passed, reason). Cheapest checks first.
+
+    Passing normally returns (True, None). The one special case is
+    (True, "js_rendered"): a client-rendered shell that the browser-based
+    Phase 1 can handle even though the static fetch shows nothing.
+    """
+    # Serialize BEFORE _visible_text — it decomposes <script> tags in place,
+    # which would blind the SPA-shell detection below.
+    raw_lower = str(soup).lower()
     text = _visible_text(soup)
 
     if len(text) < MIN_VISIBLE_TEXT_CHARS:
+        if _looks_js_rendered(raw_lower):
+            return True, "js_rendered"
         return False, "thin_content"
     if _is_parked(text):
         return False, "parked_domain"
@@ -437,6 +469,7 @@ def preflight_one(candidate: dict) -> dict:
         **candidate,
         "status": "passed",
         "reason": None,
+        "js_rendered": reason == "js_rendered",
         "soup": soup,
         "final_url": final_url or url,
     }
