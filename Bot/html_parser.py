@@ -42,6 +42,22 @@ def is_layout_class(cls_string: str) -> bool:
     return False
 
 
+# Zebra-striping classes (Drupal/older CMSes alternate rows "odd"/"even").
+# Grouping cards by one of these captures only HALF the rows — tr.odd on a
+# 170-row roster yields 85. Skipped during class grouping so striped tables
+# fall through to the parent-based sibling grouping, which sees every row.
+_ZEBRA_CLASS_TOKENS = {
+    "odd", "even", "alt", "alternate", "alternating",
+    "stripe", "striped", "zebra", "row0", "row1", "row2",
+}
+
+
+def _is_zebra_class(cls_string: str) -> bool:
+    """True when a class string consists ONLY of zebra-striping tokens."""
+    tokens = set(cls_string.lower().split())
+    return bool(tokens) and tokens <= _ZEBRA_CLASS_TOKENS
+
+
 # Strong card-class hints: when an element's class name contains one of these
 # tokens (whole-word, camelCase-aware), treat it as a likely content card
 # even if it has no <a> link. Subset of CARD_CLASS_HINTS, intentionally
@@ -53,6 +69,7 @@ _STRONG_CARD_CLASS_HINTS = {
     "doctor", "physician", "dentist", "attorney", "lawyer",
     "restaurant", "clinic", "specialist", "consultant", "therapist",
     "firm", "practice", "organization",
+    "person", "people", "staff", "faculty", "student", "roster",
 }
 
 # --- Tokenizer for class-name word matching ---
@@ -211,26 +228,70 @@ _LABEL_PREFIX_RE = re.compile(
     re.I,
 )
 
+# Person-directory label prefixes ("Pronouns: She/Her" → "She/Her"). Separate
+# from _LABEL_PREFIX_RE on purpose: adding "name"/"title" to the business list
+# would start stripping them from business extractions too.
+_PERSON_LABEL_PREFIX_RE = re.compile(
+    r'^(?:name|full name|pronouns|preferred pronouns|title|position|role|'
+    r'department|dept|office|room|email|e-mail|phone|tel|telephone|'
+    r'website|web|url|personal website|homepage)\s*:\s*',
+    re.I,
+)
+
+# CMS screen-reader/annotation boilerplate that leaks into visible link text.
+# Drupal appends "(link sends e-mail)" / "(link is external)" to anchors;
+# WordPress themes add "(opens in a new tab)". Never legitimate data in ANY
+# entity type, so it is stripped from every extracted value.
+_CMS_LINK_BOILERPLATE_RE = re.compile(
+    r'\(\s*link\s+(?:sends\s+e-?mail|is\s+external)\s*\)'
+    r'|\(\s*opens\s+in\s+(?:a\s+)?new\s+(?:tab|window)\s*\)',
+    re.I,
+)
+
+
+def _strip_cms_boilerplate(text: str | None) -> str | None:
+    """Remove CMS link annotations like "(link sends e-mail)" from text."""
+    if not text:
+        return text
+    return _CMS_LINK_BOILERPLATE_RE.sub("", text).strip()
+
 
 def _extract_company_name(element) -> str | None:
     """Extract company name from a card/detail element.
-    Priority: headings > bold/strong > first link text."""
+    Priority: headings > bold/strong > first usable link text.
+
+    Skips mailto:/tel: anchors and candidates whose entire text is an email
+    address or a URL — on people directories the mailto (or personal-website)
+    link is often the card's only link, and its text used to leak in as the
+    "name". CMS link boilerplate ("(link sends e-mail)" etc.) is stripped
+    before the checks."""
+    def _usable(text: str | None) -> bool:
+        if not text or len(text) <= 1:
+            return False
+        if _EMAIL_RE.fullmatch(text):
+            return False
+        if text.lower().startswith(("http://", "https://", "www.")):
+            return False
+        return True
+
     for tag in _HEADING_TAGS:
         el = element.find(tag)
         if el:
-            text = el.get_text(strip=True)
-            if text and len(text) > 1:
+            text = _strip_cms_boilerplate(el.get_text(strip=True))
+            if _usable(text):
                 return text
     for tag in _BOLD_TAGS:
         el = element.find(tag)
         if el:
-            text = el.get_text(strip=True)
-            if text and len(text) > 1 and len(text) < 200:
+            text = _strip_cms_boilerplate(el.get_text(strip=True))
+            if _usable(text) and len(text) < 200:
                 return text
-    a = element.find("a")
-    if a:
-        text = a.get_text(strip=True)
-        if text and len(text) > 1 and len(text) < 200:
+    for a in element.find_all("a", limit=5):
+        href = str(a.get("href") or "")
+        if href.startswith(("mailto:", "tel:")):
+            continue
+        text = _strip_cms_boilerplate(a.get_text(strip=True))
+        if _usable(text) and len(text) < 200:
             return text
     return None
 
@@ -411,16 +472,19 @@ def regex_fallback_extract(raw_html: str, domain: str) -> list[dict]:
         if score >= 3:
             signal_elements.append(el)
 
-    # Deduplicate: keep only the most specific elements (no parent-child overlap)
-    filtered = []
+    # Deduplicate: keep only the deepest signal elements (drop any element
+    # that is an ancestor of another signal element). Walking each element's
+    # parent chain is O(n × depth); the old per-pair `other in el.descendants`
+    # scan was O(n² × subtree) and could hang for minutes on large pages.
+    signal_ids = {id(el) for el in signal_elements}
+    ancestor_ids: set[int] = set()
     for el in signal_elements:
-        is_ancestor = False
-        for other in signal_elements:
-            if other is not el and other in el.descendants:
-                is_ancestor = True
-                break
-        if not is_ancestor:
-            filtered.append(el)
+        parent = el.parent
+        while parent is not None:
+            if id(parent) in signal_ids:
+                ancestor_ids.add(id(parent))
+            parent = parent.parent
+    filtered = [el for el in signal_elements if id(el) not in ancestor_ids]
 
     members = []
     for el in filtered:
@@ -634,6 +698,10 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
                 cls_str = cls.strip()
                 if not cls_str or is_layout_class(cls_str):
                     continue
+                # Zebra-stripe classes ("odd"/"even") each cover only half the
+                # rows — never group on them.
+                if cls_str.lower() in _ZEBRA_CLASS_TOKENS:
+                    continue
                 class_groups.setdefault((tag, cls_str), []).append(el)
 
         # Also group by full class string for exact-match cases
@@ -641,7 +709,8 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
             " ".join(el.get("class") or []) for el in elements if el.get("class")
         )
         for full_cls, count in full_class_counts.items():
-            if count >= 4 and not is_layout_class(full_cls):
+            if count >= 4 and not is_layout_class(full_cls) \
+                    and not _is_zebra_class(full_cls):
                 group = [
                     el for el in elements
                     if " ".join(el.get("class") or []) == full_cls
@@ -752,6 +821,34 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
 
 # --- SELECTOR LEARNING (HAIKU) ---
 
+def _parse_llm_json(raw: str) -> dict | None:
+    """Parse a JSON object out of an LLM response.
+
+    Tolerates markdown fences and prose before/after the object ("Here is the
+    JSON: {...}"). Returns None when nothing parses — callers retry on that."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start, end = raw.find("{"), raw.rfind("}")
+    if 0 <= start < end:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 def learn_selectors(raw_html: str, domain: str) -> dict:
     """Ask Haiku to identify CSS selectors from a small sample.
     Called ONCE per domain, then the result is cached permanently."""
@@ -773,12 +870,20 @@ def learn_selectors(raw_html: str, domain: str) -> dict:
 card represents, THEN return CSS selectors for extracting each card's data.
 
 STEP 1 — entity_type. What does ONE card describe?
-- "business" — a company, organization, professional, practice, firm, restaurant, agency,
-  or any contactable person/org (has a name and usually phone/website/address). This is the
-  DEFAULT: directories of doctors, lawyers, HOAs, restaurants, vendors, etc. are ALL "business".
+- "business" — a company, organization, professional practice, firm, restaurant, agency,
+  or any org-level contactable entity (has a name and usually phone/website/address). This is
+  the DEFAULT: directories of doctors, lawyers, HOAs, restaurants, vendors, etc. are ALL
+  "business" when cards carry business contact info (office phone, street address, company name).
+- "person" — cards list individual human beings AS people: university rosters (students,
+  faculty, staff), team/about pages, club or committee member lists, alumni directories.
+  Signals: a personal name is the card's label, pronouns (He/Him, She/Her), a direct email as
+  the main contact, personal websites (github.io, ~username pages), job title/department — and
+  usually NO street address or company branding per card. A professional directory row with an
+  office phone + address is still "business"; a roster row with name + pronouns + email is "person".
 - Otherwise a short lowercase noun for the listed thing: "product", "vehicle", "event",
-  "property", "book", "course", etc. Use a non-business type ONLY when cards describe physical
-  items or listings, NOT contactable organizations. When in doubt, choose "business".
+  "property", "book", "course", etc. Use such a type ONLY when cards describe physical
+  items or listings, NOT contactable people/organizations. When in doubt between "business"
+  and "person", choose "business".
 
 STEP 2 — selectors.
 
@@ -799,7 +904,21 @@ If entity_type is "business", return ONLY this JSON (no markdown):
   "contact_email": "selector for contact email relative to contact_card, or null"
 }}
 
-If entity_type is NOT "business", return ONLY this JSON (no markdown):
+If entity_type is "person", return ONLY this JSON (no markdown):
+{{
+  "entity_type": "person",
+  "card_selector": "CSS selector for each repeating card/row (absolute)",
+  "full_name": "selector for the person's name",
+  "pronouns": "selector for preferred pronouns, or null",
+  "title": "selector for job title / role / position, or null",
+  "department": "selector for department / group / affiliation, or null",
+  "office": "selector for office / room location, or null",
+  "email": "selector for the email link or text (prefer the mailto: <a>), or null",
+  "phone": "selector for phone number, or null",
+  "personal_website": "selector for the person's own website link — NOT the mailto: link, or null"
+}}
+
+If entity_type is anything else, return ONLY this JSON (no markdown):
 {{
   "entity_type": "<the type>",
   "card_selector": "CSS selector for each repeating card (absolute)",
@@ -813,28 +932,29 @@ If entity_type is NOT "business", return ONLY this JSON (no markdown):
 - invent as many "spec" fields as the card exposes (e.g. a graphics card: chipset, memory, tdp, interface)
 - omit a datum entirely if it is not present (do NOT emit empty/null entries in fields[])
 
-Rules (both modes):
+Rules (all modes):
 - Use class-based selectors where possible e.g. "div.listingBox"
 - card_selector must be ABSOLUTE; field selectors RELATIVE to the card
 - Never use :contains() pseudo-selectors — BeautifulSoup does not support them
+- For <table> rows, address columns positionally: "td:nth-of-type(2)"
 - For phone/price/spec: target the most specific element holding just that value{card_hint}
 
 HTML SAMPLE:
 {sample}"""
-    raw = ask(prompt, max_tokens=1200).strip()
-    # Strip markdown fences if the model wrapped the response
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-
-    try:
-        selectors = json.loads(raw.strip())
-    except json.JSONDecodeError as e:
-        print(f"  LLM returned non-JSON selectors for {domain}: {e}")
-        return {}
-
-    if not isinstance(selectors, dict):
+    # A single empty/malformed response must not sink the whole scrape into
+    # the business regex fallback (which produces garbage on non-business
+    # pages) — retry once before giving up.
+    selectors = None
+    for attempt in range(2):
+        raw = ask(prompt, max_tokens=1200)
+        selectors = _parse_llm_json(raw)
+        if selectors is not None:
+            break
+        print(f"  LLM returned non-JSON selectors for {domain} "
+              f"(attempt {attempt + 1}/2, {len(raw.strip())} chars)")
+        debug.log("PARSE", f"learn_selectors attempt {attempt + 1} non-JSON",
+                  level="warn")
+    if selectors is None:
         return {}
 
     # Don't cache useless selectors — the model couldn't find a card container
@@ -858,10 +978,20 @@ HTML SAMPLE:
     entity_type = (selectors.get("entity_type") or "business").strip().lower() or "business"
     selectors["entity_type"] = entity_type
 
-    # Non-business: validate the free-form field/role shape before caching. If it's
-    # incomplete, don't cache garbage — let the caller fall through (returns no members
-    # for non-business, since the contact-regex fallback can't help product/spec data).
-    if entity_type != "business":
+    # Person: flat fixed schema like business, but keyed on full_name. name_field
+    # is stored so main.py / exporter read the right identity column. Without a
+    # full_name selector the schema is useless — don't cache it.
+    if entity_type == "person":
+        if not selectors.get("full_name"):
+            print(f"  Person schema for {domain} has no full_name selector, skipping cache")
+            return selectors
+        selectors["name_field"] = "full_name"
+        print(f"  Detected entity_type='person' for {domain}")
+
+    # Non-business, non-person: validate the free-form field/role shape before caching.
+    # If it's incomplete, don't cache garbage — let the caller fall through (returns no
+    # members, since the contact-regex fallback can't help product/spec data).
+    elif entity_type != "business":
         valid_fields = [
             f for f in (selectors.get("fields") or [])
             if isinstance(f, dict) and f.get("key") and f.get("selector")
@@ -876,11 +1006,174 @@ HTML SAMPLE:
             # Fall back to the identity-role field, else the first field.
             ident = next((f["key"] for f in valid_fields if (f.get("role") or "").lower() == "identity"), None)
             selectors["name_field"] = ident or valid_fields[0]["key"]
+        if not _dynamic_schema_has_data_fields(selectors):
+            print(f"  Schema for {domain} is a link list (identity+url only) — "
+                  f"navigation, not member cards; skipping cache")
+            return selectors
         print(f"  Detected entity_type='{entity_type}' for {domain} "
               f"({len(valid_fields)} fields, identity='{selectors['name_field']}')")
 
     set_cached_selectors(domain, selectors)
     return selectors
+
+
+# --- HEADER-MAPPED TABLE LEARNING (zero AI) ---
+
+# Column-header keyword → (person_field, business_field), checked in order —
+# specific patterns before the generic "name" catch-all. First matching
+# pattern wins per column; first column wins per field.
+_HEADER_FIELD_PATTERNS = [
+    (re.compile(r'pronoun', re.I),                            "pronouns",         None),
+    (re.compile(r'e-?mail', re.I),                            "email",            "contact_email"),
+    (re.compile(r'phone|telephone|\btel\b', re.I),            "phone",            "phone"),
+    (re.compile(r'\bfax\b', re.I),                            None,               "fax"),
+    (re.compile(r'web\s?site|homepage|\burl\b', re.I),        "personal_website", "website"),
+    (re.compile(r'company|organi[sz]ation|business|firm|employer', re.I),
+                                                              None,               "company_name"),
+    (re.compile(r'address', re.I),                            "office",           "street_address"),
+    (re.compile(r'title|position|\brole\b', re.I),            "title",            None),
+    (re.compile(r'department|\bdept\b|division|program', re.I), "department",     None),
+    (re.compile(r'office|room|building', re.I),               "office",           None),
+    (re.compile(r'category|\btype\b|special', re.I),          None,               "category"),
+    (re.compile(r'name', re.I),                               "full_name",        "company_name"),
+]
+
+# Name-column headers that flag the rows as PEOPLE (vs the ambiguous "Name").
+_PERSON_NAME_HEADER_RE = re.compile(
+    r'first\s*name|last\s*name|full\s*name|student|faculty|staff|person|people',
+    re.I,
+)
+
+
+def learn_selectors_from_table_headers(raw_html: str) -> tuple[dict, bool]:
+    """Deterministically learn selectors from a labeled <table> — zero AI.
+
+    A table with a header row ("Name | Preferred Pronouns | Email | Personal
+    Website") maps columns to schema fields directly: no LLM guessing, and it
+    still works when the LLM is down. Returns (selectors, confident_person):
+
+      selectors         {} when no table maps (needs an identity column, one
+                        more mapped column, and MIN_CARDS_FOR_LEARNING rows)
+      confident_person  True when the headers unambiguously describe people
+                        (a pronouns column, or a person-flavored name header
+                        with no company column). Callers may then skip the
+                        LLM entirely; otherwise the mapping is only used as a
+                        fallback after LLM learning fails.
+    """
+    soup = strip_junk(BeautifulSoup(raw_html, "html.parser"))
+    best: dict = {}
+    best_confident = False
+    best_rows = 0
+
+    for table in soup.find_all("table"):
+        # --- Header row: <thead>, else a leading <tr> that uses <th> cells ---
+        header_row = None
+        thead = table.find("thead")
+        if thead:
+            header_row = thead.find("tr")
+        if header_row is None:
+            first = table.find("tr")
+            if first is not None and first.find("th"):
+                header_row = first
+        if header_row is None:
+            continue
+        header_cells = header_row.find_all(["th", "td"], recursive=False)
+        if len(header_cells) < 2:
+            continue
+        headers = [c.get_text(" ", strip=True) for c in header_cells]
+
+        # --- Map columns to fields ---
+        person_map: dict[str, int] = {}
+        business_map: dict[str, int] = {}
+        company_signal = False  # an explicit Company/Organization header
+        for idx, htext in enumerate(headers, start=1):
+            if not htext:
+                continue
+            for pattern, p_field, b_field in _HEADER_FIELD_PATTERNS:
+                if pattern.search(htext):
+                    if p_field and p_field not in person_map:
+                        person_map[p_field] = idx
+                    if b_field and b_field not in business_map:
+                        business_map[b_field] = idx
+                    if b_field == "company_name" and p_field is None:
+                        company_signal = True
+                    break
+
+        # --- Data rows ---
+        container = table.find("tbody") or table
+        rows = [r for r in container.find_all("tr", recursive=False)
+                if r is not header_row and r.find(["td", "th"])]
+        if len(rows) < MIN_CARDS_FOR_LEARNING:
+            continue
+
+        # --- Person vs business ---
+        person_signal = "pronouns" in person_map
+        name_idx = person_map.get("full_name")
+        if name_idx and _PERSON_NAME_HEADER_RE.search(headers[name_idx - 1]):
+            person_signal = True
+        if company_signal:
+            is_person, confident = False, False
+        elif person_signal:
+            is_person, confident = True, True
+        else:
+            # Ambiguous ("Name | Email | Website"): lean person unless
+            # business-only columns (address/fax) are present.
+            is_person = not (business_map.get("street_address")
+                             or business_map.get("fax"))
+            confident = False
+
+        field_map = person_map if is_person else business_map
+        identity = "full_name" if is_person else "company_name"
+        if identity not in field_map or len(field_map) < 2:
+            continue
+
+        # --- Card selector, guarded against over-matching ---
+        container_sel = _selector_for_container(container)
+        if not container_sel:
+            continue
+        card_selector = f"{container_sel} > tr"
+        try:
+            matched = soup.select(card_selector)
+        except Exception:
+            continue
+        if len(matched) < len(rows):
+            continue
+        anchored = ("." in card_selector or "#" in card_selector)
+        if not anchored and len(matched) > len(rows) + 1:
+            continue  # generic path ("table > tbody > tr") hit other tables too
+
+        # --- Column selectors. Row-header tables put the first column in a
+        # <th>; :nth-child keeps the remaining td positions correct there. ---
+        first_cells = rows[0].find_all(["th", "td"], recursive=False)
+        th_leading = bool(first_cells) and first_cells[0].name == "th"
+
+        def _cell_sel(idx: int) -> str:
+            if th_leading:
+                return "th" if idx == 1 else f"td:nth-child({idx})"
+            return f"td:nth-of-type({idx})"
+
+        selectors = {"entity_type": "person" if is_person else "business",
+                     "card_selector": card_selector}
+        if is_person:
+            selectors["name_field"] = "full_name"
+        for field, idx in field_map.items():
+            sel = _cell_sel(idx)
+            # Business getters read href off the selected element itself, so
+            # link-bearing cells need the anchor selected directly. (Person
+            # getters already look inside the cell.)
+            if not is_person and field in ("website", "contact_email") \
+                    and 0 < idx <= len(first_cells) and first_cells[idx - 1].find("a"):
+                sel += " a"
+            selectors[field] = sel
+
+        if len(rows) > best_rows:
+            best, best_confident, best_rows = selectors, confident, len(rows)
+
+    if best:
+        print(f"  Header-mapped table: {best_rows} rows, "
+              f"entity_type='{best['entity_type']}' "
+              f"(confident={best_confident}) via '{best['card_selector']}'")
+    return best, best_confident
 
 
 # --- SELECTOR APPLICATION (PURE BS4, ZERO AI COST) ---
@@ -889,11 +1182,15 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
     """Apply learned CSS selectors to extract all members.
     Pure BeautifulSoup — no AI calls.
 
-    Dispatches on entity_type: a non-"business" schema (free-form, role-tagged
-    fields) goes through _apply_dynamic_selectors; everything else (the default,
-    incl. all legacy cached entries without an entity_type) uses the unchanged
-    fixed business path below."""
-    if (selectors.get("entity_type") or "business") != "business":
+    Dispatches on entity_type: "person" (flat fixed schema — rosters, faculty/
+    team pages) goes through _apply_person_selectors; any other non-"business"
+    schema (free-form, role-tagged fields) goes through _apply_dynamic_selectors;
+    everything else (the default, incl. all legacy cached entries without an
+    entity_type) uses the unchanged fixed business path below."""
+    _etype = selectors.get("entity_type") or "business"
+    if _etype == "person":
+        return _apply_person_selectors(raw_html, selectors)
+    if _etype != "business":
         return _apply_dynamic_selectors(raw_html, selectors)
 
     soup = BeautifulSoup(raw_html, "html.parser")
@@ -922,6 +1219,8 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
                     text = re.sub(r'(\s*' + re.escape(separator) + r'\s*)+', separator + ' ', text)
                 # Strip known label prefixes like "Phone:" or "Website:"
                 text = _LABEL_PREFIX_RE.sub('', text)
+                # Strip CMS link annotations ("(link sends e-mail)", etc.)
+                text = _CMS_LINK_BOILERPLATE_RE.sub('', text)
                 # Replace non-breaking spaces with regular spaces
                 text = text.replace('\u00a0', ' ')
                 return text.strip() or None
@@ -936,7 +1235,7 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
                 el = card.select_one(sel)
                 if not el:
                     return None
-                return el.get("href") or el.get_text(strip=True)
+                return el.get("href") or _strip_cms_boilerplate(el.get_text(strip=True))
             except Exception:
                 return None
 
@@ -993,6 +1292,111 @@ def apply_selectors(raw_html: str, selectors: dict) -> list:
     return members
 
 
+# --- PERSON SELECTOR APPLICATION ---
+
+# Scalar text fields of the person schema (email/personal_website have
+# link-aware getters below).
+_PERSON_TEXT_FIELDS = ("full_name", "pronouns", "title", "department",
+                       "office", "phone")
+
+
+def _person_get_text(card, sel) -> str | None:
+    """Text of the first match of `sel` within a person card."""
+    if not sel or not str(sel).strip():
+        return None
+    try:
+        el = card.select_one(sel)
+        if not el:
+            return None
+        text = el.get_text(separator=" ", strip=True)
+        text = _CMS_LINK_BOILERPLATE_RE.sub('', text)
+        text = _PERSON_LABEL_PREFIX_RE.sub('', text)
+        text = re.sub(r'\s+', ' ', text)  # folds runs incl. non-breaking spaces
+        return text.strip() or None
+    except Exception:
+        return None
+
+
+def _person_get_email(card, sel) -> str | None:
+    """Email for a person card: mailto: href of the selected element (or an
+    anchor inside it), else the first email in its text. When the learned
+    selector matches nothing, falls back to any mailto: link in the card —
+    cards are per-person, so a mailto inside one is that person's address."""
+    el = None
+    if sel and str(sel).strip():
+        try:
+            el = card.select_one(sel)
+        except Exception:
+            el = None
+
+    def _from_element(node) -> str | None:
+        href = str(node.get("href") or "") if getattr(node, "get", None) else ""
+        if href.startswith("mailto:"):
+            email = href[7:].split("?")[0].strip()
+            if _EMAIL_RE.match(email):
+                return email
+        inner = node.find("a", href=lambda h: bool(h and h.startswith("mailto:")))
+        if inner:
+            email = str(inner["href"])[7:].split("?")[0].strip()
+            if _EMAIL_RE.match(email):
+                return email
+        m = _EMAIL_RE.search(node.get_text(separator=" "))
+        return m.group() if m else None
+
+    if el is not None:
+        found = _from_element(el)
+        if found:
+            return found
+    return _extract_email(card)
+
+
+def _person_get_website(card, sel) -> str | None:
+    """Personal-website href for a person card, never a mailto:/tel: link
+    (the model sometimes points this selector at the email anchor)."""
+    if not sel or not str(sel).strip():
+        return None
+    try:
+        el = card.select_one(sel)
+        if not el:
+            return None
+        href = str(el.get("href") or "")
+        if not href:
+            inner = el.find("a", href=True)
+            href = str(inner["href"]) if inner else ""
+        if href.startswith(("mailto:", "tel:", "javascript:")):
+            return None
+        return href or _strip_cms_boilerplate(el.get_text(strip=True)) or None
+    except Exception:
+        return None
+
+
+def _apply_person_selectors(raw_html: str, selectors: dict) -> list:
+    """Apply a learned "person" schema (flat, like business but person-keyed).
+
+    One record per card: full_name, pronouns, title, department, office,
+    email, phone, personal_website. Pure BeautifulSoup, no AI cost."""
+    card_selector = selectors.get("card_selector") or ""
+    if not card_selector:
+        return []
+    soup = BeautifulSoup(raw_html, "html.parser")
+    try:
+        cards = soup.select(card_selector)
+    except Exception:
+        return []
+    if not cards:
+        return []
+
+    members = []
+    for card in cards:
+        rec = {field: _person_get_text(card, selectors.get(field))
+               for field in _PERSON_TEXT_FIELDS}
+        rec["email"] = _person_get_email(card, selectors.get("email"))
+        rec["personal_website"] = _person_get_website(
+            card, selectors.get("personal_website"))
+        members.append(rec)
+    return members
+
+
 # --- DYNAMIC (NON-BUSINESS) SELECTOR APPLICATION ---
 
 def _dyn_get_text(card, sel) -> str | None:
@@ -1004,6 +1408,7 @@ def _dyn_get_text(card, sel) -> str | None:
         if not el:
             return None
         text = el.get_text(separator=" ", strip=True)
+        text = _CMS_LINK_BOILERPLATE_RE.sub('', text)
         text = re.sub(r'\s+', ' ', text)  # folds runs incl. non-breaking spaces
         return text.strip() or None
     except Exception:
@@ -1018,7 +1423,7 @@ def _dyn_get_href(card, sel) -> str | None:
         el = card.select_one(sel)
         if not el:
             return None
-        return el.get("href") or (el.get_text(strip=True) or None)
+        return el.get("href") or (_strip_cms_boilerplate(el.get_text(strip=True)) or None)
     except Exception:
         return None
 
@@ -1067,10 +1472,35 @@ def _dynamic_extraction_valid(members: list, name_field: str) -> bool:
     return with_name >= max(3, int(len(members) * 0.5))
 
 
+def _dynamic_schema_has_data_fields(selectors: dict) -> bool:
+    """True when a free-form dynamic schema extracts at least one real datum.
+
+    A schema whose only roles are identity + url is a LINK LIST — the shape
+    of city/category navigation (walmart.com's state directory taught the
+    cache exactly that), not of member records. Such schemas must never be
+    accepted or cached: they "validate" on any page with named links and then
+    shadow the real cards (address, phone) on every later page, forever.
+    """
+    for f in selectors.get("fields") or []:
+        if isinstance(f, dict) and f.get("key") and f.get("selector") \
+                and (f.get("role") or "other").lower() not in ("identity", "url"):
+            return True
+    return False
+
+
 def _selectors_valid(selectors: dict, members: list) -> bool:
     """Dispatch validity check by entity_type (business → SCALAR_KEYS)."""
-    if isinstance(selectors, dict) and (selectors.get("entity_type") or "business") != "business":
-        return _dynamic_extraction_valid(members, selectors.get("name_field") or "")
+    if isinstance(selectors, dict):
+        etype = selectors.get("entity_type") or "business"
+        if etype != "business":
+            # Link-list schemas are navigation, never valid member data.
+            # Failing them here also self-heals poisoned cache entries:
+            # parse_member_html purges the cache when validation fails.
+            if etype != "person" and not _dynamic_schema_has_data_fields(selectors):
+                return False
+            name_field = selectors.get("name_field") \
+                or ("full_name" if etype == "person" else "")
+            return _dynamic_extraction_valid(members, name_field)
     return is_extraction_valid(members)
 
 
@@ -1260,6 +1690,21 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
             debug.log("PARSE", f"JSON-LD tier: {len(jsonld_members)} members")
             return jsonld_members
 
+    # Step 1.7: header-mapped table — zero AI. When the page is a labeled
+    # table that confidently reads as a person roster ("Name | Pronouns |
+    # Email | ..."), the column mapping beats an LLM guess and costs nothing.
+    # Ambiguous/business tables keep going to the LLM; the mapping is kept
+    # around as a fallback for when learning fails (Step 2.5).
+    table_selectors, table_person_confident = learn_selectors_from_table_headers(raw_html)
+    if table_selectors and table_person_confident:
+        table_members = apply_selectors(raw_html, table_selectors)
+        if _selectors_valid(table_selectors, table_members):
+            print(f"  Header-mapped table: extracted {len(table_members)} "
+                  f"person records (zero AI cost)")
+            debug.log("PARSE", f"Header-mapped table tier: {len(table_members)} records")
+            set_cached_selectors(domain, table_selectors)
+            return table_members
+
     # Step 2: learn selectors from a small sample
     selector_members = []
     selectors = {}
@@ -1280,12 +1725,33 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
         print(f"  WARNING: Selector learning error for {domain}: {e}")
         debug.log("PARSE", f"Step 2 error: {e}", level="error")
 
-    # Non-business directories (product/spec/etc.) have no contact-regex fallback —
-    # the regex layer below only finds phone/email/address/name. Return the best
-    # selector result we have (possibly empty) instead of business-shaped garbage.
+    # Step 2.5: header-mapped table fallback. The LLM failed or its selectors
+    # didn't validate — a deterministic column mapping (any entity type) is
+    # strictly better than the business regex fallback here.
+    if table_selectors:
+        table_members = apply_selectors(raw_html, table_selectors)
+        if _selectors_valid(table_selectors, table_members):
+            print(f"  Header-mapped table fallback: extracted {len(table_members)} "
+                  f"{table_selectors.get('entity_type')} records")
+            debug.log("PARSE", f"Header-mapped fallback: {len(table_members)} records")
+            set_cached_selectors(domain, table_selectors)
+            return table_members
+
+    # Non-business directories (person/product/etc.) have no contact-regex fallback —
+    # the regex layer below only produces business-shaped records (email-as-name on
+    # rosters was exactly the bug the person schema fixes). Return the best selector
+    # result we have (possibly empty) instead of business-shaped garbage.
     _etype = (selectors.get("entity_type") if isinstance(selectors, dict) else None) \
         or (cached.get("entity_type") if cached else None) or "business"
     if _etype != "business":
+        # A link-list schema (identity+url roles only) is navigation —
+        # returning its records would ship city/category links as "members".
+        _schema = selectors if isinstance(selectors, dict) and selectors.get("fields") \
+            else (cached or {})
+        if _etype != "person" and not _dynamic_schema_has_data_fields(_schema):
+            debug.log("PARSE", f"Dynamic link-list schema ({_etype}) — "
+                      f"returning 0 members", level="warn")
+            return []
         debug.log("PARSE", f"Non-business ({_etype}) — skipping regex fallback", level="warn")
         return selector_members or []
 

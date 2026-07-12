@@ -18,12 +18,16 @@ import os
 import json
 from urllib.parse import urlparse
 
-from playwright.sync_api import sync_playwright
+from _pw import sync_playwright
 from browser import capture_responses
-from html_parser import parse_member_html
-from cleaner import clean_members, is_extraction_garbage, is_extraction_garbage_dynamic
+from html_parser import parse_member_html, apply_selectors
+from cleaner import (
+    clean_members, is_extraction_garbage, is_extraction_garbage_dynamic,
+    is_extraction_garbage_person,
+)
 from detail_crawler import crawl_detail_pages
 from cache import delete_cached_selectors, get_cached_selectors
+from debug import debug
 
 # Fields that can only be found via Phase 2 (website enrichment), not detail pages.
 PHASE2_ONLY_FIELDS = {"social_media"}
@@ -123,13 +127,14 @@ def normalize_json_member(raw: dict) -> dict:
     if email:
         contacts.append({"name": None, "email": email})
 
-    return {
+    normalized = {
         "company_name":    find_field(["Name", "CompanyName", "company_name", "BusinessName",
                                        "OrganizationName", "name", "Title", "title", "nam",
                                        "DisplayName", "ProviderName", "PracticeName",
                                        "FirmName", "RestaurantName", "DoctorName",
                                        "AttorneyName", "OfficeName", "FullName",
-                                       "EntityName", "displayName", "fullName"], flat),
+                                       "EntityName", "displayName", "fullName",
+                                       "full_name"], flat),
         "description":     find_field(["Description", "description", "About", "about",
                                        "Bio", "bio", "Summary", "summary", "cnm",
                                        "Overview", "overview", "Details", "details"], flat),
@@ -140,13 +145,24 @@ def normalize_json_member(raw: dict) -> dict:
                                        "PracticeArea", "practiceArea", "Discipline",
                                        "Department", "ServiceArea", "Services"], flat),
         "website":         find_field(["WebSite", "Website", "website", "URL", "url",
-                                       "Web", "web", "Homepage", "homepage"], flat),
+                                       "Web", "web", "Homepage", "homepage",
+                                       "PersonalWebsite", "personal_website",
+                                       "personalWebsite", "PersonalURL"], flat),
         "phone":           phone,
         "fax":             fax,
         "street_address":  full_address,
         "mailing_address": find_field(["MailingAddress", "mailing_address", "Address2", "ad2"], flat),
         "contacts":        contacts,
     }
+
+    # Person-directory aliases: attached only when the API actually carries
+    # them, so business records keep their exact 9-key shape.
+    pronouns = find_field(["Pronouns", "pronouns", "PreferredPronouns",
+                           "preferred_pronouns", "preferredPronouns"], flat)
+    if pronouns:
+        normalized["pronouns"] = pronouns
+
+    return normalized
 
 
 def is_member_list(data: list) -> bool:
@@ -160,7 +176,7 @@ def is_member_list(data: list) -> bool:
     name_keys = {"name", "companyname", "company_name", "businessname",
                  "organizationname", "title", "nam", "displayname",
                  "providername", "practicename", "firmname",
-                 "restaurantname", "doctorname", "fullname",
+                 "restaurantname", "doctorname", "fullname", "full_name",
                  "entityname", "officename", "attorneyname"}
     sample = data[:5]
     matches = 0
@@ -206,6 +222,7 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
     """
     all_members = []
     has_json_members = False
+    zero_yield_htmls = []
 
     # --- Include detail crawl results first (already parsed) ---
     if detail_members:
@@ -247,7 +264,7 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
                 name_keys = {"name", "companyname", "company_name", "businessname",
                              "displayname", "providername", "practicename",
                              "firmname", "restaurantname", "doctorname",
-                             "fullname", "entityname", "officename"}
+                             "fullname", "full_name", "entityname", "officename"}
                 data_keys_lower = {k.lower() for k in data.keys()}
                 if data_keys_lower & name_keys:
                     normalized = normalize_json_member(data)
@@ -266,17 +283,48 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
             try:
                 members = parse_member_html(data["raw_html"], domain=domain)
                 print(f"  Extracted {len(members)} members")
-                all_members.extend(members)
+                if members:
+                    all_members.extend(members)
+                else:
+                    zero_yield_htmls.append(data["raw_html"])
             except Exception as e:
                 print(f"  Failed to parse: {e}")
+
+    # --- Second pass: recover pages parsed before selectors were learned ---
+    # A category/hub run learns the schema mid-iteration (on the first page
+    # with enough cards to validate). Pages parsed before that — e.g. one-store
+    # city pages, which can't meet the ≥3-record validation bar on their own —
+    # yielded 0. Re-apply the final cached selectors to them (pure BS4, no AI).
+    # Tiny per-page yields are fine here: the schema already validated
+    # elsewhere, and the garbage gate below still sees the full population.
+    if zero_yield_htmls:
+        _final_sel = get_cached_selectors(domain)
+        if _final_sel:
+            recovered = 0
+            for html in zero_yield_htmls:
+                try:
+                    extra = [m for m in apply_selectors(html, _final_sel)
+                             if isinstance(m, dict)]
+                except Exception:
+                    continue
+                recovered += len(extra)
+                all_members.extend(extra)
+            if recovered:
+                print(f"  Second pass: recovered {recovered} members from "
+                      f"{len(zero_yield_htmls)} zero-yield page(s) using final selectors")
+                debug.log("PARSE", f"Second pass recovered {recovered} members "
+                          f"from {len(zero_yield_htmls)} zero-yield pages")
 
     # Determine the detected schema for this domain (set during selector learning).
     # Defaults to the business schema when absent — legacy cache entries, regex-only
     # extractions, and JSON-API paths all stay on the unchanged business path.
+    # "person" (rosters, faculty/team pages) is a fixed schema keyed on full_name;
+    # any other non-business type is the free-form dynamic schema.
     _sel = get_cached_selectors(domain) or {}
     entity_type = (_sel.get("entity_type") or "business")
-    name_field = _sel.get("name_field") or "company_name"
-    is_dynamic = entity_type != "business"
+    is_person = entity_type == "person"
+    name_field = _sel.get("name_field") or ("full_name" if is_person else "company_name")
+    is_dynamic = entity_type not in ("business", "person")
     field_roles = (
         {f["key"]: (f.get("role") or "other")
          for f in _sel.get("fields", []) if isinstance(f, dict) and f.get("key")}
@@ -285,18 +333,32 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
 
     # Clean and deduplicate all members
     all_members = clean_members(all_members, name_field=name_field,
-                                is_dynamic=is_dynamic, field_roles=field_roles)
+                                is_dynamic=is_dynamic, field_roles=field_roles,
+                                entity_type=entity_type)
 
     # --- Quality gate: reject garbage extractions ---
     # When the extractor scrapes navigation / content sections (not real
     # member records), every "member" lacks data. Detect this and invalidate the
     # cached selectors so future scrapes don't reuse them. Business keys on contact
-    # data; the dynamic gate keys on identity + at least one other populated field.
-    garbage = (is_extraction_garbage_dynamic(all_members, name_field)
-               if is_dynamic else is_extraction_garbage(all_members))
+    # data; the person and dynamic gates key on identity + at least one other
+    # populated field.
+    if is_person:
+        garbage = is_extraction_garbage_person(all_members)
+    elif is_dynamic:
+        # URL-role fields aren't data — a record that is only name + link is
+        # navigation (see the link-list guards in html_parser).
+        url_keys = {k for k, r in (field_roles or {}).items()
+                    if (r or "").lower() == "url"}
+        garbage = is_extraction_garbage_dynamic(all_members, name_field,
+                                                ignore_fields=url_keys)
+    else:
+        garbage = is_extraction_garbage(all_members)
     if garbage:
         print(f"WARNING: Extraction appears to be garbage for {domain} — "
               f"purging cached selectors and returning 0 members")
+        debug.decision("CLEAN", "extraction rejected as garbage",
+                       "records lack contact/identity data — cached selectors purged",
+                       data={"members_before_rejection": len(all_members)})
         delete_cached_selectors(domain)
         return []
 
@@ -402,10 +464,11 @@ def compute_metadata(members: list, source_url: str = "", intent: dict | None = 
             "field_coverage": {k: sum(1 for m in members if m.get(k)) for k in keys},
         }
         if intent:
-            metadata["intent_industry"] = intent.get("canonical") or ""
-            metadata["intent_locations"] = [
-                loc.get("state", "") for loc in (intent.get("locations") or [])
-            ]
+            # intent is the FLATTENED dict from intent_from_plan — keys are
+            # industry_canonical / location_states (already a list of state
+            # strings), NOT the plan's industry.canonical / locations[].state.
+            metadata["intent_industry"] = intent.get("industry_canonical") or ""
+            metadata["intent_locations"] = list(intent.get("location_states") or [])
         metadata.update(extra)
         return metadata
 
@@ -588,7 +651,8 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                      priority_fields: list | None = None,
                      intent: dict | None = None,
                      is_aggregator: bool = False,
-                     login_callback=None) -> list:
+                     login_callback=None,
+                     captcha_callback=None) -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
@@ -602,6 +666,11 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                         nobody is at the server's stdin. app.py passes a
                         frontend-prompt handler (Playground) or an auto-skip
                         (Agent batch mode).
+        captcha_callback: Optional callable(page, domain, vendor) -> bool for
+                        anti-bot challenges (DataDome press-and-hold, Cloudflare,
+                        hCaptcha, reCAPTCHA). Pauses so a human can solve it in
+                        the headed browser window, then resumes. If None, the
+                        challenge is logged and skipped (batch/unattended runs).
         mode: "auto" = find directory page + search (default)
               "direct" = skip navigation/search, scrape the page as-is
         priority_fields: List of field names the user wants (e.g. ["email", "phone", "address"]).
@@ -626,16 +695,41 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
     data_dump_dir = os.path.join(parent_dir, "Data-dump")
     os.makedirs(data_dump_dir, exist_ok=True)
 
-    # --- Step 1: Browser automation — capture all responses ---
-    with sync_playwright() as playwright:
-        results, detail_urls = capture_responses(
-            playwright, url, mode=mode,
-            priority_fields=priority_fields,
-            login_callback=login_callback or _login_interactive,
-            intent=intent,
-            is_aggregator=is_aggregator,
-        )
+    # Per-scrape debug trace: entries restart here so each site gets its own
+    # timeline; saved to Debug-dump/{domain}_debug.json in the finally below.
+    if debug.enabled:
+        debug.reset()
+        debug.log("BROWSER", f"Scrape started: {url}", data={
+            "mode": mode, "priority_fields": priority_fields,
+            "intent": bool(intent), "is_aggregator": is_aggregator,
+        })
 
+    try:
+        # --- Step 1: Browser automation — capture all responses ---
+        with debug.span("BROWSER", "browser capture (navigate/search/paginate)"):
+            with sync_playwright() as playwright:
+                results, detail_urls = capture_responses(
+                    playwright, url, mode=mode,
+                    priority_fields=priority_fields,
+                    login_callback=login_callback or _login_interactive,
+                    captcha_callback=captcha_callback,
+                    intent=intent,
+                    is_aggregator=is_aggregator,
+                )
+        return _finish_scrape(url, domain, data_dump_dir, results, detail_urls,
+                              prompt_callback, priority_fields, intent)
+    finally:
+        if debug.enabled:
+            debug_dump_dir = os.path.join(parent_dir, "Debug-dump")
+            debug.save_report(os.path.join(debug_dump_dir, f"{domain}_debug.json"))
+
+
+def _finish_scrape(url: str, domain: str, data_dump_dir: str, results: list,
+                   detail_urls: list, prompt_callback, priority_fields: list,
+                   intent: dict | None) -> list:
+    """Steps 2-5 of scrape_directory: save raw, optional detail crawl, parse,
+    warn on empty. Split out so scrape_directory can wrap the whole pipeline
+    in one try/finally that saves the debug trace even on errors."""
     # --- Step 2: Save raw responses ---
     raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
     print(f"Saving {len(results)} raw responses to {raw_output_path}")
@@ -674,7 +768,8 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
             should_crawl = prompt_detail_crawl(len(detail_urls))
 
         if should_crawl:
-            detail_members = crawl_detail_pages(detail_urls, domain)
+            with debug.span("DETAIL", f"detail crawl ({len(detail_urls)} pages)"):
+                detail_members = crawl_detail_pages(detail_urls, domain)
             if detail_members:
                 detail_path = os.path.join(data_dump_dir, f"{domain}_detail_raw.json")
                 with open(detail_path, "w") as f:
@@ -682,10 +777,12 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                 print(f"Saved {len(detail_members)} detail members to {detail_path}")
 
     # --- Step 4: Parse, clean, and save structured data ---
-    members = parse_and_save_results(results, data_dump_dir, domain,
-                                     detail_members=detail_members,
-                                     intent=intent,
-                                     source_url=url)
+    with debug.span("PARSE", "parse + clean + save structured data"):
+        members = parse_and_save_results(results, data_dump_dir, domain,
+                                         detail_members=detail_members,
+                                         intent=intent,
+                                         source_url=url)
+    debug.log("CLEAN", f"Final member count: {len(members)}")
 
     # --- Step 5: If zero results, warn (login gate already handled in browser) ---
     if len(members) == 0:

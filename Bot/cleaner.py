@@ -63,6 +63,26 @@ _GENERIC_SINGLE_WORDS = {
 _SHARED_EMAIL_MIN_COUNT = 5
 _SHARED_EMAIL_MIN_FRACTION = 0.20
 
+# An entire value that is just an email address. A person record whose
+# full_name matches this is an extraction misfire (the mailto link text
+# leaked in as the name), not a person.
+_EMAIL_ONLY_RE = re.compile(
+    r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$'
+)
+_EMAIL_IN_TEXT_RE = re.compile(
+    r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}'
+)
+
+# CMS link annotations ("(link sends e-mail)", "(link is external)",
+# "(opens in a new tab)"). The parser strips these at extraction time; the
+# cleaner strips them again as a safety net for records that arrive from
+# other paths. Kept local so cleaner.py stays import-free.
+_LINK_BOILERPLATE_RE = re.compile(
+    r'\(\s*link\s+(?:sends\s+e-?mail|is\s+external)\s*\)'
+    r'|\(\s*opens\s+in\s+(?:a\s+)?new\s+(?:tab|window)\s*\)',
+    re.I,
+)
+
 
 # --- Dedup key normalization ---
 # Previously the dedup key was just name.lower().strip(). That caused obvious
@@ -236,13 +256,16 @@ def _prune_shared_emails(members: list) -> int:
 
 
 def clean_members(members: list, name_field: str = "company_name",
-                  is_dynamic: bool = False, field_roles: dict | None = None) -> list:
+                  is_dynamic: bool = False, field_roles: dict | None = None,
+                  entity_type: str = "business") -> list:
     """Clean and deduplicate extracted member data.
 
-    Business path (default, is_dynamic=False) is unchanged. For a non-"business"
-    entity_type, is_dynamic=True routes to _clean_members_dynamic, which dedups on
-    `name_field` and applies role-based normalization (phone/url/email) using
-    `field_roles` ({field_key: role}) instead of the fixed business keys.
+    Business path (default, is_dynamic=False) is unchanged. entity_type="person"
+    routes to _clean_members_person (dedup on full_name + email, person field
+    normalization). For any other non-"business" entity_type, is_dynamic=True
+    routes to _clean_members_dynamic, which dedups on `name_field` and applies
+    role-based normalization (phone/url/email) using `field_roles`
+    ({field_key: role}) instead of the fixed business keys.
 
     Operations (business):
     - Reject false-positive names (nav text, CTA, FAQ headings, etc.)
@@ -253,6 +276,8 @@ def clean_members(members: list, name_field: str = "company_name",
     - Deduplicate contacts by email within each card
     - Remove redundant mailing addresses that match street addresses
     """
+    if entity_type == "person":
+        return _clean_members_person(members)
     if is_dynamic:
         return _clean_members_dynamic(members, name_field, field_roles or {})
 
@@ -277,12 +302,17 @@ def clean_members(members: list, name_field: str = "company_name",
             continue
         # Normalized dedup key collapses "Acme Corp" / "Acme Corp." /
         # "Acme Corporation" / "Acme, Corp" into a single bucket.
+        # Phone is included in the key so chain locations (e.g. multiple
+        # "Les Schwab Tire Center" branches) aren't conflated — same name
+        # + different phone = different location → keep both.
         name_key = _normalize_name_key(name)
         if not name_key:
             continue
-        if name_key in seen_companies:
+        phone_digits = re.sub(r'\D', '', m.get("phone") or "")
+        dedup_key = f"{name_key}|{phone_digits}" if phone_digits else name_key
+        if dedup_key in seen_companies:
             continue  # deduplicate
-        seen_companies.add(name_key)
+        seen_companies.add(dedup_key)
         m["company_name"] = name
 
         # --- PHONE / FAX ---
@@ -349,6 +379,97 @@ def clean_members(members: list, name_field: str = "company_name",
     return cleaned
 
 
+def _clean_members_person(members: list) -> list:
+    """Clean + dedup a "person" member list (rosters, faculty/team pages).
+
+    Person-aware rules:
+    - full_name that is a bare email address or URL is an extraction misfire → drop
+    - dedup key is full_name + email, NOT name alone — two "John Smith"s with
+      different emails are different people; pagination overlap (same name, same
+      email) still collapses
+    - email: strip mailto:, lowercase, keep only a well-formed address
+    - personal_website: drop mailto:/tel: hrefs, prefix bare domains with https://
+    - phone formatted like the business path
+    Skips the business false-positive name heuristics (tuned for company
+    directories) apart from the shared label-word check."""
+    seen = set()
+    cleaned = []
+    dropped_email_names = 0
+
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+
+        # --- FULL NAME ---
+        name = _LINK_BOILERPLATE_RE.sub(" ", m.get("full_name") or "")
+        name = " ".join(name.split())
+        if not name:
+            continue  # no identity → drop
+        if _is_label_name(name):
+            continue  # header rows: "Name", "Email", ...
+        if _EMAIL_ONLY_RE.match(name) or name.lower().startswith(
+                ("http://", "https://", "www.")):
+            dropped_email_names += 1
+            continue
+        m["full_name"] = name
+
+        # --- EMAIL ---
+        email = (m.get("email") or "").strip()
+        if email.lower().startswith("mailto:"):
+            email = email[7:].split("?")[0].strip()
+        email = email.lower()
+        if email and not _EMAIL_ONLY_RE.match(email):
+            # salvage an address from surrounding garbage, else discard
+            em = _EMAIL_IN_TEXT_RE.search(email)
+            email = em.group() if em else ""
+        m["email"] = email or None
+
+        # --- DEDUP (name + email) ---
+        name_key = _normalize_name_key(name)
+        if not name_key:
+            continue
+        key = f"{name_key}|{email}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # --- PRONOUNS ---
+        pronouns = " ".join((m.get("pronouns") or "").split()).strip("()[]")
+        m["pronouns"] = pronouns or None
+
+        # --- TITLE / DEPARTMENT / OFFICE ---
+        for field in ("title", "department", "office"):
+            if field in m:
+                val = " ".join((m.get(field) or "").split())
+                m[field] = val or None
+
+        # --- PHONE ---
+        val = m.get("phone") or ""
+        digits = re.sub(r'\D', '', val)
+        if len(digits) == 10:
+            m["phone"] = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+        elif len(digits) == 11 and digits[0] == "1":
+            m["phone"] = f"({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
+        else:
+            m["phone"] = val.strip() or None
+
+        # --- PERSONAL WEBSITE ---
+        site = (m.get("personal_website") or "").strip()
+        if site.lower().startswith(("mailto:", "tel:", "javascript:")):
+            site = ""
+        if site and not site.startswith("http"):
+            site = "https://" + site if re.match(r'^[\w.-]+\.[a-z]{2,}', site) else ""
+        m["personal_website"] = site or None
+
+        cleaned.append(m)
+
+    if dropped_email_names:
+        print(f"  Cleaner: dropped {dropped_email_names} person record(s) whose "
+              f"name was an email address or URL")
+
+    return cleaned
+
+
 def _clean_members_dynamic(members: list, name_field: str, field_roles: dict) -> list:
     """Clean + dedup a non-business (free-form, role-tagged) member list.
 
@@ -393,22 +514,28 @@ def _clean_members_dynamic(members: list, name_field: str, field_roles: dict) ->
 
 
 def is_extraction_garbage_dynamic(members: list, name_field: str,
-                                  min_populated_ratio: float = 0.3) -> bool:
+                                  min_populated_ratio: float = 0.3,
+                                  ignore_fields: set | None = None) -> bool:
     """Quality gate for a non-business extraction.
 
     Business `is_extraction_garbage` keys on contact data (phone/email/address),
     which products legitimately lack. Here "valid" means: most records have the
     identity field AND at least one other populated field. Returns True (garbage)
-    when fewer than `min_populated_ratio` of records meet that bar."""
+    when fewer than `min_populated_ratio` of records meet that bar.
+
+    `ignore_fields` (main.py passes the url-role keys) never count as the
+    "other populated field" — a record that is only name + link is scraped
+    navigation (city/category link lists), not data."""
     if not members:
         return True
+    ignore = ignore_fields or set()
     n = len(members)
     good = 0
     for m in members:
         if not isinstance(m, dict) or not m.get(name_field):
             continue
         has_extra = any(
-            k != name_field and v not in (None, "", [], {})
+            k != name_field and k not in ignore and v not in (None, "", [], {})
             for k, v in m.items()
         )
         if has_extra:
@@ -418,6 +545,16 @@ def is_extraction_garbage_dynamic(members: list, name_field: str,
               f"records have identity + data ({good / n:.1%})")
         return True
     return False
+
+
+def is_extraction_garbage_person(members: list) -> bool:
+    """Quality gate for a "person" extraction.
+
+    Same bar as the dynamic gate, keyed on full_name: most records must have
+    an identity plus at least one other populated field (pronouns, title,
+    email, ...). A list of bare names with nothing else is a scraped nav menu,
+    not a roster — matching how the business gate treats name-only output."""
+    return is_extraction_garbage_dynamic(members, "full_name")
 
 
 def is_extraction_garbage(members: list, min_contact_ratio: float = 0.05) -> bool:

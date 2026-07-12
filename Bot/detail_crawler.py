@@ -8,31 +8,46 @@ Triggered when:
 2. Member detail links are detected (e.g. /members/?id=81707594)
 3. User confirms they want to crawl
 
-Strategy:
-1. Check cache for detail selectors → apply with BS4 (zero AI cost)
-2. Crawl 3 sample detail pages
-3. Send samples to Haiku to learn CSS selectors (one cheap call per domain)
-4. Apply learned selectors to all remaining pages with BS4 (zero AI cost)
+Crawl ladder — cheapest viable path first:
+1. CURL-FIRST: fetch pages over plain HTTP (curl_cffi, parallel, no browser).
+   Extraction mode picked on samples: JSON-LD → cached selectors → learned
+   selectors → regex → merge. Falls through on hash-route URLs, JS shells,
+   blocked fetches, or when nothing validates.
+2. API fast-path: probe one page in a browser for a per-member JSON endpoint,
+   then fetch all members over HTTP.
+3. Playwright crawl (headed by default): navigate every page in a browser.
+   Selector learning/validation identical to the curl path.
 """
 
+import os
 import re
 import json
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 import random
 import ssl
 import urllib.request
-from playwright.sync_api import sync_playwright
+from _pw import sync_playwright, IS_PATCHRIGHT
 from bs4 import BeautifulSoup
+
+# Reuse Phase 2's TLS-fingerprinted HTTP fetcher (same pattern as
+# url_enumeration.py — additive import, does not modify Phase2Bot)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from Phase2Bot.page_fetcher import fetch_page  # noqa: E402
 
 from config import (
     DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX,
     DETAIL_SAMPLE_COUNT, DETAIL_URL_KEYWORDS,
     NETWORK_IDLE_TIMEOUT, EXTERNAL_SKIP_DOMAINS,
-    block_unnecessary_resources, launch_browser,
+    block_unnecessary_resources, launch_browser, new_stealth_page,
 )
 from llm import ask
-from html_parser import strip_junk, regex_extract_from_card, _merge_member_data, _LABEL_PREFIX_RE
+from html_parser import (
+    strip_junk, regex_extract_from_card, _merge_member_data, _LABEL_PREFIX_RE,
+    _PHONE_RE, _EMAIL_RE, extract_jsonld_members,
+)
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
 
 
@@ -650,18 +665,21 @@ def _detect_detail_api(sample_urls: list) -> dict | None:
 
     with sync_playwright() as playwright:
         browser = launch_browser(playwright)
-        page = browser.new_page()
-        try:
-            from playwright_stealth import Stealth
-            Stealth(
-                webgl_vendor=True,
-                webgl_renderer_override="Intel Iris OpenGL Engine",
-                webgl_vendor_override="Intel Inc.",
-                navigator_hardware_concurrency=True,
-                sec_ch_ua=True,
-            ).apply_stealth_sync(page)
-        except ImportError:
-            pass
+        page = new_stealth_page(browser)
+        # Stock-Playwright JS patches only — patchright applies its own and
+        # closes the Runtime.enable CDP leak the plugin can't touch.
+        if not IS_PATCHRIGHT:
+            try:
+                from playwright_stealth import Stealth
+                Stealth(
+                    webgl_vendor=True,
+                    webgl_renderer_override="Intel Iris OpenGL Engine",
+                    webgl_vendor_override="Intel Inc.",
+                    navigator_hardware_concurrency=True,
+                    sec_ch_ua=True,
+                ).apply_stealth_sync(page)
+            except ImportError:
+                pass
         block_unnecessary_resources(page)
         page.on("response", on_response)
 
@@ -787,6 +805,216 @@ def _fetch_all_via_api(api_pattern: dict, detail_urls: list) -> list:
 
 
 # ───────────────────────────────────────────
+#  CURL-FIRST CRAWL (no browser at all)
+# ───────────────────────────────────────────
+# Most detail pages are server-rendered: a TLS-fingerprinted HTTP fetch gets
+# the same HTML a browser would, 10-50x faster, and in parallel. The
+# Playwright path stays as the fallback for JS-rendered / blocked /
+# hash-route sites — "try curl, and only go headed when curl can't".
+
+_CURL_DETAIL_WORKERS = 6      # parallel fetches — same domain, stay polite
+_CURL_MIN_SUCCESS_RATE = 0.5  # below this, assume blocking → browser path
+
+
+def _fetch_detail_html(url: str) -> str | None:
+    """One curl_cffi fetch → HTML string, or None on failure/thin response."""
+    try:
+        soup, _ = fetch_page(url)
+    except Exception:
+        return None
+    if soup is None:
+        return None
+    html = str(soup)
+    return html if len(html) >= 500 else None
+
+
+def _has_contact_signal(html: str) -> bool:
+    """Cheap check that fetched HTML contains extractable contact content.
+    A JS shell or cookie wall has none — curl would be wasted on it."""
+    low = html.lower()
+    if "tel:" in low or "mailto:" in low or "itemprop" in low:
+        return True
+    return bool(_PHONE_RE.search(html) or _EMAIL_RE.search(html))
+
+
+def _jsonld_detail_member(html: str) -> dict | None:
+    """Extract ONE member from a detail page's JSON-LD, if present.
+    Returns the entity with the most populated fields, or None."""
+    try:
+        entities = extract_jsonld_members(html)
+    except Exception:
+        return None
+    if not entities:
+        return None
+    return max(entities, key=lambda m: sum(1 for v in m.values() if v))
+
+
+def _pick_curl_extraction_mode(sample_htmls: list, domain: str, cached) -> tuple:
+    """Choose how to extract from curl-fetched sample pages.
+
+    Returns (mode, selectors): mode ∈ {"jsonld", "selectors", "regex",
+    "merge"} — or (None, None) when nothing validates, meaning the caller
+    should fall back to the API-probe → Playwright ladder.
+    """
+    cache_key = f"detail_{domain}"
+
+    # 1. JSON-LD — free and CSS-proof. Require DISTINCT names across the
+    #    samples: a site-wide Organization blob (the directory describing
+    #    itself on every page) must not be mistaken for per-member data.
+    jsonld_members = [m for m in (_jsonld_detail_member(h) for h in sample_htmls) if m]
+    distinct = {m.get("company_name") for m in jsonld_members if m.get("company_name")}
+    if len(jsonld_members) >= 2 and len(distinct) >= 2 \
+            and is_detail_extraction_valid(jsonld_members):
+        print("  Curl detail crawl: per-member JSON-LD detected (zero AI cost)")
+        return "jsonld", None
+
+    # 2. Cached selectors. If they don't fit the CURL HTML, do NOT purge —
+    #    curl may simply see different markup than the browser does; the
+    #    browser path re-validates the cache against browser HTML itself.
+    if cached:
+        sample_members = [apply_detail_selectors(h, cached) for h in sample_htmls]
+        if is_detail_extraction_valid(sample_members):
+            return "selectors", cached
+        print("  Curl detail crawl: cached selectors don't fit curl HTML — deferring to browser")
+        return None, None
+
+    # 3. Learn selectors from the curl samples (one LLM call, cached).
+    selectors = {}
+    try:
+        selectors = learn_detail_selectors(sample_htmls, domain)
+    except Exception as e:
+        print(f"  Curl detail crawl: selector learning failed ({e})")
+    sample_members = ([apply_detail_selectors(h, selectors) for h in sample_htmls]
+                      if selectors else [])
+    if selectors and is_detail_extraction_valid(sample_members):
+        return "selectors", selectors
+
+    # 4. Regex / merge fallbacks — same ladder the browser path uses.
+    regex_members = [regex_extract_from_detail_html(h, domain) for h in sample_htmls]
+    if is_detail_extraction_valid(regex_members):
+        return "regex", None
+    if selectors and sample_members:
+        merged = [_merge_member_data(s, r) for s, r in zip(sample_members, regex_members)]
+        if is_detail_extraction_valid(merged):
+            return "merge", selectors
+
+    # Selectors learned from curl HTML failed every mode — remove them so
+    # the browser path re-learns from browser HTML instead of trusting them.
+    if selectors and selectors.get("company_name"):
+        delete_cached_selectors(cache_key)
+    print("  Curl detail crawl: no extraction mode validated on curl HTML — falling back")
+    return None, None
+
+
+def _try_curl_detail_crawl(detail_urls: list, domain: str) -> list | None:
+    """Crawl detail pages over plain HTTP — no browser at all.
+
+    Returns the member list on success, or None to fall back to the
+    API-probe → Playwright ladder. Never returns an empty list.
+    """
+    total = len(detail_urls)
+    if any("#" in u for u in detail_urls[:5]):
+        print("  Curl detail crawl: hash-route URLs (SPA) — needs a browser, skipping")
+        return None
+
+    cached = get_cached_selectors(f"detail_{domain}")
+
+    # --- Probe samples ---
+    sample_urls = detail_urls[:DETAIL_SAMPLE_COUNT]
+    print(f"  Curl detail crawl: probing {len(sample_urls)} sample page(s) via curl_cffi...")
+    sample_pairs = []
+    for url in sample_urls:
+        html = _fetch_detail_html(url)
+        if html:
+            sample_pairs.append((url, html))
+    if len(sample_pairs) < 2:
+        print(f"  Curl detail crawl: {len(sample_pairs)}/{len(sample_urls)} samples "
+              f"fetched — falling back to browser")
+        return None
+    sample_htmls = [h for _, h in sample_pairs]
+    if sum(1 for h in sample_htmls if _has_contact_signal(h)) < 2:
+        print("  Curl detail crawl: samples carry no contact signal "
+              "(JS-rendered page?) — falling back to browser")
+        return None
+
+    mode, selectors = _pick_curl_extraction_mode(sample_htmls, domain, cached)
+    if mode is None:
+        return None
+
+    # --- Bulk fetch (parallel; fetch_page rate-limits per domain) ---
+    fetched = dict(sample_pairs)
+    remaining = [u for u in detail_urls if u not in fetched]
+    if remaining:
+        print(f"  Curl detail crawl: mode={mode} — fetching {len(remaining)} "
+              f"remaining page(s) with {_CURL_DETAIL_WORKERS} workers...")
+    failed: list[str] = []
+    if remaining:
+        with ThreadPoolExecutor(max_workers=_CURL_DETAIL_WORKERS) as pool:
+            futures = {pool.submit(_fetch_detail_html, u): u for u in remaining}
+            done_n = 0
+            for fut in as_completed(futures):
+                u = futures[fut]
+                try:
+                    html = fut.result()
+                except Exception:
+                    html = None
+                if html:
+                    fetched[u] = html
+                else:
+                    failed.append(u)
+                done_n += 1
+                if done_n % 50 == 0 or done_n == len(remaining):
+                    print(f"    Fetched {done_n}/{len(remaining)} ({len(failed)} failed)")
+
+    # Retry failures once, serially — transient 403/429s often clear after a
+    # pause. Only worth doing when the site is basically cooperating.
+    if failed and (len(fetched) / total) >= _CURL_MIN_SUCCESS_RATE:
+        print(f"  Curl detail crawl: retrying {len(failed)} failed page(s) serially...")
+        still_failed = []
+        for u in failed:
+            time.sleep(1.0)
+            html = _fetch_detail_html(u)
+            if html:
+                fetched[u] = html
+            else:
+                still_failed.append(u)
+        failed = still_failed
+
+    success_rate = (len(fetched) / total) if total else 0.0
+    if success_rate < _CURL_MIN_SUCCESS_RATE:
+        print(f"  Curl detail crawl: only {len(fetched)}/{total} pages fetched "
+              f"({success_rate:.0%}) — falling back to browser")
+        return None
+
+    # --- Extract, order-preserving ---
+    members = []
+    for u in detail_urls:
+        html = fetched.get(u)
+        if not html:
+            continue
+        if mode == "jsonld":
+            member = _jsonld_detail_member(html) or regex_extract_from_detail_html(html, domain)
+        elif mode == "regex":
+            member = regex_extract_from_detail_html(html, domain)
+        elif mode == "merge":
+            member = _merge_member_data(apply_detail_selectors(html, selectors),
+                                        regex_extract_from_detail_html(html, domain))
+        else:
+            member = apply_detail_selectors(html, selectors)
+        if member and member.get("company_name"):
+            members.append(member)
+
+    if not members:
+        print("  Curl detail crawl: fetched pages but extracted 0 members — "
+              "falling back to browser")
+        return None
+
+    print(f"  Curl detail crawl complete: {len(members)}/{total} members — "
+          f"no browser needed")
+    return members
+
+
+# ───────────────────────────────────────────
 #  MAIN CRAWL ENTRY POINT
 # ───────────────────────────────────────────
 
@@ -808,6 +1036,24 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
     if not detail_urls:
         return []
 
+    total = len(detail_urls)
+    print(f"\n  Starting detail page crawl ({total} pages)...")
+
+    # --- Cheapest path: plain HTTP crawl via curl_cffi (no browser) ---
+    # Runs before the API probe because a successful curl crawl needs no
+    # browser at all, while the probe costs a full Playwright launch.
+    # Hash-route URLs skip instantly and land on the API probe, which is
+    # exactly the path that handles them (MembershipWorks pattern).
+    try:
+        curl_members = _try_curl_detail_crawl(detail_urls, domain)
+    except Exception as e:
+        print(f"  Curl detail crawl error (non-fatal, using browser): {e}")
+        curl_members = None
+    if curl_members is not None:
+        return curl_members
+
+    # Read the cache AFTER the curl attempt — it may have purged selectors
+    # that failed validation on curl HTML.
     cache_key = f"detail_{domain}"
     cached = get_cached_selectors(cache_key)
 
@@ -815,9 +1061,6 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
     sample_htmls = []
     use_regex_fallback = False
     use_merge_mode = False
-
-    total = len(detail_urls)
-    print(f"\n  Starting detail page crawl ({total} pages)...")
 
     # --- Fast path: detect API endpoints behind detail pages ---
     # Navigate to one detail page with a network listener. If the SPA makes
@@ -835,18 +1078,21 @@ def crawl_detail_pages(detail_urls: list, domain: str) -> list:
 
     with sync_playwright() as playwright:
         browser = launch_browser(playwright)
-        page = browser.new_page()
-        try:
-            from playwright_stealth import Stealth
-            Stealth(
-                webgl_vendor=True,
-                webgl_renderer_override="Intel Iris OpenGL Engine",
-                webgl_vendor_override="Intel Inc.",
-                navigator_hardware_concurrency=True,
-                sec_ch_ua=True,
-            ).apply_stealth_sync(page)
-        except ImportError:
-            pass
+        page = new_stealth_page(browser)
+        # Stock-Playwright JS patches only — patchright applies its own and
+        # closes the Runtime.enable CDP leak the plugin can't touch.
+        if not IS_PATCHRIGHT:
+            try:
+                from playwright_stealth import Stealth
+                Stealth(
+                    webgl_vendor=True,
+                    webgl_renderer_override="Intel Iris OpenGL Engine",
+                    webgl_vendor_override="Intel Inc.",
+                    navigator_hardware_concurrency=True,
+                    sec_ch_ua=True,
+                ).apply_stealth_sync(page)
+            except ImportError:
+                pass
         block_unnecessary_resources(page)
 
         def _navigate_detail(url):

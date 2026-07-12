@@ -5,7 +5,7 @@ Handles: AI-based multi-depth directory URL discovery, smart search strategy,
 """
 
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 from debug import debug
 from llm import ask
 from config import (
@@ -16,6 +16,7 @@ from config import (
     RESULT_COUNT_SELECTORS,
     RESULT_LINK_SELECTORS, NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
     EXTERNAL_SKIP_DOMAINS, CATEGORY_URL_KEYWORDS, CATEGORY_SKIP_VISIBLE_THRESHOLD,
+    CATEGORY_MAX_LINKS,
     DIRECTORY_SEARCH_POSITIVE_CONTEXT, DIRECTORY_SEARCH_NEGATIVE_CONTEXT,
     DIRECTORY_SEARCH_BUTTON_TEXTS, NON_DIRECTORY_BUTTON_TEXTS,
 )
@@ -190,11 +191,16 @@ def find_directory_url(page, link: str, intent: dict | None = None) -> str:
 
     Returns the URL of the page we ended up on.
     """
-    page.goto(link)
-    try:
-        page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-    except:
-        pass
+    # Skip the load if the caller already navigated here (browser.py's Step-0
+    # anti-bot gate loads `link` first). Avoids a redundant reload and the
+    # duplicate response capture that comes with it. Falls back to goto when
+    # called with a blank/other page.
+    if page.url.rstrip("/") != link.rstrip("/"):
+        page.goto(link)
+        try:
+            page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+        except:
+            pass
 
     current_url = link
     visited = set()
@@ -1343,18 +1349,15 @@ def trigger_search(page, results_list: list,
     best_visible = 0
     best_query = ""
 
-    # ─────────────────────────────────────────────────
-    #  STEP 0: INTENT-FIRST (aggregator + intent only)
-    # ─────────────────────────────────────────────────
-    # Cross-vertical aggregators (SuperPages, YellowPages, BBB, ...) return
-    # every industry on blank/wildcard searches. When Phase 0 flagged this
-    # URL as an aggregator AND we have a user intent, try the industry name
-    # FIRST so we capture only the vertical the user asked for.
-    #
-    # Fall through to the existing wildcard chain if intent queries return
-    # too few results (e.g. the aggregator doesn't recognize the term, or
-    # there genuinely are no matches in this geography).
-    if is_aggregator and intent:
+    def run_intent_queries(label: str) -> bool:
+        """Type the user's industry terms (canonical + up to 3 aliases) into
+        the search box. Returns True when the results are usable (>=3 visible
+        or STOP_THRESHOLD hit) — the caller should stop searching. Updates
+        best_visible/best_query so the final re-execution still works when
+        the intent chain falls through."""
+        nonlocal best_visible, best_query
+        if not intent:
+            return False
         canonical = (intent.get("industry_canonical") or "").strip()
         aliases = [
             (a or "").strip()
@@ -1368,31 +1371,51 @@ def trigger_search(page, results_list: list,
             if q and q.lower() not in seen_lower:
                 intent_queries.append(q)
                 seen_lower.add(q.lower())
+        if not intent_queries:
+            return False
 
-        if intent_queries:
-            print(f"  Aggregator + intent: trying {len(intent_queries)} intent queries first ({intent_queries})")
-            for iq in intent_queries:
-                if not go_back_to_form():
-                    print(f"  Could not return to form, stopping intent-first chain")
-                    break
-                print(f"  Trying intent query '{iq}'...")
-                visible = execute_query(iq)
-                if visible < 0:
-                    print(f"  Intent query '{iq}' failed, trying next")
-                    continue
-                if visible > best_visible:
-                    best_visible = visible
-                    best_query = iq
-                if visible >= STOP_THRESHOLD:
-                    print(f"  Intent query '{iq}': {visible} visible — stopping (intent-narrowed)")
-                    return True
-
-            # If intent narrowed to something usable, stop here — wildcards
-            # would re-pollute the result set with off-vertical records.
-            if best_visible >= 3:
-                print(f"  Intent queries best: '{best_query}' ({best_visible} visible) — using, skipping wildcards")
+        print(f"  {label}: trying {len(intent_queries)} intent queries ({intent_queries})")
+        for iq in intent_queries:
+            if not go_back_to_form():
+                print(f"  Could not return to form, stopping intent chain")
+                break
+            print(f"  Trying intent query '{iq}'...")
+            visible = execute_query(iq)
+            if visible < 0:
+                print(f"  Intent query '{iq}' failed, trying next")
+                continue
+            if visible > best_visible:
+                best_visible = visible
+                best_query = iq
+            if visible >= STOP_THRESHOLD:
+                print(f"  Intent query '{iq}': {visible} visible — stopping (intent-narrowed)")
                 return True
-            print(f"  Intent queries yielded only {best_visible} visible — falling through to wildcard chain")
+
+        # Usable = an intent query put >=3 results on screen (the same bar
+        # the rest of trigger_search uses for "the search worked").
+        if best_visible >= 3:
+            print(f"  Intent queries best: '{best_query}' ({best_visible} visible) — using")
+            return True
+        print(f"  Intent queries yielded only {best_visible} visible — not usable")
+        return False
+
+    # ─────────────────────────────────────────────────
+    #  STEP 0: INTENT-FIRST (aggregator + intent only)
+    # ─────────────────────────────────────────────────
+    # Cross-vertical aggregators (SuperPages, YellowPages, BBB, ...) return
+    # every industry on blank/wildcard searches. When Phase 0 flagged this
+    # URL as an aggregator AND we have a user intent, try the industry name
+    # FIRST so we capture only the vertical the user asked for — stopping
+    # there when usable, because wildcards would re-pollute the result set
+    # with off-vertical records.
+    #
+    # Fall through to the existing wildcard chain if intent queries return
+    # too few results (e.g. the aggregator doesn't recognize the term, or
+    # there genuinely are no matches in this geography).
+    if is_aggregator and intent:
+        if run_intent_queries("Aggregator + intent"):
+            return True
+        print(f"  Falling through to wildcard chain")
 
     # ─────────────────────────────────────────────────
     #  STEP 1: Search "" (blank) — most sites return all results
@@ -1401,7 +1424,13 @@ def trigger_search(page, results_list: list,
     visible_blank = execute_query("")
 
     if visible_blank < 0:
-        # Blank failed — try "a" as fallback
+        # Blank submit rejected outright (strict engines: validation,
+        # minimum length). In Agent mode the user's industry terms are the
+        # one query family such a site is guaranteed to understand — try
+        # them before degrading to "a". (Aggregators already ran them.)
+        if intent and not is_aggregator and run_intent_queries("Intent fallback"):
+            return True
+        # Try "a" as the last resort
         print(f"  Blank failed, trying 'a'...")
         if go_back_to_form():
             execute_query("a")
@@ -1499,6 +1528,20 @@ def trigger_search(page, results_list: list,
         else:
             print(f"  '{strat_name}': ~{visible} visible (no counter)")
 
+    # ─────────────────────────────────────────────────
+    #  STEP 4.5: Intent terms as a last resort (Agent mode)
+    # ─────────────────────────────────────────────────
+    # Complicated search engines reject blank/wildcard queries (validation,
+    # no "show all" semantics). When the whole wildcard chain produced
+    # nothing usable, the user's industry terms are the one query family the
+    # site is guaranteed to understand. Wildcards-first stays deliberate: a
+    # working "%" fetches a superset of the intent subset, so sites where
+    # wildcards succeed are untouched. Aggregators already ran these FIRST.
+    if intent and not is_aggregator and best_visible < 3 and best_count == 0:
+        print(f"  Wildcards produced nothing usable — trying intent terms")
+        if run_intent_queries("Intent fallback"):
+            return True
+
     # --- Re-execute the best query so the page shows the most results ---
     # This ensures the HTML capture in browser.py gets the best page,
     # not the last strategy which may have returned fewer results.
@@ -1576,7 +1619,9 @@ def try_view_all(page) -> bool:
 
 # --- CATEGORY DETECTION ---
 
-def detect_category_links(page) -> list:
+def detect_category_links(page, child_hub_of: str | None = None,
+                          min_links: int = 3, ignore_visible: bool = False,
+                          top_groups: int = 1) -> list:
     """Detect category/browse links on a directory landing page.
 
     Looks for groups of content-area links that share a URL prefix template
@@ -1587,16 +1632,34 @@ def detect_category_links(page) -> list:
     - Skips links inside nav/header/footer/breadcrumbs
     - Skips single characters (alphabet filters) and pure numbers (pagination)
     - Skips external domains
-    - Requires 3-50 links with unique text in the same URL group
+    - Requires min_links..CATEGORY_MAX_LINKS links with unique text per group
     - Only triggers when members aren't already visible on page
+
+    Args:
+        child_hub_of: When set (to the current page URL), hub mode: accept
+            ONLY path-based groups that are direct children of that URL's own
+            path (/store-directory/mn → /store-directory/mn/<city>). Used by
+            the pre-search listing-hub check in browser.py — the child-of-
+            current-path requirement is what keeps busy nav/footer link
+            farms from ever qualifying.
+        min_links: Minimum links for a group to count (default 3; the hub
+            check passes CHILD_HUB_MIN_LINKS for a much stricter bar).
+        ignore_visible: Skip the members-already-visible early return. The
+            intent sub-page crawler sets this — a weak search can leave a few
+            junk cards on screen while the real data sits behind sub-pages.
+        top_groups: Return the merged links of the N best-scoring groups
+            instead of only the winner. A page often carries BOTH a category
+            group and a city group; the intent crawler wants candidates from
+            all of them. Default 1 preserves the original single-group pick.
 
     Returns:
         List of {"text": str, "href": str} dicts, or [] if none found.
     """
     # Check if members are already visible — if so, no need for categories
-    visible = count_visible_results(page)
-    if visible >= CATEGORY_SKIP_VISIBLE_THRESHOLD:
-        return []
+    if not ignore_visible:
+        visible = count_visible_results(page)
+        if visible >= CATEGORY_SKIP_VISIBLE_THRESHOLD:
+            return []
 
     try:
         links = page.eval_on_selector_all("a[href]", """els => els.map(el => ({
@@ -1654,7 +1717,7 @@ def detect_category_links(page) -> list:
         seen.add(href)
         filtered.append({"text": text, "href": href})
 
-    if len(filtered) < 3:
+    if len(filtered) < min_links:
         return []
 
     # Group links by URL prefix template
@@ -1676,12 +1739,26 @@ def detect_category_links(page) -> list:
 
         groups.setdefault(prefix, []).append(link)
 
-    # Score and pick the best group
-    best_group = None
-    best_score = 0
+    # Hub mode: precompute the current page's own path for the child check.
+    current_path = ""
+    if child_hub_of:
+        try:
+            current_path = unquote(urlparse(child_hub_of).path).rstrip("/")
+        except Exception:
+            return []
+
+    # Score the groups
+    scored_groups: list[tuple[int, list]] = []
     for prefix, group_links in groups.items():
         count = len(group_links)
-        if count < 3 or count > 50:
+        if count < min_links or count > CATEGORY_MAX_LINKS:
+            continue
+
+        # Hub mode: only path-groups that are direct children of the current
+        # page's own path qualify (/store-directory/mn → …/mn/<city>).
+        # Query-param groups and link groups from elsewhere never do.
+        if child_hub_of and (
+                "?" in prefix or unquote(prefix).rstrip("/") != current_path):
             continue
 
         # Category links must have mostly unique text (not duplicate labels)
@@ -1702,20 +1779,26 @@ def detect_category_links(page) -> list:
         if avg_len < 30:
             score += 10
 
-        if score > best_score:
-            best_score = score
-            best_group = group_links
+        scored_groups.append((score, group_links))
 
-    if not best_group:
+    if not scored_groups:
         return []
 
-    # Deduplicate by href, preserve order
+    # Best group(s) first. sort() is stable, so ties keep insertion order —
+    # top_groups=1 picks the exact group the old single-winner loop did.
+    scored_groups.sort(key=lambda sg: sg[0], reverse=True)
+    kept = scored_groups[:max(1, top_groups)]
+    best_score = kept[0][0]
+
+    # Deduplicate by href across the kept groups, preserve order
     seen_hrefs: set[str] = set()
     result = []
-    for link in best_group:
-        if link["href"] not in seen_hrefs:
-            seen_hrefs.add(link["href"])
-            result.append(link)
+    for _, group_links in kept:
+        for link in group_links:
+            if link["href"] not in seen_hrefs:
+                seen_hrefs.add(link["href"])
+                result.append(link)
 
-    print(f"  Detected {len(result)} category links (score={best_score})")
+    print(f"  Detected {len(result)} category links "
+          f"({len(kept)} group(s), best score={best_score})")
     return result

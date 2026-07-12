@@ -40,6 +40,12 @@ def intent_from_plan(plan: dict | None) -> dict | None:
     if not plan or not plan.get("is_actionable"):
         return None
 
+    # "Scrape everything" goals carry no industry to narrow by — returning
+    # None makes Phase 1 run the plain full-coverage flow (wildcard search,
+    # full category iteration, no record filter), same as Playground auto.
+    if (plan.get("coverage") or "targeted").lower() == "all":
+        return None
+
     industry = plan.get("industry") or {}
     canonical = (industry.get("canonical") or "").strip()
     if not canonical:

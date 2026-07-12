@@ -1,32 +1,16 @@
 import { useState, useRef, useEffect } from 'react'
 import {
-  Sparkles, User, CheckCircle2, Loader2, XCircle,
+  Search, User, Check, Loader2, X,
   FileJson, FileSpreadsheet, Download,
   Folder, Globe, ChevronDown, ChevronRight,
 } from 'lucide-react'
-
-// Category → color mapping. Mirrors the Playground OutputTerminal so the
-// Agent's embedded terminal feels visually consistent with the rest of the app.
-const CAT_COLORS = {
-  INPUT: '#111',
-  BROWSER: '#6C5CE7',
-  NAV: '#2563EB',
-  SEARCH: '#0891B2',
-  SCROLL: '#7C3AED',
-  CAPTURE: '#16A34A',
-  PARSE: '#6C5CE7',
-  DETAIL: '#059669',
-  CLEAN: '#D97706',
-  LOG: '#9CA3AF',
-  SYSTEM: '#6B7280',
-  ERROR: '#DC2626',
-}
+import { lineStyle } from '../../lib/terminalTheme'
 
 
 function AgentAvatar() {
   return (
-    <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gray-100 text-accent">
-      <Sparkles size={13} />
+    <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center bg-black text-white">
+      <Search size={13} />
     </div>
   )
 }
@@ -36,16 +20,16 @@ function StatusStep({ step }) {
   let Icon = Loader2
   let iconClass = 'text-gray-400 animate-spin'
   if (step.status === 'done') {
-    Icon = CheckCircle2
-    iconClass = 'text-accent'
+    Icon = Check
+    iconClass = 'text-black'
   } else if (step.status === 'error') {
-    Icon = XCircle
-    iconClass = 'text-red-500'
+    Icon = X
+    iconClass = 'text-black'
   }
   return (
     <div className="flex items-start gap-2 text-xs leading-relaxed">
       <Icon size={13} className={`mt-0.5 shrink-0 ${iconClass}`} />
-      <span className={step.status === 'error' ? 'text-red-600' : 'text-gray-600'}>
+      <span className={step.status === 'error' ? 'font-medium text-black' : 'text-gray-600'}>
         {step.label}
       </span>
     </div>
@@ -55,7 +39,7 @@ function StatusStep({ step }) {
 
 function StatusBubble({ steps }) {
   return (
-    <div className="flex flex-col gap-1.5 rounded-2xl rounded-tl-md bg-gray-50 border border-gray-100 px-4 py-3 max-w-[80%]">
+    <div className="flex max-w-[80%] flex-col gap-1.5 border border-hairline bg-white px-4 py-3">
       {steps.length === 0 ? (
         <span className="text-xs text-gray-400">Thinking...</span>
       ) : (
@@ -215,7 +199,7 @@ function SourcesBubble({
   const selectedCount = selected.size
 
   return (
-    <div className="flex flex-col gap-2.5 rounded-2xl rounded-tl-md bg-gray-50 border border-gray-100 px-4 py-3 max-w-[85%]">
+    <div className="flex max-w-[85%] flex-col gap-2.5 border border-hairline bg-white px-4 py-3">
       <div className="text-sm text-gray-700">
         {hasAny
           ? <>I found{' '}
@@ -260,7 +244,7 @@ function SourcesBubble({
           </button>
           <button
             onClick={() => onCancel && onCancel()}
-            className="rounded-lg border border-gray-200 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white transition-colors"
+            className="border border-black px-3 py-2 text-xs font-medium text-black transition-colors hover:bg-black hover:text-white"
           >
             Cancel
           </button>
@@ -277,7 +261,7 @@ function ScopeBubble({ question, options = [], answered = false, chosenLabel, on
   const inclusiveLabel = options[1] || 'Anyone who does it'
 
   return (
-    <div className="flex flex-col gap-2.5 rounded-2xl rounded-tl-md bg-gray-50 border border-gray-100 px-4 py-3 max-w-[85%]">
+    <div className="flex max-w-[85%] flex-col gap-2.5 border border-hairline bg-white px-4 py-3">
       <div className="text-sm text-gray-700">{question}</div>
       {answered ? (
         <div className="text-xs text-gray-500">
@@ -293,7 +277,7 @@ function ScopeBubble({ question, options = [], answered = false, chosenLabel, on
           </button>
           <button
             onClick={() => onChoose && onChoose('inclusive', inclusiveLabel)}
-            className="flex-1 rounded-lg border border-gray-200 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white transition-colors"
+            className="flex-1 border border-black px-3 py-2 text-xs font-medium text-black transition-colors hover:bg-black hover:text-white"
           >
             {inclusiveLabel}
           </button>
@@ -313,17 +297,12 @@ function TerminalBubble({ lines = [], isComplete = false, outputFiles = [] }) {
   }, [lines])
 
   return (
-    <div className="flex flex-col overflow-hidden rounded-xl border border-gray-200 bg-[#FAFAFA] max-w-[85%]">
-      {/* Title bar — matches Playground OutputTerminal styling */}
-      <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
-        <div className="flex items-center gap-2">
-          <div className="h-2 w-2 rounded-full bg-gray-300" />
-          <div className="h-2 w-2 rounded-full bg-gray-300" />
-          <div className="h-2 w-2 rounded-full bg-gray-300" />
-          <span className="ml-2 text-[11px] text-gray-400 font-mono">trawlbase ~ scraping</span>
-        </div>
+    <div className="flex max-w-[85%] flex-col overflow-hidden border border-hairline bg-white">
+      {/* Title bar — matches the Playground OutputTerminal */}
+      <div className="flex items-center justify-between border-b border-hairline px-3 py-2">
+        <span className="font-mono text-[11px] text-gray-500">trawlbase — scraping</span>
         {isComplete && (
-          <span className="text-[10px] text-accent font-mono">done</span>
+          <span className="font-mono text-[10px] font-medium text-black">done</span>
         )}
       </div>
 
@@ -335,12 +314,12 @@ function TerminalBubble({ lines = [], isComplete = false, outputFiles = [] }) {
           lines.map((line, i) => (
             <div
               key={i}
-              style={{ color: CAT_COLORS[line.category] || '#6B7280' }}
+              style={lineStyle(line.category)}
               className="whitespace-pre-wrap"
             >
               {line.text}
               {i === lines.length - 1 && !isComplete && line.text && (
-                <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-accent align-middle" />
+                <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-black align-middle" />
               )}
             </div>
           ))
@@ -383,6 +362,8 @@ function ResultBubble({ result }) {
     directories_scraped = 0,
     per_site = [],
     stats = {},
+    final_json = null,
+    final_xlsx = null,
   } = result
   const rejected = stats.rejected_count || 0
   const totalEnriched = per_site.reduce((acc, s) => acc + (s.enriched || 0), 0)
@@ -402,6 +383,37 @@ function ResultBubble({ result }) {
       {rejected > 0 && (
         <div className="text-[11px] text-gray-400">
           {rejected} candidate{rejected === 1 ? '' : 's'} rejected during discovery.
+        </div>
+      )}
+      {final_json && (
+        <div className="mt-1 flex items-center gap-2 border-t border-accent-100 pt-2">
+          <Download size={11} className="text-gray-400 shrink-0" />
+          <span className="flex-1 truncate text-[11px] text-gray-600 font-mono">
+            Final dataset — cleaned &amp; deduped
+          </span>
+          <a
+            href={`/download/${final_json}?format=json`}
+            download
+            className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-0.5 text-[10px] text-gray-600 hover:bg-gray-50"
+          >
+            <FileJson size={10} /> JSON
+          </a>
+          <a
+            href={`/download/${final_json}?format=csv`}
+            download
+            className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-0.5 text-[10px] text-gray-600 hover:bg-gray-50"
+          >
+            <FileSpreadsheet size={10} /> CSV
+          </a>
+          {final_xlsx && (
+            <a
+              href={`/download/${final_xlsx}`}
+              download
+              className="inline-flex items-center gap-1 rounded-md bg-accent px-2 py-0.5 text-[10px] text-white hover:bg-accent-600"
+            >
+              <FileSpreadsheet size={10} /> Excel
+            </a>
+          )}
         </div>
       )}
     </div>
@@ -477,10 +489,10 @@ export default function ChatMessage({ message }) {
   if (message.type === 'error') {
     return (
       <div className="flex gap-3 animate-fade-in" style={{ animationDelay: '0.05s' }}>
-        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-50 text-red-500">
-          <XCircle size={13} />
+        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center border border-black bg-white text-black">
+          <X size={13} />
         </div>
-        <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-red-50 border border-red-100 px-4 py-2.5 text-sm leading-relaxed text-red-700">
+        <div className="max-w-[80%] border border-black bg-white px-4 py-2.5 text-sm font-medium leading-relaxed text-black">
           {message.text}
         </div>
       </div>
@@ -494,17 +506,17 @@ export default function ChatMessage({ message }) {
       style={{ animationDelay: '0.05s' }}
     >
       <div
-        className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${
-          isUser ? 'bg-accent text-white' : 'bg-gray-100 text-accent'
+        className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center ${
+          isUser ? 'border border-black bg-white text-black' : 'bg-black text-white'
         }`}
       >
-        {isUser ? <User size={13} /> : <Sparkles size={13} />}
+        {isUser ? <User size={13} /> : <Search size={13} />}
       </div>
       <div
-        className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+        className={`max-w-[80%] px-4 py-2.5 text-sm leading-relaxed ${
           isUser
-            ? 'bg-accent text-white rounded-tr-md'
-            : 'bg-gray-100 text-gray-700 rounded-tl-md'
+            ? 'bg-black text-white'
+            : 'border border-hairline bg-white text-gray-700'
         }`}
       >
         {message.text}

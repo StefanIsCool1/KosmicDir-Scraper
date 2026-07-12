@@ -12,12 +12,16 @@ Covers:
   Fix 5  deterministic location filter
   QW     member-shaped pagination gate, JSON-LD tier, launch helper,
          login_callback plumbing
+  Eff    curl-first detail crawl (selectors / JSON-LD / fallback ladders),
+         URL-template pagination over HTTP, O(n) Layer-B ancestor dedup
 """
 
 import json
 import os
+import re as _re
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ["SCRAPER_HEADLESS"] = "1"  # fixture tests never need a window
 
@@ -449,6 +453,219 @@ def test_plumbing_signatures():
 
 
 # ────────────────────────────────────────────────────────────────────
+#  Efficiency pass — curl-first detail crawl, URL pagination, dedup
+# ────────────────────────────────────────────────────────────────────
+
+def _start_server(handler_cls):
+    """Serve fixtures over real HTTP on an ephemeral port (curl_cffi needs
+    a live server — it can't fetch file:// URLs)."""
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv, srv.server_address[1]
+
+
+class _QuietHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send_html(self, body: str):
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class _SelectorDetailHandler(_QuietHandler):
+    """Server-rendered detail pages — the classic chamber-profile shape."""
+    def do_GET(self):
+        m = _re.match(r"^/member/(\d+)$", self.path)
+        if not m:
+            self.send_response(404)
+            self.end_headers()
+            return
+        i = int(m.group(1))
+        self._send_html(f"""<html><head><title>Member {i}</title></head><body>
+          <div id="profile">
+            <h1>Member Co {i:02d}</h1>
+            <p class="ph">Phone: (206) 555-9{i:03d}</p>
+            <a href="mailto:m{i}@example.com">Email us</a>
+            <p>{'profile filler text ' * 40}</p>
+          </div></body></html>""")
+
+
+class _JsonLdDetailHandler(_QuietHandler):
+    """Detail pages whose data lives in JSON-LD (modern platform shape)."""
+    def do_GET(self):
+        m = _re.match(r"^/member/(\d+)$", self.path)
+        if not m:
+            self.send_response(404)
+            self.end_headers()
+            return
+        i = int(m.group(1))
+        blob = json.dumps({
+            "@context": "https://schema.org", "@type": "LocalBusiness",
+            "name": f"LD Company {i:02d}", "telephone": f"(206) 555-8{i:03d}",
+            "address": {"streetAddress": f"{i} Main St", "addressLocality": "Seattle",
+                        "addressRegion": "WA", "postalCode": "98101"},
+        })
+        self._send_html(
+            f'<html><head><script type="application/ld+json">{blob}</script></head>'
+            f'<body><div>Profile page {i}. {"pad " * 100}</div></body></html>')
+
+
+class _JsShellDetailHandler(_QuietHandler):
+    """SPA shell — no server-rendered content at all."""
+    def do_GET(self):
+        self._send_html(
+            '<html><body><div id="root"></div>'
+            f'<div>{"lorem ipsum dolor sit amet " * 40}</div></body></html>')
+
+
+class _PaginatedListHandler(_QuietHandler):
+    """Listing at /list?page=N (1..4), classic query-param pagination."""
+    def do_GET(self):
+        from urllib.parse import urlparse as _up, parse_qs as _pq
+        u = _up(self.path)
+        if u.path != "/list":
+            self.send_response(404)
+            self.end_headers()
+            return
+        n = min(int(_pq(u.query).get("page", ["1"])[0] or 1), 4)
+        rows = "".join(
+            f'<div class="result-item">Page{n} Member Co {i:02d} — (206) 555-4{n}{i:02d}</div>'
+            for i in range(6))
+        pager = "".join(f'<a href="/list?page={k}">{k}</a>' for k in range(1, 5))
+        self._send_html(
+            f"<html><head><title>Member Directory</title></head><body>"
+            f"<h1>Member directory listing results</h1>{rows}"
+            f"<div class='pager'>{pager}</div></body></html>")
+
+
+class _ParamIgnoredHandler(_QuietHandler):
+    """Pathological case: pagination links exist but ?page= is ignored."""
+    def do_GET(self):
+        rows = "".join(
+            f'<div class="result-item">Member Co {i:02d} — (206) 555-60{i:02d}</div>'
+            for i in range(6))
+        pager = "".join(f'<a href="/ignore?page={k}">{k}</a>' for k in range(1, 5))
+        self._send_html(
+            f"<html><body><h1>Member directory listing</h1>{rows}{pager}</body></html>")
+
+
+def _patch_detail_cache(dc):
+    """Patch detail_crawler's cache + LLM seams; returns a restore fn."""
+    real = (dc.ask, dc.get_cached_selectors, dc.set_cached_selectors,
+            dc.delete_cached_selectors)
+
+    def restore():
+        (dc.ask, dc.get_cached_selectors, dc.set_cached_selectors,
+         dc.delete_cached_selectors) = real
+    dc.get_cached_selectors = lambda k: None
+    dc.set_cached_selectors = lambda k, s: None
+    dc.delete_cached_selectors = lambda k: None
+    return restore
+
+
+def test_curl_detail_crawl_selectors():
+    print("\n[Eff] curl-first detail crawl — learned-selector mode")
+    import detail_crawler as dc
+
+    srv, port = _start_server(_SelectorDetailHandler)
+    urls = [f"http://127.0.0.1:{port}/member/{i}" for i in range(10)]
+    canned = json.dumps({
+        "company_name": "h1", "phone": "p.ph", "description": None,
+        "category": None, "website": None, "fax": None,
+        "street_address": None, "mailing_address": None,
+        "contact_name": None, "contact_email": None,
+    })
+    restore = _patch_detail_cache(dc)
+    calls = []
+    dc.ask = lambda p, max_tokens=1000: (calls.append(1) or canned)
+    try:
+        members = dc._try_curl_detail_crawl(urls, "curltest_selectors")
+    finally:
+        restore()
+        srv.shutdown()
+
+    check("curl crawl succeeded without a browser",
+          members is not None and len(members) == 10,
+          f"got {len(members) if members else members}")
+    if members:
+        check("names extracted", members[0]["company_name"] == "Member Co 00",
+              repr(members[0]["company_name"]))
+        check("phones extracted (label stripped)",
+              members[0]["phone"] == "(206) 555-9000", repr(members[0]["phone"]))
+    check("exactly one LLM call for the whole crawl", len(calls) == 1,
+          f"calls={len(calls)}")
+
+
+def test_curl_detail_crawl_jsonld():
+    print("\n[Eff] curl-first detail crawl — JSON-LD mode (zero LLM)")
+    import detail_crawler as dc
+
+    srv, port = _start_server(_JsonLdDetailHandler)
+    urls = [f"http://127.0.0.1:{port}/member/{i}" for i in range(8)]
+    restore = _patch_detail_cache(dc)
+    dc.ask = lambda p, max_tokens=1000: (_ for _ in ()).throw(
+        AssertionError("LLM must not be called in JSON-LD mode"))
+    try:
+        members = dc._try_curl_detail_crawl(urls, "curltest_jsonld")
+    finally:
+        restore()
+        srv.shutdown()
+
+    check("JSON-LD mode extracted all members, zero LLM calls",
+          members is not None and len(members) == 8,
+          f"got {len(members) if members else members}")
+    if members:
+        check("JSON-LD fields mapped",
+              members[0]["company_name"] == "LD Company 00"
+              and members[0]["phone"] == "(206) 555-8000"
+              and members[0]["street_address"] == "0 Main St, Seattle, WA, 98101",
+              repr(members[0]))
+
+
+def test_curl_detail_crawl_fallbacks():
+    print("\n[Eff] curl-first detail crawl — fallback signals")
+    import detail_crawler as dc
+
+    restore = _patch_detail_cache(dc)
+    try:
+        hash_urls = [f"http://example.invalid/dir#!biz/id/{i}" for i in range(5)]
+        check("hash-route URLs skip curl instantly (browser handles SPAs)",
+              dc._try_curl_detail_crawl(hash_urls, "curltest_hash") is None)
+
+        srv, port = _start_server(_JsShellDetailHandler)
+        try:
+            shell_urls = [f"http://127.0.0.1:{port}/member/{i}" for i in range(5)]
+            check("JS-shell pages (no contact signal) fall back to browser",
+                  dc._try_curl_detail_crawl(shell_urls, "curltest_shell") is None)
+        finally:
+            srv.shutdown()
+    finally:
+        restore()
+
+
+def test_layer_b_dedup():
+    print("\n[Eff] regex Layer B ancestor dedup (O(n), same semantics)")
+    import html_parser
+
+    entries = "".join(
+        f'<div><h3>Company {c}</h3><p>(206) 555-77{i:02d}</p>'
+        f'<p>contact{i}@example.com</p><p>{"pad " * 15}</p></div>'
+        for i, c in enumerate(["Alpha", "Beta", "Gamma", "Delta"]))
+    html = f"<html><body><div>{entries}</div></body></html>"
+    members = html_parser.regex_fallback_extract(html, "dedup_test")
+    names = sorted(m["company_name"] for m in members)
+    check("only the 4 deepest cards extracted (wrapper ancestor dropped)",
+          names == ["Company Alpha", "Company Beta", "Company Delta", "Company Gamma"],
+          str(names))
+
+
+# ────────────────────────────────────────────────────────────────────
 #  Browser fixture tests (Playwright, file:// pages, headless)
 # ────────────────────────────────────────────────────────────────────
 
@@ -582,6 +799,33 @@ def run_browser_tests():
         check("last capture is the '9' results",
               collector and "Results for: 9" in collector[-1])
 
+        # --- Eff: URL-template pagination over HTTP (no clicking) ---
+        print("\n[Eff/browser] URL-template pagination (pattern-first)")
+        srv, port = _start_server(_PaginatedListHandler)
+        try:
+            page.goto(f"http://127.0.0.1:{port}/list?page=1")
+            htmls, links = [], []
+            pages = bot_browser.handle_pagination(page, threading.Event(),
+                                                  link_collector=links,
+                                                  html_collector=htmls)
+            joined = " ".join(htmls)
+            check("pages 2-4 fetched over HTTP without clicking", pages == 3,
+                  f"pages={pages}")
+            check("all paginated content captured",
+                  all(f"Page{k} Member Co 00" in joined for k in (2, 3, 4)))
+            check("links harvested from HTTP-fetched pages",
+                  any("/list?page=" in l["href"] for l in links))
+        finally:
+            srv.shutdown()
+
+        srv, port = _start_server(_ParamIgnoredHandler)
+        try:
+            page.goto(f"http://127.0.0.1:{port}/ignore?page=1")
+            check("param-ignoring site caught by probe → falls back to clicking",
+                  bot_browser._try_url_pagination(page, [], []) == 0)
+        finally:
+            srv.shutdown()
+
         browser.close()
 
 
@@ -601,6 +845,10 @@ def main():
     test_bing_fallback()
     test_member_shaped_gate()
     test_plumbing_signatures()
+    test_curl_detail_crawl_selectors()
+    test_curl_detail_crawl_jsonld()
+    test_curl_detail_crawl_fallbacks()
+    test_layer_b_dedup()
 
     if "--browser" in sys.argv:
         run_browser_tests()

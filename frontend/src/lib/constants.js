@@ -2,8 +2,8 @@ export const NAV_LINKS = [
   { label: 'Features', href: '/#features' },
   { label: 'Scraper', href: '/playground' },
   { label: 'Discover', href: '/agent' },
-  { label: 'Docs', href: '/docs' },
   { label: 'Pricing', href: '/pricing' },
+  { label: 'Stats', href: '/analytics' },
 ]
 
 export const FEATURES = [
@@ -187,13 +187,15 @@ export const PRICING_FAQ = [
   },
 ]
 
+// Rendered on the black hero terminal: white for the command and results,
+// #888 for the machine's working notes. No hue anywhere.
 export const HERO_TERMINAL_LINES = [
-  { text: '$ trawlbase scrape hoa-directory.org/members', color: '#6C5CE7' },
-  { text: '→ Reading 3 sample cards...', color: '#888' },
-  { text: '→ Selectors learned ✓', color: '#22C55E' },
-  { text: '→ Stealth: TLS chrome136, WebGL patched', color: '#6C5CE7' },
-  { text: '→ Paginating... captured 912 records', color: '#22C55E' },
-  { text: '→ Enriching from company sites (8 workers)', color: '#6C5CE7' },
-  { text: '→ Filled 814/912 — emails, social, hours', color: '#22C55E' },
-  { text: '✓ Saved hoa_members.json (912 rows)', color: '#22C55E' },
+  { text: '$ trawlbase scrape hoa-directory.org/members', color: '#FFFFFF' },
+  { text: '→ Reading 3 sample cards...', color: '#888888' },
+  { text: '→ Selectors learned ✓', color: '#FFFFFF' },
+  { text: '→ Stealth: TLS chrome136, WebGL patched', color: '#888888' },
+  { text: '→ Paginating... captured 912 records', color: '#FFFFFF' },
+  { text: '→ Enriching from company sites (8 workers)', color: '#888888' },
+  { text: '→ Filled 814/912 — emails, social, hours', color: '#FFFFFF' },
+  { text: '✓ Saved hoa_members.json (912 rows)', color: '#FFFFFF' },
 ]

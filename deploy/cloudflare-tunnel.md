@@ -1,5 +1,10 @@
 # Cloudflare Tunnel — Public Access Without Port Forwarding
 
+> **Not the current production path.** The VPS has a public IP, so deployment
+> uses direct DNS + certbot — see **`DEPLOY.md`**. Keep this only if you ever
+> move to a box with no public IP (home server, NAT'd network).
+
+
 Cloudflare Tunnel gives your mini PC a public URL **without** opening router ports,
 exposing your home IP, or dealing with dynamic DNS. It's free.
 
@@ -52,7 +57,10 @@ This prints a tunnel ID (e.g., `abcdef12-3456-...`). Keep it.
 
 ```bash
 # Point your domain (or subdomain) to the tunnel
-cloudflared tunnel route dns trawlbase scraper.yourdomain.com
+cloudflared tunnel route dns trawlbase trawlbase.com
+cloudflared tunnel route dns trawlbase www.trawlbase.com
+# Analytics dashboard lives on its own subdomain
+cloudflared tunnel route dns trawlbase stats.trawlbase.com
 ```
 
 ### 7. Configure the tunnel
@@ -64,7 +72,13 @@ tunnel: <YOUR-TUNNEL-ID>
 credentials-file: /home/trawlbase/.cloudflared/<YOUR-TUNNEL-ID>.json
 
 ingress:
-  - hostname: scraper.yourdomain.com
+  # nginx routes by Host header, so every hostname forwards to the same port —
+  # trawlbase.com gets the app, stats.trawlbase.com gets the analytics dashboard.
+  - hostname: trawlbase.com
+    service: http://localhost:80
+  - hostname: www.trawlbase.com
+    service: http://localhost:80
+  - hostname: stats.trawlbase.com
     service: http://localhost:80
   - service: http_status:404
 ```

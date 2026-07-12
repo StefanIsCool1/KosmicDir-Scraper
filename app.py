@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
-import sys, os, csv, json, io, builtins, queue, threading, uuid
+import sys, os, csv, json, io, builtins, queue, threading, time, uuid, re
 
 os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
@@ -11,7 +11,9 @@ from Bot.main import scrape_directory, PHASE2_ONLY_FIELDS, read_members, read_me
 from Bot.debug import debug
 from Bot.intent_filter import intent_from_plan
 from Phase2Bot.email_extractor import enrich_from_websites
-from DiscoveryBot import run_discovery
+from DiscoveryBot import run_discovery, parse_intent
+from exporter import export_final_dataset, records_to_csv
+from analytics import record_page_view, record_event, get_stats
 
 app = Flask(__name__)
 
@@ -31,6 +33,7 @@ CORS(app,
 
 DATA_DUMP = os.path.join(os.path.dirname(__file__), "Data-dump")
 PHASE2_DUMP = os.path.join(os.path.dirname(__file__), "Phase2-Dump")
+DEBUG_DUMP = os.path.join(os.path.dirname(__file__), "Debug-dump")
 
 # Active scrape sessions for interactive prompts
 # {session_id: {"queue": Queue, "response_event": Event, "response_value": str}}
@@ -103,35 +106,94 @@ def _check_fields_from_file(json_path):
         def _count(predicate):
             return sum(1 for m in sample if predicate(m))
 
+        # Person-schema records carry email/personal_website at the top level
+        # (no contacts list); business records never have those keys, so the
+        # extra checks are no-ops for them.
         if _count(lambda m: bool(m.get("phone"))) >= threshold:
             fields.add("phone")
-        if _count(lambda m: any(c.get("email") for c in m.get("contacts", []))) >= threshold:
+        if _count(lambda m: bool(m.get("email"))
+                  or any(c.get("email") for c in m.get("contacts", []))) >= threshold:
             fields.add("email")
         if _count(lambda m: bool(m.get("street_address") or m.get("mailing_address"))) >= threshold:
             fields.add("address")
         if _count(lambda m: bool(m.get("description"))) >= threshold:
             fields.add("description")
-        if _count(lambda m: bool(m.get("website"))) >= threshold:
+        if _count(lambda m: bool(m.get("website") or m.get("personal_website"))) >= threshold:
             fields.add("website")
     except Exception:
         pass
     return fields
 
 
+def _normalize_link(raw: str) -> tuple[str | None, str | None]:
+    """Clean up a user-pasted URL. Returns (link, error) — exactly one is set.
+
+    Users paste links wrapped in <>/quotes (email, Slack), with uppercase or
+    missing schemes, or scheme-relative (//host/path). Anything that still
+    has no plausible host afterwards gets a readable error instead of being
+    handed to the browser, where it grinds against about:blank for minutes
+    and then reports a misleading "0 members".
+    """
+    from urllib.parse import urlparse
+
+    link = (raw or "").strip().strip("<>\"'").strip()
+    if not link:
+        return None, "No link provided"
+    if link.startswith("//"):  # scheme-relative paste
+        link = "https:" + link
+
+    scheme_match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://(.*)$", link)
+    if scheme_match:
+        scheme = scheme_match.group(1).lower()
+        if scheme not in ("http", "https"):
+            return None, f"Unsupported URL scheme '{scheme}' — only http(s) pages can be scraped"
+        link = f"{scheme}://{scheme_match.group(2)}"
+    else:
+        link = "https://" + link
+
+    parsed = urlparse(link)
+    try:
+        hostname = parsed.hostname or ""
+    except ValueError:  # e.g. malformed IPv6 bracket syntax
+        hostname = ""
+    if not hostname or " " in parsed.netloc:
+        return None, f"'{raw.strip()}' doesn't look like a valid URL"
+    # Require a dot (domain), a colon (IPv6), or localhost — bare words like
+    # "hoa directory texas" are search queries, not scrape targets.
+    if "." not in hostname and ":" not in hostname and hostname != "localhost":
+        return None, (f"'{raw.strip()}' doesn't look like a valid URL — "
+                      f"paste the full address of the directory page")
+    return link, None
+
+
+def _sse_error_response(message: str) -> Response:
+    """One-shot SSE stream carrying a single error event. The frontend
+    terminal renders `error` events with their message; a bare 400 would
+    surface only as "Error: 400 BAD REQUEST" with no explanation."""
+    def stream():
+        yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
+    return Response(stream(), mimetype="text/event-stream")
+
+
 @app.route("/scrape/single", methods=["POST"])
 def scrape_single():
     """Stream scrape progress as SSE events. Supports interactive prompts."""
-    link = request.json.get("link", "").strip()
+    raw_link = request.json.get("link", "")
     debug_mode = request.json.get("debug", False)
     scrape_mode = request.json.get("mode", "auto")  # "auto" or "direct"
     priority_fields = request.json.get("priority_fields", ["email", "phone"])
     accurate_enrichment = bool(request.json.get("accurate_enrichment", False))
-    if not link:
+    # Optional Auto-Discover intent: free-form "what to discover on this site".
+    # Only used in auto mode; direct scrapes ignore it. Empty / "everything"
+    # goals resolve to intent=None (parse_intent → coverage:"all"), i.e. the
+    # unchanged plain auto-discover flow.
+    goal = (request.json.get("goal") or "").strip()
+    if not (raw_link or "").strip():
         return jsonify({"error": "No link"}), 400
 
-    # Normalize URL — add https:// if missing
-    if not link.startswith(("http://", "https://")):
-        link = "https://" + link
+    link, url_error = _normalize_link(raw_link)
+    if url_error:
+        return _sse_error_response(url_error)
 
     session_id = str(uuid.uuid4())
     event_queue = queue.Queue()
@@ -172,6 +234,19 @@ def scrape_single():
             f"'y' to continue (or 'n' to skip this site).",
         )
 
+    def captcha_via_frontend(page, domain, vendor):
+        """CAPTCHA / anti-bot-challenge handler for the web UI. Same round-trip
+        as login: the headed browser window (on the backend machine) shows the
+        challenge, the user solves it there, then confirms through the frontend
+        terminal to resume. Returns True to re-check/resume, False to skip."""
+        return prompt_via_frontend(
+            0,
+            f"{vendor} detected on {domain.replace('_', '.')}. "
+            f"Solve the challenge in the browser window that opened "
+            f"(e.g. press & hold the button / complete the check), then respond "
+            f"'y' to resume (or 'n' to skip this site).",
+        )
+
     def bot_thread():
         original_print = builtins.print
         debug.enabled = debug_mode
@@ -189,10 +264,25 @@ def scrape_single():
 
         builtins.print = captured_print
         try:
+            # Auto-Discover intent (single-URL): parse the user's free-form
+            # goal into the same flattened intent the /discover path uses, so
+            # this scrape gets intent-driven sub-page discovery, XHR replay,
+            # category narrowing, and record filtering. Direct mode and empty/
+            # "everything" goals leave intent=None (unchanged behavior).
+            intent = None
+            if scrape_mode == "auto" and goal:
+                try:
+                    intent = intent_from_plan(parse_intent(goal))
+                except Exception as e:
+                    print(f"  Intent parse failed (non-fatal, scraping everything): {e}")
+                    intent = None
+
             members = scrape_directory(
                 link, prompt_callback=prompt_via_frontend,
                 mode=scrape_mode, priority_fields=priority_fields,
+                intent=intent,
                 login_callback=login_via_frontend,
+                captcha_callback=captcha_via_frontend,
             )
 
             phase1_records = len(members)
@@ -326,11 +416,16 @@ def scrape_csv():
         return jsonify({"error": "No file"}), 400
 
     reader = csv.reader(io.StringIO(file.read().decode("utf-8")))
-    next(reader)
-    links = [row[0].strip() for row in reader if row]
+    next(reader, None)  # header row; empty file must not raise StopIteration
+    links = [row[0].strip() for row in reader if row and row[0].strip()]
 
     def stream():
-        for i, link in enumerate(links):
+        for i, raw_link in enumerate(links):
+            link, url_error = _normalize_link(raw_link)
+            if url_error:
+                yield f"data: {json.dumps({'index': i, 'link': raw_link, 'success': False, 'records': 0, 'logs': [url_error]})}\n\n"
+                continue
+
             logs = []
             original_print = builtins.print
 
@@ -341,7 +436,14 @@ def scrape_csv():
 
             builtins.print = captured_print
             try:
-                members = scrape_directory(link)
+                # Batch endpoint: auto-decline interactive prompts. The default
+                # handlers fall back to terminal input(), which hangs the server
+                # thread forever — nobody is at Flask's stdin.
+                members = scrape_directory(
+                    link,
+                    prompt_callback=lambda count, message=None: False,
+                    login_callback=lambda page, domain: False,
+                )
                 records = len(members)
                 success = records > 0
             except Exception as e:
@@ -524,6 +626,13 @@ def discover():
 
         builtins.print = captured_print
 
+        # Full-run debug trace, always on for /discover: Phase 0 saves one
+        # timeline file per run, then each Phase 1 scrape resets and saves its
+        # own Debug-dump/{domain}_debug.json (see Bot/main.py). Every entry
+        # carries elapsed time; spans carry durations; decisions carry the why.
+        debug.enabled = True
+        debug.reset()
+
         def emit(event):
             """Push a structured event into the SSE queue."""
             event_queue.put(event)
@@ -559,6 +668,11 @@ def discover():
         try:
             # --- Phase 0: Discovery (independent of scope — see run_discovery) ---
             result = run_discovery(goal, event_cb=emit)
+
+            # Persist the Phase 0 trace now — each Phase 1 scrape resets the
+            # logger for its own per-site trace file.
+            debug.save_report(os.path.join(
+                DEBUG_DUMP, f"discover_{int(time.time())}_phase0_debug.json"))
 
             # If intent parsing said the message wasn't actionable, the
             # pipeline already emitted a needs_clarification event. Stop
@@ -965,63 +1079,48 @@ def discover():
                         "category": "ERROR",
                     })
 
-            # --- Merge all output files into one combined JSON ---
+            # --- Final deliverable: one cleaned JSON + Excel workbook ---
+            # Consolidates EVERY output file of this run (Phase 1 structured,
+            # Phase 2 enriched — which live in Phase2-Dump and were silently
+            # skipped by the old Data-dump-only merge — NPI pulls, standalone
+            # sites) into {industry}_{states}_final.json/.xlsx: deduped
+            # across sources, canonical field order, source-tagged records.
             merged_file = None
-            if len(output_files) > 1:
-                all_members = []
-                all_sources = []
-                seen_names = set()
-                for fname in output_files:
-                    fpath = os.path.join(DATA_DUMP, fname)
-                    if not os.path.isfile(fpath):
-                        continue
-                    try:
-                        members = read_members(fpath)
-                        meta = read_metadata(fpath) or {}
-                        src = meta.get("source_url", fname)
-                        for m in members:
-                            key = (m.get("company_name") or "").lower().strip()
-                            if key and key not in seen_names:
-                                seen_names.add(key)
-                                all_members.append(m)
-                        all_sources.append(src)
-                    except Exception:
-                        continue
+            final_xlsx = None
+            if output_files:
+                try:
+                    plan_industry = (result.get("plan") or {}).get("industry") or {}
+                    plan_locations = (result.get("plan") or {}).get("locations") or []
+                    industry_name = plan_industry.get("canonical") or ""
+                    industry_slug = (industry_name or "results").replace(" ", "_")[:40]
+                    states = "_".join(
+                        loc.get("state", "") for loc in plan_locations[:3] if loc.get("state")
+                    )
+                    base_name = f"{industry_slug}_{states}" if states else industry_slug
 
-                if all_members:
-                    from datetime import datetime, timezone
-                    total = len(all_members)
-                    merged_meta = {
-                        "scraped_at": datetime.now(timezone.utc).isoformat(),
-                        "source_urls": all_sources,
-                        "total_members": total,
-                        "with_name": sum(1 for m in all_members if m.get("company_name")),
-                        "with_phone": sum(1 for m in all_members if m.get("phone")),
-                        "with_email": sum(1 for m in all_members if m.get("contacts") and any(c.get("email") for c in m["contacts"])),
-                        "with_website": sum(1 for m in all_members if m.get("website")),
-                        "with_address": sum(1 for m in all_members if m.get("street_address") or m.get("mailing_address")),
-                        "with_description": sum(1 for m in all_members if m.get("description")),
-                        "with_category": sum(1 for m in all_members if m.get("category")),
-                        "with_contacts": sum(1 for m in all_members if m.get("contacts") and any(c.get("name") or c.get("email") for c in m["contacts"])),
-                    }
-                    intent = result.get("plan", {}).get("industry", {})
-                    locations = result.get("plan", {}).get("locations", [])
-                    if intent.get("canonical"):
-                        merged_meta["intent_industry"] = intent["canonical"]
-                    if locations:
-                        merged_meta["intent_locations"] = [loc.get("state", "") for loc in locations]
-
-                    industry = intent.get("canonical", "").replace(" ", "_")[:40] if intent.get("canonical") else "results"
-                    states = "_".join(loc.get("state", "") for loc in (locations or [])[:3])
-                    merged_fname = f"{industry}_{states}_merged.json" if states else f"{industry}_merged.json"
-                    merged_path = os.path.join(DATA_DUMP, merged_fname)
-                    with open(merged_path, "w") as mf:
-                        json.dump({"metadata": merged_meta, "members": all_members}, mf, indent=4)
-                    merged_file = merged_fname
+                    export_info = export_final_dataset(
+                        output_files, [DATA_DUMP, PHASE2_DUMP], DATA_DUMP,
+                        base_name, goal=goal, industry=industry_name,
+                        locations=[loc.get("state", "") for loc in plan_locations],
+                    )
+                    if export_info:
+                        merged_file = export_info["json_file"]
+                        final_xlsx = export_info.get("xlsx_file")
+                        dup_note = (f", {export_info['duplicates_merged']} duplicates merged"
+                                    if export_info["duplicates_merged"] else "")
+                        event_queue.put({
+                            "type": "log",
+                            "message": (f"Final dataset: {export_info['total']} unique records "
+                                        f"from {len(export_info['sources'])} source(s){dup_note} "
+                                        f"→ {merged_file}"
+                                        + (f" + {final_xlsx}" if final_xlsx else "")),
+                            "category": "CLEAN",
+                        })
+                except Exception as e:
                     event_queue.put({
                         "type": "log",
-                        "message": f"Merged {len(output_files)} files → {merged_fname} ({total} unique members, deduped across sources)",
-                        "category": "CLEAN",
+                        "message": f"Final export failed (per-site files unaffected): {e}",
+                        "category": "ERROR",
                     })
 
             event_queue.put({
@@ -1033,6 +1132,8 @@ def discover():
                 "websites": [w["url"] for w in websites],
                 "output_files": output_files,
                 "merged_file": merged_file,
+                "final_json": merged_file,
+                "final_xlsx": final_xlsx,
                 "per_site": per_site_results,
                 "stats": {
                     "rejected_count": result.get("rejected_count", 0),
@@ -1066,113 +1167,9 @@ def discover():
 
 # --- CSV CONVERSION & DOWNLOAD ---
 
-# Column order for CSV — most important fields first
-_CSV_COLUMNS = [
-    "company_name", "category", "website",
-    "phone", "fax",
-    "contact_name", "contact_email",
-    "street_address", "mailing_address",
-    "description",
-    # Phase 2 enrichment fields
-    "facebook", "linkedin", "instagram", "twitter", "youtube", "yelp", "pinterest", "tiktok",
-    "hours", "services", "founded",
-    "team",
-    "enrichment_status", "enrichment_source", "website_source",
-]
-
-
-def _flatten_record(record: dict, dynamic: bool = False) -> dict:
-    """Flatten a nested member record into a single-level dict for CSV.
-    Contacts get merged into contact_name/contact_email (semicolon-separated if multiple).
-    Social media gets flattened from nested dict to top-level keys.
-    Lists (services, team) get joined into comma-separated strings."""
-    row = {}
-
-    # Simple fields — copy directly
-    for key in ("company_name", "category", "website", "phone", "fax",
-                "street_address", "mailing_address", "description",
-                "hours", "founded", "enrichment_status", "enrichment_source", "website_source"):
-        val = record.get(key)
-        row[key] = str(val).strip() if val else ""
-
-    # Contacts — flatten into semicolon-separated name/email
-    contacts = record.get("contacts", [])
-    if contacts and isinstance(contacts, list):
-        names = [c.get("name", "") for c in contacts if c.get("name")]
-        emails = [c.get("email", "") for c in contacts if c.get("email")]
-        row["contact_name"] = "; ".join(names)
-        row["contact_email"] = "; ".join(emails)
-    else:
-        row["contact_name"] = ""
-        row["contact_email"] = ""
-
-    # Social media — flatten nested dict
-    social = record.get("social_media", {}) or {}
-    for platform in ("facebook", "linkedin", "instagram", "twitter", "youtube", "yelp", "pinterest", "tiktok"):
-        row[platform] = social.get(platform, "") or ""
-
-    # Services — join list
-    services = record.get("services", [])
-    row["services"] = ", ".join(services) if isinstance(services, list) else str(services or "")
-
-    # Team — flatten to "Name (Title); Name (Title)"
-    team = record.get("team", [])
-    if team and isinstance(team, list):
-        parts = []
-        for member in team:
-            if isinstance(member, dict):
-                name = member.get("name", "")
-                title = member.get("title", "")
-                parts.append(f"{name} ({title})" if title else name)
-            elif isinstance(member, str):
-                parts.append(member)
-        row["team"] = "; ".join(parts)
-    else:
-        row["team"] = ""
-
-    if dynamic:
-        # Pass through AI-chosen fields (e.g. model, chipset, vram, price) that
-        # aren't part of the fixed business layout. Nested values are JSON-encoded.
-        for k, v in record.items():
-            if k in row or k in ("contacts", "social_media", "services", "team"):
-                continue
-            if isinstance(v, (dict, list)):
-                row[k] = json.dumps(v, ensure_ascii=False) if v else ""
-            else:
-                row[k] = str(v).strip() if v not in (None, "") else ""
-
-    return row
-
-
-def _records_to_csv(records: list, entity_type: str = "business") -> str:
-    """Convert a list of member records to CSV string.
-
-    For a non-"business" entity_type the records carry AI-chosen field keys, so
-    columns are the union of the business layout (for any that have data) plus the
-    extra dynamic keys, in first-seen order. Business output is unchanged."""
-    output = io.StringIO()
-    dynamic = entity_type != "business"
-
-    # Determine which columns actually have data (skip empty columns)
-    columns_with_data = []
-    flat_records = [_flatten_record(r, dynamic=dynamic) for r in records]
-    for col in _CSV_COLUMNS:
-        if any(row.get(col) for row in flat_records):
-            columns_with_data.append(col)
-
-    if dynamic:
-        # Append AI-chosen columns that carry data, in first-seen order.
-        for row in flat_records:
-            for k in row:
-                if k not in columns_with_data and any(rr.get(k) for rr in flat_records):
-                    columns_with_data.append(k)
-
-    writer = csv.DictWriter(output, fieldnames=columns_with_data, extrasaction="ignore")
-    writer.writeheader()
-    for row in flat_records:
-        writer.writerow(row)
-
-    return output.getvalue()
+# Flattening + CSV live in exporter.py (one implementation for CSV and XLSX).
+# Alias kept because ad-hoc tests import _records_to_csv from app.
+_records_to_csv = records_to_csv
 
 
 @app.route("/download/<path:filename>", methods=["GET"])
@@ -1180,6 +1177,11 @@ def download_file(filename):
     """Download a structured or enriched JSON file as JSON or CSV.
     Query param: ?format=csv or ?format=json (default: json)"""
     fmt = request.args.get("format", "json").lower()
+
+    # Dump files are always flat basenames — reject anything path-shaped
+    # (guards the os.path.join below against ../ traversal).
+    if os.path.basename(filename) != filename:
+        return jsonify({"error": "Invalid filename"}), 400
 
     # Check both Data-dump and Phase2-Dump directories
     file_path = None
@@ -1191,6 +1193,11 @@ def download_file(filename):
 
     if not file_path:
         return jsonify({"error": f"File not found: {filename}"}), 404
+
+    # Excel workbooks are served as-is (binary) — no format conversion.
+    if filename.lower().endswith(".xlsx"):
+        return send_file(file_path, as_attachment=True,
+                         download_name=os.path.basename(file_path))
 
     try:
         members = read_members(file_path)
@@ -1218,6 +1225,69 @@ def download_file(filename):
             mimetype="application/json",
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
+
+
+# --- ANALYTICS ---
+
+ANALYTICS_PASSWORD = os.environ.get("ANALYTICS_PASSWORD", "trawlbase")  # change in .env!
+
+
+@app.route("/a", methods=["POST"])
+def analytics_collect():
+    """Fire-and-forget event recording.  Lightweight — no auth needed to log.
+
+    Expects JSON: {visitor_id, type: "page_view"|"event",
+                   path?, event_name?, event_data?, referrer?}
+    Returns 204 No Content on success.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return "", 204
+
+    vid = (data.get("visitor_id") or "").strip()
+    if not vid:
+        return "", 204
+
+    ev_type = (data.get("type") or "").strip()
+
+    if ev_type == "page_view":
+        record_page_view(
+            visitor_id=vid,
+            path=data.get("path", "/"),
+            referrer=data.get("referrer", ""),
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+    elif ev_type == "event":
+        record_event(
+            visitor_id=vid,
+            event_name=data.get("event_name", "unknown"),
+            event_data=data.get("event_data"),
+            page=data.get("path", ""),
+        )
+
+    return "", 204
+
+
+@app.route("/analytics/stats", methods=["GET"])
+def analytics_stats():
+    """Return aggregate analytics.  Protected by ANALYTICS_PASSWORD.
+
+    Query params:
+      password (required)
+      days     (optional, default 30)
+    """
+    pw = request.args.get("password", "")
+    if pw != ANALYTICS_PASSWORD:
+        return jsonify({"error": "Invalid password"}), 401
+
+    try:
+        days = int(request.args.get("days", "30"))
+    except ValueError:
+        days = 30
+
+    stats = get_stats(days=days)
+    return jsonify(stats)
 
 
 if __name__ == "__main__":

@@ -5,21 +5,40 @@
 body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  color: #000000;
+  /* Native checkboxes/radios render black instead of the OS blue. */
+  accent-color: #000000;
 }
+
+/* Selection inverts — the only "highlight" the palette allows. */
+::selection {
+  background: #000000;
+  color: #ffffff;
+}
+
+
 
 @layer utilities {
   .animate-fade-in {
-    animation: fadeIn 0.3s ease-out both;
+    animation: fadeIn 0.2s ease both;
   }
 }
 
+/* Pure fade — no slide. Motion is reserved for things that inform. */
 @keyframes fadeIn {
   from {
     opacity: 0;
-    transform: translateY(4px);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
   }
 }

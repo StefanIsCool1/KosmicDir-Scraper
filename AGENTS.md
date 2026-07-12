@@ -51,25 +51,30 @@ User: "HOAs in Washington"
     └──────────────────────────────┘
          │
          ▼
-    Structured JSON / CSV output
+    Structured JSON / CSV / Excel output
 ```
 
 ### Beyond the diagram (added since it was drawn)
 
 - **Phase 0 API fast-path.** When a goal maps to an authoritative public registry, Phase 0 skips DDG / preflight / classify / browser and pulls structured data directly. One vertical today — **NPI** (US healthcare practitioners: dentists, chiropractors, optometrists, PTs, etc.). `intent.py` emits `api_vertical`/`api_params`; `pipeline._maybe_api_route` validates the taxonomy (`vertical_enrichment.resolve_npi_taxonomies`) + a US state and returns early; `app.py` calls `npi_search_by_taxonomy` and saves a normal `_structured.json`. Misses (vets, broad "doctors", no state) fall back to discovery.
 - **Intent-aware Phase 1** (Agent mode only — Playground passes `intent=None`, so it stays byte-for-byte unchanged). *Stage 2 — source narrowing*: fetch only the relevant `<select>` categories (`url_enumeration.py` + `intent_filter.py`) or run an intent-first search-box query on cross-vertical aggregators (`navigator.py`). *Stage 1 — record filter*: drop off-target records after extraction (`intent_record_filter.py`), gated by a `scope` knob ("specialist" vs "inclusive") the user sets via a `scope_refinement_required` prompt. Both fail-open.
+  - **"Scrape everything" is `intent=None`.** `intent.py` emits a `coverage` field (`all` | `targeted`); `intent_filter.intent_from_plan` maps `coverage=="all"` → `None`, so a whole-directory goal runs today's plain wildcard flow with zero intent behavior. Everything below is therefore gated on a non-`None` (targeted) intent.
+  - **Intent deep capture** (`browser.py` Step 2.5, targeted intent only, non-aggregator, non-hub) fires when the normal flow left yield low (`< INTENT_LOW_RECORDS` member records AND `< INTENT_LOW_VISIBLE` visible). Two reuse-heavy passes: (a) `replay_directory_xhrs` re-fetches captured directory-API endpoints through `page.context.request` (browser cookies/clearance ride along) with mutated page / intent-term / letter params, gated back through the same `_is_directory_json`; (b) `discover_intent_subpages` BFS-crawls intent-matched category/sub-directory links (`detect_category_links(ignore_visible=True, top_groups=3)` for candidates, `filter_categories_by_intent` strict-subset for the pick, cached per domain+industry under `intent_nav_<domain>`), feeding each page into the existing collect-links / capture-HTML / paginate recipe. Caps in `config.py` (`INTENT_MAX_SUBPAGES`, `INTENT_SUBPAGE_DEPTH`, `XHR_MAX_REPLAYS`, …). Complicated-search sites also get an intent-terms search fallback in `trigger_search` when the wildcard chain finds nothing usable.
 - **Standalone sites are selectable.** The Phase 0 picker lets the user choose WEBSITE-class single businesses to enrich via Phase 2, not just directories.
+- **Final deliverable.** Every `/discover` run with output ends by consolidating ALL its files (Phase 1 structured, Phase 2 enriched — read from `Phase2-Dump/`, which the old Data-dump-only merge silently skipped — NPI pulls, standalone sites) into `Data-dump/{industry}_{states}_final.json` + `.xlsx` via `exporter.py`: duplicates across sources merged field-by-field, canonical key order, empty fields dropped, records sorted and source-tagged, metadata with per-source counts + field coverage. The `complete` SSE event carries `final_json` / `final_xlsx` (plus legacy `merged_file`), and the Agent result bubble shows JSON / CSV / Excel buttons. `exporter.py` is also the single home of the flatten/CSV logic `/download` uses.
+- **Run tracing.** `/discover` always writes debug traces: Phase 0 → `Debug-dump/discover_<ts>_phase0_debug.json`, then each Phase 1 site → `Debug-dump/{domain}_debug.json`. Every entry carries elapsed seconds; `span` entries carry durations (where the time went); `decision` entries carry what the bot chose at each fork and why (STAY/CLICK, skip pagination, intent XHR replay + sub-page expansion, back-out, garbage gate, Phase 0 routing). Enable for CLI runs with `SCRAPER_DEBUG=1`; `Bot/debug.py` is the singleton, `save_report()` writes the file.
 
 ## Data Acquisition Strategies (how records are actually extracted)
 
 Phase 1 tries the cheapest viable path first:
 1. **URL-param enumeration** (`url_enumeration.py`) — GET-form `<select>` → fetch each option's URL in parallel via curl_cffi, no browser. Detects *narrowing filter vs partition* (probes the unfiltered URL); with intent, enumerates only the matching categories.
 2. **Network / JSON capture** (`browser.py`) — member data lifted from the page's own XHR/JSON beats HTML parsing.
-3. **Search + pagination** (`navigator.py`) — fill the search box (blank/`%`/`all`/`a`, or intent-first on aggregators), then paginate (path/segment-aware).
-4. **3-tier HTML parse** (`html_parser.py`) — cached selector → AI-learned (DeepSeek) → regex. Selectors cached per-domain in `selector_cache.json` forever (~1 AI call per new domain).
-5. **Detail-page crawl** (`detail_crawler.py`) — optional per-member profile pages: API fast-path → Haiku selector learning (validated) → regex; merges, aborts on invalid.
-6. **NPI API** — the Phase 0 fast-path above; no scraping at all.
-7. **Phase 2 enrichment** (`Phase2Bot/`) — fill gaps from each company's site: derive the domain from a contact email, else DDG-find (with opt-in verify-by-fetch "accurate" mode that fetches+scores top candidates), then TLS-fetch + JSON-LD/regex. Vertical-routed first (NPI for healthcare, tuned DDG for lawyers/realtors).
+3. **Search + pagination** (`navigator.py`, `browser.py`) — fill the search box (blank/`%`/`all`/`a`, or intent-first on aggregators), then paginate: URL-template pagination first (`?page=N` / `/page/N/` links fetched over parallel HTTP), clicking (Next / numbered / Load More) as the fallback. **Skipped entirely on listing hubs**: when the page shows ≥`CHILD_HUB_MIN_LINKS` same-template child links of its own path (walmart.com/store-directory/mn → per-city pages), no member-shaped JSON, and <3 visible cards, `detect_category_links(child_hub_of=…)` flags it pre-search and the child pages are iterated as categories instead — a site-wide search box would otherwise hijack the run. Hub partitions (geography/A-Z) bypass the intent category filter; gates count member *records* via `_count_json_member_records`, so junk JSON (Partytown proxies, cart GraphQL) can't block category discovery.
+4. **Intent-driven sub-page expansion** (`browser.py:discover_intent_subpages` + `replay_directory_xhrs`, Step 2.5) — after search/pagination, when a *targeted* intent is still under-served (`< INTENT_LOW_VISIBLE` visible AND `< INTENT_LOW_RECORDS` JSON records), replay captured directory XHRs with mutated params, then BFS-crawl intent-matched category/city sub-pages (depth `INTENT_SUBPAGE_DEPTH`, ≤`INTENT_MAX_SUBPAGES`, same-origin), each crawled + paginated like a category. Reuses `detect_category_links` (relaxed via `ignore_visible`/`top_groups`) and `filter_categories_by_intent` (strict-subset so it fails closed). No-op when `intent is None` (Playground / direct / "scrape everything"), on hubs, and on aggregators. (Supersedes an earlier `ai_discover_listing_links` LLM-nav design that was documented here but never landed in code.)
+5. **3-tier HTML parse** (`html_parser.py`) — JSON-LD (zero AI) → cached selector → AI-learned (DeepSeek) → regex. Selectors cached per-domain in `selector_cache.json` forever (~1 AI call per new domain). The learner classifies each domain's cards into one of three entity types, all cached in the same schema entry: **business** (default fixed schema: `company_name`/phone/address/contacts — byte-for-byte unchanged), **person** (fixed schema for rosters, faculty/staff/team pages: `full_name`, `pronouns`, `title`, `department`, `office`, `email`, `phone`, `personal_website`; dedup on name+email; no regex fallback), and **dynamic** (any other noun — product, vehicle, … — free-form role-tagged `fields[]`). `main.py`/`cleaner.py`/`exporter.py`/CSV all route on the cached `entity_type` + `name_field`.
+6. **Detail-page crawl** (`detail_crawler.py`) — optional per-member profile pages, cheapest first: **curl-first** (parallel curl_cffi; extraction mode picked on samples: JSON-LD → cached/learned selectors → regex → merge) → API fast-path (browser probes one page for a per-member JSON endpoint) → Playwright crawl. Falls down the ladder on hash-route URLs, JS shells, blocked fetches, or failed validation; merges, aborts on invalid.
+7. **NPI API** — the Phase 0 fast-path above; no scraping at all.
+8. **Phase 2 enrichment** (`Phase2Bot/`) — fill gaps from each company's site: derive the domain from a contact email, else DDG-find (with opt-in verify-by-fetch "accurate" mode that fetches+scores top candidates), then TLS-fetch + JSON-LD/regex. Vertical-routed first (NPI for healthcare, tuned DDG for lawyers/realtors).
 
 ## Project Structure & Module Organization
 
@@ -92,7 +97,7 @@ KosmicDir-Scraper/
 │   ├── cleaner.py         # Deduplication & phone formatting
 │   ├── cache.py           # Per-domain selector & URL-enumeration cache persistence
 │   ├── llm.py             # LLM client (DeepSeek V4 Flash, OpenAI-compatible)
-│   ├── debug.py           # Optional debug logging
+│   ├── debug.py           # Run tracing: timed spans + decisions → Debug-dump reports
 │   ├── url_enumeration.py # URL-param enumeration (narrowing-filter detect + intent narrowing)
 │   ├── intent_filter.py   # Stage 2: scope-aware source category selection; intent_from_plan()
 │   └── intent_record_filter.py # Stage 1: drop off-target records after extraction (fail-open)
@@ -110,8 +115,10 @@ KosmicDir-Scraper/
 │   │   └── Docs/          # Documentation page
 │   ├── src/components/    # Shared: Navbar, Footer, Button
 │   └── src/hooks/         # useSSE (streaming), useTypewriter
-├── Data-dump/             # Phase 1 output (_structured.json files)
+├── Data-dump/             # Phase 1 output (_structured.json) + per-run _final.json/_final.xlsx
 ├── Phase2-Dump/           # Phase 2 output (_enriched.json files)
+├── Debug-dump/            # Per-run debug traces (_debug.json — actions, timings, decisions)
+├── exporter.py            # Final deliverable: consolidated clean JSON + Excel; flatten/CSV logic
 ├── cookies/               # Per-domain Playwright cookies (login persistence)
 ├── app.py                 # Flask backend with SSE streaming
 └── .env                   # DEEPSEEK_API_KEY (gitignored)
@@ -144,7 +151,9 @@ No DiscoveryBot module imports from Bot modules that pull in Playwright — the 
 | `/discover` | POST | Phase 0: parse goal → discover → classify → auto-scrape via Phase 1 + Phase 2. Streams SSE. |
 | `/phase2/enrich` | POST | Standalone Phase 2 enrichment on an existing structured JSON file. |
 | `/phase2/files` | GET | List structured JSON files with enrichment potential stats. |
-| `/download/<filename>` | GET | Download results as JSON (?format=json) or CSV (?format=csv). |
+| `/download/<filename>` | GET | Download results as JSON (?format=json) or CSV (?format=csv); `.xlsx` filenames are served as binary Excel. |
+| `/a` | POST | Analytics beacon — page views + events from `frontend/src/hooks/useAnalytics.js`. SQLite-backed (`Data-dump/analytics.db`). |
+| `/analytics/stats` | GET | Aggregate analytics, gated by `ANALYTICS_PASSWORD`. Backs the dashboard served at stats.trawlbase.com (host-detected in `frontend/src/main.jsx`). |
 
 ## SSE Event Types (for Frontend Integration)
 

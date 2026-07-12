@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useRef, useCallback, useEffect } from 'react'
 import formatTerminalLine, { STEALTH_BANNER } from '../lib/formatTerminalLine'
+import useAnalytics from '../hooks/useAnalytics'
 
 // --- Persistence ----------------------------------------------------------
 // The whole point of this provider: the Discover conversation + live scrape
@@ -68,6 +69,7 @@ export function AgentProvider({ children }) {
   const [messages, setMessages] = useState(initial.current.messages)
   const [isRunning, setIsRunning] = useState(false)
   const [accurateEnrichment, setAccurateEnrichment] = useState(initial.current.accurate)
+  const { trackEvent } = useAnalytics()
 
   // Per-stream mutable bag — survives renders without triggering them.
   const streamRef = useRef({
@@ -356,6 +358,12 @@ export function AgentProvider({ children }) {
           patchMessage(terminalId, { isComplete: true })
         }
         setMessages((prev) => [...prev, { role: 'agent', type: 'result', result: event }])
+        trackEvent('discover_done', {
+          records: event.records || 0,
+          directories: event.directories_scraped || 0,
+          websites: event.websites_found || 0,
+          success: event.success || false,
+        })
         break
 
       case 'error':
@@ -370,7 +378,7 @@ export function AgentProvider({ children }) {
         break
     }
   }, [appendStep, updateLastStep, patchMessage, appendTerminalLines,
-      handleConfirmScrape, handleCancelScrape, handleScopeChoice])
+      handleConfirmScrape, handleCancelScrape, handleScopeChoice, trackEvent])
 
   // --- Main send handler --------------------------------------------------
 
@@ -399,6 +407,8 @@ export function AgentProvider({ children }) {
       { id: statusId, role: 'agent', type: 'status', steps: [] },
     ])
     setIsRunning(true)
+
+    trackEvent('discover_started', { goal: text })
 
     try {
       const resp = await fetch('/discover', {
@@ -450,7 +460,7 @@ export function AgentProvider({ children }) {
     } finally {
       setIsRunning(false)
     }
-  }, [isRunning, handleEvent, accurateEnrichment])
+  }, [isRunning, handleEvent, accurateEnrichment, trackEvent])
 
   // Start a fresh conversation (only allowed when nothing is streaming).
   const newChat = useCallback(() => {

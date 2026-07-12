@@ -62,7 +62,7 @@ export default function OnboardingTour({ step, currentStep, targetRect, totalSte
     left: targetRect.left - 8,
     width: targetRect.width + 16,
     height: targetRect.height + 16,
-    borderRadius: 12,
+    borderRadius: 0,
     boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.45)',
     pointerEvents: 'none',
     zIndex: 51,
@@ -73,7 +73,6 @@ export default function OnboardingTour({ step, currentStep, targetRect, totalSte
     position: 'fixed',
     inset: 0,
     background: 'rgba(0, 0, 0, 0.45)',
-    backdropFilter: 'blur(2px)',
     zIndex: 50,
   } : null
 
@@ -93,7 +92,7 @@ export default function OnboardingTour({ step, currentStep, targetRect, totalSte
         style={isCenter ? undefined : tooltipStyle(targetRect, currentStep.placement)}
         className={`fixed z-[60] ${isCenter ? 'inset-0 flex items-center justify-center' : ''}`}
       >
-        <div className={`relative bg-white rounded-2xl shadow-2xl ${isCenter ? 'mx-4 max-w-md p-8' : 'w-full p-5'}`}>
+        <div className={`relative border border-black bg-white ${isCenter ? 'mx-4 max-w-md p-8' : 'w-full p-5'}`}>
           {/* Close */}
           <button
             onClick={onClose}

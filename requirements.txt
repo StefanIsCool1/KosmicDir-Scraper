@@ -5,5 +5,10 @@ openai>=1.0
 python-dotenv>=1.0
 playwright>=1.48
 playwright-stealth>=1.0
+# patchright: drop-in patched Playwright that closes the Runtime.enable CDP
+# leak DataDome/Cloudflare use to fail human-solved challenges. Bot/_pw.py
+# auto-selects it when present. After install run: patchright install chromium
+patchright>=1.52
 curl-cffi>=0.7
 beautifulsoup4>=4.12
+openpyxl>=3.1

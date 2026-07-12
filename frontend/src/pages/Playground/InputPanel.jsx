@@ -1,5 +1,7 @@
-import { useState } from 'react'
-import { Loader2, Play, Plus, X, Trash2 } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
+import { Loader2, ArrowRight, Plus, X, Trash2, ChevronRight } from 'lucide-react'
+import { EASE } from '../../lib/motion'
 
 const TASK_TYPES = ['Auto Discover', 'Direct Scrape']
 
@@ -14,12 +16,28 @@ const PRIORITY_FIELDS = [
 
 const DEFAULT_PRIORITIES = ['email', 'phone']
 
+const PLACEHOLDER_URLS = [
+  'https://en.wikipedia.org/wiki/Web_scraping',
+  'https://www.chamberofcommerce.com/directory',
+  'https://members.hoa-usa.com/washington',
+  'https://example.com/business-directory',
+]
+
+const PLACEHOLDER_TYPE_SPEED = 55   // ms per character
+const PLACEHOLDER_PAUSE = 2200      // pause after fully typed before cycling
+
 export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }) {
-  const [urls, setUrls] = useState([''])
+  const [urls, setUrls] = useState([])
   const [taskType, setTaskType] = useState('Auto Discover')
   const [inputValue, setInputValue] = useState('')
+  const [goal, setGoal] = useState('')
   const [priorities, setPriorities] = useState(new Set(DEFAULT_PRIORITIES))
   const [accurateEnrichment, setAccurateEnrichment] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [isFocused, setIsFocused] = useState(false)
+  const [placeholderText, setPlaceholderText] = useState('')
+
+  const isAuto = taskType === 'Auto Discover'
 
   const togglePriority = (key) => {
     setPriorities((prev) => {
@@ -38,24 +56,21 @@ export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }
     }
   }
 
-  const removeUrl = (index) => {
-    setUrls((prev) => prev.filter((_, i) => i !== index))
-  }
+  const removeUrl = (index) => setUrls((prev) => prev.filter((_, i) => i !== index))
 
   const clearAll = () => {
     setUrls([])
     setInputValue('')
   }
 
-  const handleKeyDown = (e) => {
+  const handleUrlKeyDown = (e) => {
     if (e.key === 'Enter') {
       e.preventDefault()
-      addUrl()
+      handleSubmit()
     }
   }
 
   const handlePaste = (e) => {
-    e.preventDefault()
     const text = e.clipboardData.getData('text')
     const pasted = text
       .split(/[\n,]+/)
@@ -63,192 +78,302 @@ export default function InputPanel({ onRun, isRunning, currentIndex, totalUrls }
       .filter((s) => s && s.includes('.'))
 
     if (pasted.length > 1) {
+      e.preventDefault()
       setUrls((prev) => {
         const existing = new Set(prev)
         const newUrls = pasted.filter((u) => !existing.has(u))
         return [...prev.filter(Boolean), ...newUrls]
       })
       setInputValue('')
-    } else {
-      setInputValue(text.trim())
     }
   }
 
   const handleSubmit = (e) => {
-    e.preventDefault()
+    if (e) e.preventDefault()
     const allUrls = [...urls.filter(Boolean)]
     const trimmed = inputValue.trim()
-    if (trimmed && !allUrls.includes(trimmed)) {
-      allUrls.push(trimmed)
-    }
+    if (trimmed && !allUrls.includes(trimmed)) allUrls.push(trimmed)
     if (allUrls.length === 0) return
     setUrls(allUrls)
     setInputValue('')
-    onRun({ urls: allUrls, taskType, priorityFields: [...priorities], accurateEnrichment })
+    onRun({
+      urls: allUrls,
+      taskType,
+      priorityFields: [...priorities],
+      accurateEnrichment,
+      goal: isAuto ? goal.trim() : '',
+    })
   }
 
   const activeUrls = urls.filter(Boolean)
+  const canRun = !isRunning && (activeUrls.length > 0 || inputValue.trim())
+  const queued = activeUrls.length + (inputValue.trim() && !activeUrls.includes(inputValue.trim()) ? 1 : 0)
+
+  // ── Live-typing placeholder: cycles through example URLs ──
+  const shouldAnimate = !isFocused && !inputValue.trim() && activeUrls.length === 0
+
+  useEffect(() => {
+    if (!shouldAnimate) {
+      setPlaceholderText('')
+      return
+    }
+
+    let urlIdx = 0
+    let charIdx = 0
+    let timeout
+
+    const type = () => {
+      const url = PLACEHOLDER_URLS[urlIdx]
+      if (charIdx <= url.length) {
+        setPlaceholderText(url.slice(0, charIdx))
+        charIdx++
+        timeout = setTimeout(type, PLACEHOLDER_TYPE_SPEED)
+      } else {
+        timeout = setTimeout(() => {
+          charIdx = 0
+          urlIdx = (urlIdx + 1) % PLACEHOLDER_URLS.length
+          type()
+        }, PLACEHOLDER_PAUSE)
+      }
+    }
+
+    type()
+    return () => clearTimeout(timeout)
+  }, [shouldAnimate])
 
   return (
-    <form onSubmit={handleSubmit} className="flex flex-col gap-5">
-      {/* URL input */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <label className="text-xs font-medium text-gray-400">
-            Target URLs
-            {activeUrls.length > 0 && (
-              <span className="ml-1.5 text-accent">({activeUrls.length})</span>
-            )}
-          </label>
-          {activeUrls.length > 1 && (
-            <button type="button" onClick={clearAll} className="text-xs text-gray-300 hover:text-red-400 transition-colors flex items-center gap-1">
-              <Trash2 size={11} /> Clear all
-            </button>
-          )}
+    <form onSubmit={handleSubmit} className="flex flex-col items-stretch">
+      {/* ── The bar. One line: paste a directory URL, press run. ── */}
+      <div
+        className={`flex items-stretch border transition-colors ${
+          isRunning ? 'border-hairline' : 'border-black'
+        }`}
+      >
+        <div className="flex select-none items-center pl-4 pr-3 font-mono text-sm text-gray-300">
+          {isAuto ? '⌖' : '↳'}
         </div>
-
-        {activeUrls.length > 0 && (
-          <div className="mb-2 flex flex-col gap-1.5 max-h-40 overflow-y-auto">
-            {activeUrls.map((url, i) => (
-              <div
-                key={i}
-                className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-mono ${
-                  isRunning && i === currentIndex
-                    ? 'border-accent bg-accent-50 text-accent'
-                    : isRunning && i < (currentIndex ?? -1)
-                    ? 'border-green-200 bg-green-50 text-green-600'
-                    : 'border-gray-100 text-gray-500'
-                }`}
-              >
-                <span className="flex-1 truncate">{url}</span>
-                {!isRunning && (
-                  <button type="button" onClick={() => removeUrl(i)} className="text-gray-300 hover:text-red-400 transition-colors shrink-0">
-                    <X size={13} />
-                  </button>
-                )}
-                {isRunning && i === currentIndex && (
-                  <Loader2 size={12} className="animate-spin text-accent shrink-0" />
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            placeholder={activeUrls.length === 0 ? 'https://members.example.org' : 'Add another URL...'}
-            disabled={isRunning}
-            className="block flex-1 rounded-lg border border-gray-200 px-3.5 py-2.5 text-sm text-gray-700 placeholder-gray-300 outline-none transition-colors focus:border-accent focus:ring-1 focus:ring-accent/20 disabled:opacity-50"
-          />
+        <input
+          type="text"
+          value={inputValue}
+          onChange={(e) => setInputValue(e.target.value)}
+          onKeyDown={handleUrlKeyDown}
+          onPaste={handlePaste}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          placeholder={activeUrls.length > 0 ? 'Add another URL…' : placeholderText}
+          disabled={isRunning}
+          autoFocus
+          className="min-w-0 flex-1 bg-transparent py-4 pr-3 font-mono text-base text-black placeholder-gray-300 outline-none disabled:opacity-50"
+        />
+        {inputValue.trim() && !isRunning && (
           <button
             type="button"
             onClick={addUrl}
-            disabled={isRunning || !inputValue.trim()}
-            className="rounded-lg border border-gray-200 px-3 py-2.5 text-gray-400 hover:text-accent hover:border-accent transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+            title="Add another URL"
+            className="border-l border-hairline px-3 text-gray-400 transition-colors hover:text-black"
           >
             <Plus size={16} />
           </button>
-        </div>
-        <p className="mt-1.5 text-[11px] text-gray-300">
-          Paste multiple URLs (one per line) or add them one at a time.
-        </p>
-      </div>
-
-      {/* Task type */}
-      <div>
-        <label className="block text-xs font-medium text-gray-400 mb-1.5">Task Type</label>
-        <div data-tour="playground-task-type" className="flex rounded-lg border border-gray-200 p-0.5">
-          {TASK_TYPES.map((type) => (
-            <button
-              key={type}
-              type="button"
-              onClick={() => setTaskType(type)}
-              disabled={isRunning}
-              className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-all ${
-                taskType === type
-                  ? 'bg-accent text-white shadow-sm'
-                  : 'text-gray-500 hover:text-gray-700'
-              } disabled:opacity-70`}
-            >
-              {type}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Priority fields */}
-      <div>
-        <label className="block text-xs font-medium text-gray-400 mb-2">Priority Fields</label>
-        <div className="flex flex-wrap gap-2">
-          {PRIORITY_FIELDS.map(({ key, label }) => (
-            <button
-              key={key}
-              type="button"
-              onClick={() => togglePriority(key)}
-              disabled={isRunning}
-              className={`rounded-full px-3 py-1 text-xs font-medium border transition-all ${
-                priorities.has(key)
-                  ? 'border-accent bg-accent-50 text-accent'
-                  : 'border-gray-200 text-gray-400 hover:border-gray-300 hover:text-gray-600'
-              } disabled:opacity-70`}
-            >
-              {priorities.has(key) && <span className="mr-1">✓</span>}
-              {label}
-            </button>
-          ))}
-        </div>
-        <p className="mt-1.5 text-[11px] text-gray-300">
-          The bot will try detail crawl + enrichment to find these fields.
-        </p>
-      </div>
-
-      {/* Accurate enrichment toggle */}
-      <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5">
-        <label className="flex items-start gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={accurateEnrichment}
-            onChange={(e) => setAccurateEnrichment(e.target.checked)}
-            disabled={isRunning}
-            className="mt-0.5 h-4 w-4 rounded border-gray-300 text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="flex-1">
-            <span className="block text-sm font-medium text-gray-700">
-              More accurate web enrichment
-            </span>
-            <span className="mt-0.5 block text-[11px] text-amber-600">
-              ⚠ WARNING: takes longer — verifies each candidate website by fetching and matching
-              phone, email, address, and name against the page.
-            </span>
-          </span>
-        </label>
-      </div>
-
-      {/* Run button */}
-      <button
-        type="submit"
-        disabled={isRunning || (activeUrls.length === 0 && !inputValue.trim())}
-        className="mt-1 flex w-full items-center justify-center gap-2 rounded-xl bg-accent py-3 text-sm font-semibold text-white shadow-sm transition-all hover:bg-accent-600 disabled:opacity-70 disabled:cursor-not-allowed"
-      >
-        {isRunning ? (
-          <>
-            <Loader2 size={16} className="animate-spin" />
-            Scraping {currentIndex !== null ? `(${(currentIndex ?? 0) + 1}/${totalUrls})` : '...'}
-          </>
-        ) : (
-          <>
-            <Play size={16} />
-            {activeUrls.length > 1 || (activeUrls.length === 1 && inputValue.trim())
-              ? `Scrape ${activeUrls.length + (inputValue.trim() ? 1 : 0)} Sites`
-              : 'Run Trawlbase'}
-          </>
         )}
-      </button>
+        <button
+          type="submit"
+          disabled={!canRun}
+          className="flex items-center gap-2 bg-black px-5 text-sm font-medium text-white transition-colors hover:bg-[#222222] disabled:cursor-not-allowed disabled:opacity-30"
+        >
+          {isRunning ? (
+            <>
+              <Loader2 size={15} className="animate-spin" />
+              {currentIndex !== null ? `${(currentIndex ?? 0) + 1}/${totalUrls}` : 'Running'}
+            </>
+          ) : (
+            <>
+              {queued > 1 ? `Run ${queued}` : 'Run'}
+              <ArrowRight size={15} />
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Queued URLs — appear only when more than one is staged. */}
+      {activeUrls.length > 0 && (
+        <div className="mt-2 flex flex-col gap-1">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[11px] text-gray-300">
+              {activeUrls.length} queued
+            </span>
+            {!isRunning && (
+              <button
+                type="button"
+                onClick={clearAll}
+                className="flex items-center gap-1 text-[11px] text-gray-300 transition-colors hover:text-black"
+              >
+                <Trash2 size={10} /> clear
+              </button>
+            )}
+          </div>
+          {activeUrls.map((url, i) => (
+            <div
+              key={url}
+              className={`flex items-center gap-2 border px-3 py-1.5 font-mono text-[11px] ${
+                isRunning && i === currentIndex
+                  ? 'border-black text-black'
+                  : isRunning && i < (currentIndex ?? -1)
+                  ? 'border-hairline text-gray-300 line-through'
+                  : 'border-hairline text-gray-500'
+              }`}
+            >
+              <span className="flex-1 truncate">{url}</span>
+              {isRunning && i === currentIndex ? (
+                <Loader2 size={11} className="shrink-0 animate-spin text-black" />
+              ) : (
+                !isRunning && (
+                  <button type="button" onClick={() => removeUrl(i)} className="shrink-0 text-gray-300 transition-colors hover:text-black">
+                    <X size={12} />
+                  </button>
+                )
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── Mode. Auto Discover reveals the intent bar; Direct just scrapes. ── */}
+      <div className="mt-3 flex border border-hairline p-0.5">
+        {TASK_TYPES.map((type) => (
+          <button
+            key={type}
+            type="button"
+            data-tour={type === TASK_TYPES[0] ? 'playground-task-type' : undefined}
+            onClick={() => setTaskType(type)}
+            disabled={isRunning}
+            className={`flex-1 px-3 py-2 text-sm font-medium transition-colors disabled:opacity-70 ${
+              taskType === type ? 'bg-black text-white' : 'text-gray-500 hover:text-black'
+            }`}
+          >
+            {type}
+          </button>
+        ))}
+      </div>
+
+      {/* ── The magical bit: tell it what to look for. Auto Discover only. ── */}
+      <AnimatePresence initial={false}>
+        {isAuto && (
+          <motion.div
+            key="intent"
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.35, ease: EASE }}
+            className="overflow-hidden"
+          >
+            <div className="mt-3 border border-hairline bg-surface">
+              <div className="flex items-start gap-3 px-4 py-3">
+                <span className="mt-0.5 animate-pulse select-none font-mono text-base leading-none text-black">✦</span>
+                <div className="min-w-0 flex-1">
+                  <label className="block text-xs font-medium text-black">
+                    What should it discover?
+                  </label>
+                  <input
+                    type="text"
+                    value={goal}
+                    onChange={(e) => setGoal(e.target.value)}
+                    placeholder="all the restaurants · every plumber · leave blank for everything"
+                    disabled={isRunning}
+                    className="mt-1.5 w-full bg-transparent font-mono text-sm text-black placeholder-gray-300 outline-none disabled:opacity-50"
+                  />
+                </div>
+                {goal.trim() && !isRunning && (
+                  <button
+                    type="button"
+                    onClick={() => setGoal('')}
+                    className="mt-0.5 shrink-0 text-gray-300 transition-colors hover:text-black"
+                  >
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Advanced. Priority fields + enrichment, tucked out of the way. ── */}
+      <div className="mt-3">
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="flex items-center gap-1.5 text-xs font-medium text-gray-500 transition-colors hover:text-black"
+        >
+          <ChevronRight
+            size={13}
+            className="transition-transform"
+            style={{ transform: showAdvanced ? 'rotate(90deg)' : 'none' }}
+          />
+          Advanced
+          {(priorities.size > 0 || accurateEnrichment) && (
+            <span className="font-mono text-[11px] text-gray-300">
+              · {priorities.size} field{priorities.size === 1 ? '' : 's'}{accurateEnrichment ? ' · verify' : ''}
+            </span>
+          )}
+        </button>
+
+        <AnimatePresence initial={false}>
+          {showAdvanced && (
+            <motion.div
+              key="advanced"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.3, ease: EASE }}
+              className="overflow-hidden"
+            >
+              <div className="mt-3 flex flex-col gap-4 border border-hairline px-4 py-4">
+                <div>
+                  <span className="block text-xs font-medium text-black">Priority fields</span>
+                  <p className="mt-0.5 text-[11px] text-gray-300">
+                    Detail-crawl and enrich to fill these in.
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {PRIORITY_FIELDS.map(({ key, label }) => (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => togglePriority(key)}
+                        disabled={isRunning}
+                        className={`border px-3 py-1 text-xs font-medium transition-colors disabled:opacity-70 ${
+                          priorities.has(key)
+                            ? 'border-black bg-black text-white'
+                            : 'border-hairline text-gray-500 hover:border-black hover:text-black'
+                        }`}
+                      >
+                        {priorities.has(key) && <span className="mr-1">✓</span>}
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <label className="flex cursor-pointer items-start gap-2.5 border-t border-hairline pt-3">
+                  <input
+                    type="checkbox"
+                    checked={accurateEnrichment}
+                    onChange={(e) => setAccurateEnrichment(e.target.checked)}
+                    disabled={isRunning}
+                    className="mt-0.5 h-4 w-4 border-gray-300 disabled:opacity-50"
+                  />
+                  <span className="flex-1">
+                    <span className="block text-sm font-medium text-black">More accurate web enrichment</span>
+                    <span className="mt-0.5 block text-[11px] text-gray-500">
+                      Slower — verifies each candidate site by matching its phone, email,
+                      address, and name against the page.
+                    </span>
+                  </span>
+                </label>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </form>
   )
 }

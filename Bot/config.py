@@ -237,7 +237,22 @@ JSON_URL_EXCLUDE_PATTERNS = [
     "filter", "config", "setting", "auth", "token",
     "login", "session", "analytics", "visitor",
     "tracking", "nrdata", "nr-data", "newrelic", "stripe",
+    "partytown",  # web-worker proxy (walmart etc.) — forwards browser API
+                  # calls as JSON; tokens like "user"/"vendor" pass Method 1
 ]
+
+# Whole-word URL tokens that veto a JSON response (matched with the same
+# camelCase-aware tokenizer as Method 1, NOT substring like the patterns
+# above). Commerce endpoints — cart/checkout GraphQL ops like Walmart's
+# MergeAndGetCart — never hold directory members, but their multi-KB
+# payloads carry stray keyword tokens ("member" via membership-upsell
+# fields), so Method 1 flags them. A substring "cart" pattern above would
+# also veto legit URLs like ?city=Cartersville; tokenizing splits
+# MergeAndGetCart into {merge, and, get, cart} while "cartersville" stays
+# one token, so only real cart endpoints match.
+JSON_URL_EXCLUDE_TOKENS = {
+    "cart", "carts", "checkout", "basket", "wishlist",
+}
 
 # Field names that signal a JSON response contains member/company records
 # If a JSON object/array has 3+ of these keys, it's probably directory data
@@ -410,6 +425,42 @@ CATEGORY_URL_KEYWORDS = [
 # (if members are already visible, no need to iterate categories)
 CATEGORY_SKIP_VISIBLE_THRESHOLD = 3
 
+# Largest link group detect_category_links will accept. State/city partition
+# hubs routinely exceed the old cap of 50 (Walmart Minnesota lists 65 cities);
+# the uniqueness + nav-exclusion filters keep tag clouds out.
+CATEGORY_MAX_LINKS = 200
+
+# Minimum same-template child links (of the CURRENT page path) for a page to
+# count as a listing hub — used by the pre-search hub check in browser.py.
+# High on purpose: skipping search is only safe when the page is clearly a
+# partition index (per-city / per-category sub-pages), not a busy nav.
+CHILD_HUB_MIN_LINKS = 8
+
+# --- INTENT-DRIVEN DEEP CAPTURE (Agent mode only; intent=None skips all) ---
+# Step 2.5 in capture_responses fires only when the run captured LESS than
+# both of these — i.e. the normal search flow left the targeted intent
+# unfulfilled and it's worth replaying XHRs / crawling intent sub-pages.
+INTENT_LOW_RECORDS = 30    # JSON member records
+INTENT_LOW_VISIBLE = 25    # visible result cards
+
+# Intent sub-page crawl (discover_intent_subpages): BFS over intent-matched
+# category/sub-directory links. Depth 2 covers /directory/{category}/{city}.
+INTENT_MAX_SUBPAGES = 40
+INTENT_SUBPAGE_DEPTH = 2
+
+# XHR replay (replay_directory_xhrs): re-fetch captured directory APIs with
+# mutated page/term/letter params through the browser's own cookie jar.
+XHR_MAX_REPLAYS = 60             # total replayed requests per run
+XHR_MAX_PAGINATION_PAGES = 30    # pages walked per paginated endpoint
+
+# Query-param names recognized by _find_enumerable_params. Matched on the
+# lowercased param name; page-like params get incremented, term-like params
+# get the intent terms substituted, letter-like params iterate a-z0-9.
+XHR_PAGE_PARAMS = {"page", "pg", "pagenum", "pagenumber", "offset", "start", "skip", "p"}
+XHR_TERM_PARAMS = {"q", "query", "search", "keyword", "keywords", "term",
+                   "name", "category", "cat", "type", "specialty", "industry"}
+XHR_LETTER_PARAMS = {"letter", "alpha", "startswith", "char"}
+
 # --- RESOURCE BLOCKING ---
 # Block these resource types — the bot only uses JSON and HTML responses.
 # CSS is kept (needed for is_visible() checks and element positioning).
@@ -419,15 +470,111 @@ CATEGORY_SKIP_VISIBLE_THRESHOLD = 3
 _BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
+# --- STEALTH / ANTI-BOT EVASION ---
+# Launch flags that lower the automation fingerprint. The single most important
+# one is --disable-blink-features=AutomationControlled, which removes the
+# navigator.webdriver=true tell at the browser level (the cheapest check
+# DataDome/Cloudflare run). We deliberately keep this list SHORT and safe:
+# flags like --disable-features=IsolateOrigins,site-per-process are omitted
+# because they break the iframe result-frame flow this scraper depends on.
+STEALTH_LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-infobars",
+]
+
+# Playwright adds these by default; they advertise automation to anti-bot
+# fingerprinters. Dropping them is safe for normal scraping.
+_IGNORE_DEFAULT_ARGS = ["--enable-automation"]
+
+
 def launch_browser(playwright):
-    """Launch Chromium for scraping. Single point for all three launch sites
+    """Launch a browser for scraping. Single point for all three launch sites
     (browser.py, detail_crawler.py x2).
 
-    Default is HEADED — the interactive login flow needs a visible window.
-    Set SCRAPER_HEADLESS=1 to run headless (servers / CI, where headed
-    Chromium crashes on a missing display)."""
+    Default is HEADED — the interactive login/CAPTCHA flow needs a visible
+    window. Set SCRAPER_HEADLESS=1 to run headless (servers / CI, where headed
+    Chromium crashes on a missing display).
+
+    Prefers real Google Chrome (channel="chrome") when it's installed — a
+    genuine Chrome build has a much stronger fingerprint (real UA, media
+    codecs, component-updater traffic) than bundled headless Chromium. Falls
+    back to the bundled Chromium when Chrome isn't present on this machine."""
     headless = os.environ.get("SCRAPER_HEADLESS", "").strip() == "1"
-    return playwright.chromium.launch(headless=headless)
+    launch_kwargs = dict(
+        headless=headless,
+        args=STEALTH_LAUNCH_ARGS,
+        ignore_default_args=_IGNORE_DEFAULT_ARGS,
+    )
+    try:
+        return playwright.chromium.launch(channel="chrome", **launch_kwargs)
+    except Exception:
+        # Real Chrome not installed / not launchable — use bundled Chromium.
+        return playwright.chromium.launch(**launch_kwargs)
+
+
+def _clean_user_agent(browser) -> str | None:
+    """Build a realistic desktop-Chrome user agent matching the launched
+    browser's major version and the host OS. Used to strip the 'HeadlessChrome'
+    token that headless Chromium leaks (its loudest tell). Returns None if the
+    version can't be read, so the caller keeps the native UA rather than risk a
+    mismatched one."""
+    try:
+        version = browser.version  # e.g. "140.0.7339.5"
+        major = version.split(".")[0]
+        if not major.isdigit():
+            return None
+    except Exception:
+        return None
+    import sys as _sys
+    if _sys.platform == "darwin":
+        platform_token = "Macintosh; Intel Mac OS X 10_15_7"
+    elif _sys.platform.startswith("win"):
+        platform_token = "Windows NT 10.0; Win64; x64"
+    else:
+        platform_token = "X11; Linux x86_64"
+    return (
+        f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
+def new_stealth_page(browser):
+    """Create a page inside a context tuned to look like a normal desktop-Chrome
+    session: consistent locale/timezone/viewport, a clean user agent (no
+    'HeadlessChrome' token when headless), and navigator.webdriver removed.
+
+    Single point used by browser.py and detail_crawler.py so every page the
+    scraper opens carries the same, non-automated-looking fingerprint. Cookie
+    persistence still works — page.context is the context created here."""
+    headless = os.environ.get("SCRAPER_HEADLESS", "").strip() == "1"
+    context_opts = dict(
+        locale="en-US",
+        timezone_id="America/New_York",
+        viewport={"width": 1440, "height": 900},
+        color_scheme="light",
+    )
+    # Only override the UA when headless (to strip 'HeadlessChrome'). In headed
+    # mode the native UA is already clean, and overriding risks a UA vs.
+    # sec-ch-ua client-hint mismatch (which is itself a fingerprint).
+    if headless:
+        ua = _clean_user_agent(browser)
+        if ua:
+            context_opts["user_agent"] = ua
+
+    context = browser.new_context(**context_opts)
+    # Belt-and-suspenders webdriver cover via an init script (runs before any
+    # page script). Redundant with the launch flag and with patchright, but
+    # it's the only webdriver protection detail_crawler pages get without the
+    # stealth plugin.
+    try:
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+    except Exception:
+        pass
+    return context.new_page()
 
 
 def block_unnecessary_resources(page):
@@ -442,6 +589,18 @@ def block_unnecessary_resources(page):
             route.continue_()
 
     page.route("**/*", _route_handler)
+
+
+def unblock_resources(page):
+    """Remove the image/font/media route block (see block_unnecessary_resources)
+    so a paused human sees a fully-rendered page — e.g. an image-based CAPTCHA
+    challenge that would otherwise show broken tiles. Call
+    block_unnecessary_resources(page) again to restore blocking afterwards.
+    This module is the only place that routes "**/*", so unrouting it is safe."""
+    try:
+        page.unroute("**/*")
+    except Exception:
+        pass
 
 
 # --- SELECTOR CACHE ---

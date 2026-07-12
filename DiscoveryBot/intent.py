@@ -117,7 +117,8 @@ Return ONLY a JSON object — no markdown fences, no explanation. Use this schem
   "api_params": {{"taxonomy": "<the practitioner type, singular, e.g. 'dentist'>", "state": "<2-letter US state>", "city": "<optional single city, or empty string>"}},
   "scope_ambiguous": <true | false>,
   "scope_question": "<REQUIRED when scope_ambiguous=true: ONE friendly sentence asking whether they want specialists only, or anyone who does this work. Empty string otherwise.>",
-  "scope_options": ["<short label for the SPECIALISTS-ONLY choice>", "<short label for the ANYONE-WHO-DOES-IT choice>"]
+  "scope_options": ["<short label for the SPECIALISTS-ONLY choice>", "<short label for the ANYONE-WHO-DOES-IT choice>"],
+  "coverage": "<'all' when the user wants EVERYTHING a directory or site lists, with NO industry qualifier — 'all businesses in the Duluth chamber', 'everything from this directory', 'every member/listing'. 'targeted' when they want a specific industry, profession, or subset. Default 'targeted'.>"
 }}
 
 When is_actionable is false, only "is_actionable" and "clarification" are required — omit the other fields.
@@ -131,6 +132,9 @@ Rules when actionable:
 - api_vertical: set "npi" ONLY for the healthcare practitioners listed above with a US state.
   When unsure, leave it null — a downstream check validates the taxonomy and falls back to
   normal directory discovery anyway, so a wrong "npi" guess wastes the routing, not the run.
+- coverage: "all" ONLY when no industry narrows the ask — the user wants a whole directory
+  ("all businesses in the Duluth chamber", "the entire member list"). An "all"/"every" that
+  modifies a specific industry is still "targeted": "all dentists in Austin" → "targeted".
 
 SCOPE AMBIGUITY — decide whether the target is a specific build/remodel/trade CAPABILITY that
 general contractors, remodelers, or broader firms also provide, so "the results" could mean two
@@ -198,6 +202,7 @@ def _fallback_plan(goal: str) -> dict:
         "scope_options": [],
         "api_vertical": None,
         "api_params": {},
+        "coverage": "targeted",
     }
 
 
@@ -215,6 +220,7 @@ def _clarification_plan(question: str) -> dict:
         "scope_options": [],
         "api_vertical": None,
         "api_params": {},
+        "coverage": "targeted",
     }
 
 
@@ -302,6 +308,13 @@ def parse_intent(goal: str) -> dict:
     # back to discovery on a miss), so here we just clean the shape.
     plan["api_vertical"] = plan.get("api_vertical") if plan.get("api_vertical") in ("npi",) else None
     plan["api_params"] = plan["api_params"] if isinstance(plan.get("api_params"), dict) else {}
+
+    # Coverage: "all" = scrape the whole directory (intent_from_plan maps it
+    # to intent=None so Phase 1 runs the plain wildcard flow). Anything the
+    # LLM didn't answer cleanly stays "targeted" — today's behavior.
+    coverage = plan.get("coverage")
+    plan["coverage"] = coverage if isinstance(coverage, str) and coverage.lower() in ("all", "targeted") else "targeted"
+    plan["coverage"] = plan["coverage"].lower()
 
     # Safety net: catch region keywords the LLM may have ignored
     plan = _expand_regions(goal, plan)

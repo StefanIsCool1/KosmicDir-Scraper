@@ -1,30 +1,20 @@
-import { motion } from 'framer-motion'
 import Button from '../../components/Button'
-import { EASE } from '../../lib/motion'
 
+// One closing action, stated plainly on the surface tone.
 export default function CTASection() {
   return (
-    <section className="bg-[#FAFAFA] px-6 py-20 md:py-28">
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.6, ease: EASE }}
-        className="mx-auto max-w-lg text-center"
-      >
-        <h2 className="text-3xl font-bold tracking-tighter text-gray-900 sm:text-4xl">
-          Scrape your first directory
-        </h2>
-        <p className="mt-4 text-gray-500">
-          Paste a URL and watch it work. No account required.
-        </p>
-        <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-          <Button to="/playground">Open the Scraper &rarr;</Button>
-          <Button variant="secondary" to="/pricing">
-            View Pricing
-          </Button>
+    <section className="border-t border-hairline bg-surface px-6 py-24 md:py-32 lg:px-16">
+      <div className="mx-auto flex max-w-site flex-col items-start gap-12 md:flex-row md:items-end md:justify-between">
+        <div>
+          <h2 className="text-3xl font-semibold tracking-tighter text-black sm:text-4xl">
+            Scrape your first directory.
+          </h2>
+          <p className="mt-4 max-w-md text-gray-500">
+            Paste a URL and watch it work. No account required.
+          </p>
         </div>
-      </motion.div>
+        <Button to="/playground">Open the scraper</Button>
+      </div>
     </section>
   )
 }

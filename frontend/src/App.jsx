@@ -4,14 +4,16 @@ import Footer from './components/Footer'
 import PageTransition from './components/PageTransition'
 import OnboardingTour from './components/OnboardingTour'
 import useOnboardingTour from './hooks/useOnboardingTour'
+import useAnalytics from './hooks/useAnalytics'
 import Landing from './pages/Landing/Landing'
 import Playground from './pages/Playground/Playground'
 import Agent from './pages/Agent/Agent'
 import Pricing from './pages/Pricing/Pricing'
-import Docs from './pages/Docs/Docs'
+import Analytics from './pages/Analytics/Analytics'
 
 export default function App() {
   const { show, step, currentStep, targetRect, totalSteps, next, prev, complete } = useOnboardingTour()
+  useAnalytics({ trackPageViews: true })
   const location = useLocation()
 
   return (
@@ -36,7 +38,9 @@ export default function App() {
             <Route path="/playground" element={<Playground />} />
             <Route path="/agent" element={<Agent />} />
             <Route path="/pricing" element={<Pricing />} />
-            <Route path="/docs" element={<Docs />} />
+            {/* Production analytics lives at stats.trawlbase.com (see main.jsx);
+                this route exists only so the dashboard is reachable in dev. */}
+            {import.meta.env.DEV && <Route path="/analytics" element={<Analytics />} />}
           </Routes>
         </PageTransition>
       </main>

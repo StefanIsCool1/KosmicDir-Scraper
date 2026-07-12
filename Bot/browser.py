@@ -11,19 +11,29 @@ import time
 import threading
 import json
 import os
-from urllib.parse import urlparse
+from collections import deque
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from config import (
     DEFAULT_IDLE_TIMEOUT, SEARCH_IDLE_TIMEOUT, PAGINATION_IDLE_TIMEOUT,
     NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
     JSON_JUNK_DOMAINS,
-    JSON_DIRECTORY_KEYWORDS, JSON_URL_KEYWORDS, JSON_URL_EXCLUDE_PATTERNS, JSON_STRUCTURE_FIELDS,
+    JSON_DIRECTORY_KEYWORDS, JSON_URL_KEYWORDS, JSON_URL_EXCLUDE_PATTERNS,
+    JSON_URL_EXCLUDE_TOKENS, JSON_STRUCTURE_FIELDS,
     DIRECTORY_URL_KEYWORDS,
     NEXT_BUTTON_SELECTORS, LOAD_MORE_SELECTORS,
     SCROLL_BATCH_SIZE, SCROLL_STALE_THRESHOLD,
     CATEGORY_SKIP_VISIBLE_THRESHOLD,
+    CHILD_HUB_MIN_LINKS,
+    INTENT_LOW_RECORDS, INTENT_LOW_VISIBLE,
+    INTENT_MAX_SUBPAGES, INTENT_SUBPAGE_DEPTH,
+    XHR_MAX_REPLAYS, XHR_MAX_PAGINATION_PAGES,
+    XHR_PAGE_PARAMS, XHR_TERM_PARAMS, XHR_LETTER_PARAMS,
     block_unnecessary_resources,
+    unblock_resources,
     launch_browser,
+    new_stealth_page,
 )
+from _pw import IS_PATCHRIGHT
 from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all
 from intent_filter import filter_categories_by_intent
 from debug import debug
@@ -37,6 +47,11 @@ _DIRECTORY_CONTENT_KEYWORDS = [
     "load more", "company", "contact",
     "doctor", "restaurant", "attorney", "clinic",
 ]
+
+# Loose US phone pattern — fallback signal that a deliberately visited
+# category page holds listing data even when none of the keywords above
+# appear in its HTML.
+_PHONE_RE = re.compile(r"\(\d{3}\)\s*\d{3}[-.\s]\d{4}|\b\d{3}[-.]\d{3}[-.]\d{4}\b")
 
 # --- IFRAME DETECTION ---
 
@@ -245,6 +260,14 @@ def _is_directory_json(data, url: str) -> bool:
     if is_directory_data and any(excl in url_lower for excl in JSON_URL_EXCLUDE_PATTERNS):
         is_directory_data = False
 
+    # Commerce-endpoint veto: cart/checkout ops never hold members, but
+    # their payloads trip Method 1 (Walmart's MergeAndGetCart carries a
+    # stray "member" token in membership fields). Tokenize the ORIGINAL-
+    # case URL so camelCase operation names split (MergeAndGetCart →
+    # "cart") — lowercasing first would fuse them into one unmatched token.
+    if is_directory_data and (_extract_word_tokens(url) & JSON_URL_EXCLUDE_TOKENS):
+        is_directory_data = False
+
     return is_directory_data
 
 
@@ -275,6 +298,369 @@ def _looks_like_member_records(lst) -> bool:
     if "fields" in keys and isinstance(lst[0].get("fields"), dict):
         return bool({k.lower() for k in lst[0]["fields"].keys()} & _MEMBER_NAME_KEYS)
     return False
+
+
+def _count_json_member_records(results: list) -> int:
+    """Total member-shaped records across the captured JSON responses.
+
+    Junk that slips capture (Partytown worker proxies, cart/session GraphQL,
+    i18n bundles) makes `results` non-empty on many sites, so any gate that
+    asks "did we capture data yet?" must count member RECORDS, not responses.
+    """
+    count = 0
+    for r in results:
+        data = r.get("data", {})
+        if isinstance(data, list) and _looks_like_member_records(data):
+            count += len(data)
+        elif isinstance(data, dict) and "raw_html" not in data:
+            for val in data.values():
+                if isinstance(val, list) and _looks_like_member_records(val):
+                    count += len(val)
+    return count
+
+
+def _find_enumerable_params(url: str) -> dict:
+    """Classify a captured URL's query params into page/term/letter buckets.
+
+    Pure — no network. Drives replay_directory_xhrs: page-like params get
+    incremented, term-like params get the intent terms substituted, letter-
+    like params iterate a-z0-9. A term-like param whose current value is a
+    single character is reclassified as letter-like (starts-with engines).
+    """
+    out: dict[str, list] = {"page": [], "term": [], "letter": []}
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return out
+    if not parsed.query:
+        return out
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    for name, values in params.items():
+        lname = name.lower()
+        val = (values[0] if values else "").strip()
+        if lname in XHR_LETTER_PARAMS or (
+                lname in XHR_TERM_PARAMS and len(val) == 1 and val.isalnum()):
+            out["letter"].append(name)
+        elif lname in XHR_PAGE_PARAMS:
+            out["page"].append(name)
+        elif lname in XHR_TERM_PARAMS:
+            out["term"].append(name)
+    return out
+
+
+def _replace_query_param(url: str, name: str, value) -> str:
+    """Return `url` with query param `name` set to `value` (others intact)."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[name] = [str(value)]
+    return urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+
+
+def _infer_page_size(query_params: dict) -> int:
+    """Best-effort page size from a limit/per_page/size-style param, else 20."""
+    for k, vals in query_params.items():
+        if k.lower() in {"limit", "pagesize", "per_page", "perpage",
+                         "size", "count", "rows"}:
+            try:
+                n = int((vals[0] if vals else "").strip())
+                if n > 0:
+                    return n
+            except (ValueError, IndexError):
+                pass
+    return 20
+
+
+def replay_directory_xhrs(page, results, intent) -> int:
+    """Re-fetch captured directory-API endpoints with mutated params.
+
+    A site that answered its search over XHR usually exposes page/query/letter
+    params we can walk directly — cheaper and more complete than driving the
+    UI. Replays go through page.context.request so the browser's cookies and
+    anti-bot clearance ride along (curl_cffi carries neither and would 403 on
+    exactly these sites). New responses are gated through the SAME
+    _is_directory_json used by on_response and appended in the same shape, so
+    all downstream counting/dedup/detail logic works unchanged.
+
+    Agent mode only (intent gate lives at the call site AND here). Fail-open:
+    any error just returns the records added so far. Returns NEW record count.
+    """
+    if not intent:
+        return 0
+    try:
+        req = page.context.request
+    except Exception:
+        return 0
+
+    # Candidate endpoints: URLs already gated by _is_directory_json, GET-shaped
+    # with a mutable query string. Dedup, preserve capture order.
+    candidates: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+    for r in results:
+        url = r.get("url", "")
+        data = r.get("data")
+        if not url or url in seen:
+            continue
+        if not isinstance(data, (list, dict)):
+            continue
+        if isinstance(data, dict) and "raw_html" in data:
+            continue
+        params = _find_enumerable_params(url)
+        if params["page"] or params["term"] or params["letter"]:
+            seen.add(url)
+            candidates.append((url, params))
+
+    if not candidates:
+        return 0
+
+    # Intent term queries (canonical + up to 3 aliases), deduped.
+    canonical = (intent.get("industry_canonical") or "").strip()
+    aliases = [(a or "").strip()
+               for a in (intent.get("industry_aliases") or []) if (a or "").strip()]
+    term_values: list[str] = []
+    seen_terms: set[str] = set()
+    for t in [canonical] + aliases[:3]:
+        if t and t.lower() not in seen_terms:
+            term_values.append(t)
+            seen_terms.add(t.lower())
+
+    start_records = _count_json_member_records(results)
+    counters = {"replays": 0, "consec_fail": 0}
+
+    def _fetch(u: str):
+        """GET u through the browser context; return parsed JSON or None."""
+        if counters["replays"] >= XHR_MAX_REPLAYS or counters["consec_fail"] >= 3:
+            return None
+        counters["replays"] += 1
+        try:
+            resp = req.get(u, timeout=15000)
+            if not resp.ok:
+                counters["consec_fail"] += 1
+                return None
+            data = resp.json()
+            counters["consec_fail"] = 0
+            return data
+        except Exception:
+            counters["consec_fail"] += 1
+            return None
+        finally:
+            time.sleep(random.uniform(0.1, 0.25))
+
+    def _absorb(u: str, data) -> bool:
+        """Gate + append exactly like on_response. True if member data."""
+        if data is not None and _is_directory_json(data, u):
+            results.append({"url": u, "data": data})
+            return True
+        return False
+
+    def _stop() -> bool:
+        return (counters["replays"] >= XHR_MAX_REPLAYS
+                or counters["consec_fail"] >= 3
+                or _count_json_member_records(results) >= 300)
+
+    for base_url, params in candidates:
+        if _stop():
+            break
+
+        # --- Strategy 1: pagination (increment page/offset until dry) ---
+        for pname in params["page"]:
+            if _stop():
+                break
+            qp = parse_qs(urlparse(base_url).query, keep_blank_values=True)
+            try:
+                cur = int((qp.get(pname, ["0"])[0] or "0").strip())
+            except ValueError:
+                continue
+            is_offset = pname.lower() in {"offset", "start", "skip"}
+            step = _infer_page_size(qp) if is_offset else 1
+            prev_hash = None
+            nxt = cur
+            for _ in range(XHR_MAX_PAGINATION_PAGES):
+                if _stop():
+                    break
+                nxt += step
+                u = _replace_query_param(base_url, pname, nxt)
+                before = _count_json_member_records(results)
+                data = _fetch(u)
+                if data is None:
+                    break
+                h = hash(json.dumps(data, sort_keys=True, default=str))
+                if h == prev_hash:
+                    break              # same payload — endpoint clamps, stop
+                prev_hash = h
+                _absorb(u, data)
+                if _count_json_member_records(results) == before:
+                    break              # no new members — end of the list
+
+        # --- Strategy 2: intent terms (does the intent live in this API?) ---
+        for pname in params["term"]:
+            for tv in term_values:
+                if _stop():
+                    break
+                u = _replace_query_param(base_url, pname, tv)
+                _absorb(u, _fetch(u))
+
+        # --- Strategy 3: letters (starts-with API mirror of search_all_letters) ---
+        for pname in params["letter"]:
+            for ch in "abcdefghijklmnopqrstuvwxyz0123456789":
+                if _stop():
+                    break
+                u = _replace_query_param(base_url, pname, ch)
+                _absorb(u, _fetch(u))
+
+    added = _count_json_member_records(results) - start_records
+    if counters["replays"] > 0:
+        print(f"  XHR replay: {counters['replays']} requests, {added} new member records")
+        debug.decision("CAPTURE", "xhr replay",
+                       f"{counters['replays']} requests, {added} new records",
+                       data={"candidates": len(candidates)})
+    return added
+
+
+def discover_intent_subpages(page, intent, results, link_collector,
+                             html_collector) -> bool:
+    """BFS-crawl intent-matched category / sub-directory links.
+
+    The normal category iteration only runs in the no-search fallback; when a
+    search fired weakly or a few records trickled in, the intent-relevant
+    sub-pages are never explored. This finds LOTS of them: it seeds from the
+    landing page's intent-matched children (relaxed detect_category_links +
+    strict-subset filter_categories_by_intent), then walks each sub-page
+    through the SAME collect-links / capture-HTML / paginate recipe the
+    category loop uses, and re-detects deeper children as it goes.
+
+    JSON XHRs the navigations fire are captured by the live on_response
+    listener into `results` — nothing extra needed for network data.
+
+    Agent mode only (caller AND this fn gate on intent). Same-origin, depth-
+    and count-capped, fail-open. Returns True if it visited any sub-page.
+    """
+    if not intent:
+        return False
+    try:
+        origin = urlparse(page.url).netloc.lower()
+    except Exception:
+        return False
+
+    aliases = {(a or "").lower() for a in intent.get("industry_aliases", []) if a}
+    canon = (intent.get("industry_canonical") or "").lower()
+    if canon:
+        aliases.add(canon)
+
+    def _norm(u: str) -> str:
+        try:
+            return urlparse(u)._replace(fragment="").geturl().rstrip("/")
+        except Exception:
+            return u
+
+    def _same_origin(u: str) -> bool:
+        try:
+            return urlparse(u).netloc.lower() == origin
+        except Exception:
+            return False
+
+    def _substring_pick(cands: list) -> list:
+        return [c for c in cands
+                if any(a and a in (c.get("text") or "").lower() for a in aliases)]
+
+    llm_budget = {"n": 3}   # hard cap on LLM-backed picks per domain
+
+    def _pick(cands: list, examine_depth: int) -> list:
+        """Intent-narrow candidate children. filter_categories_by_intent
+        falls OPEN (returns the same full list) when there's no intent signal,
+        so only a STRICT subset counts as a real match. The LLM layer is
+        allowed at shallow depths within budget; deeper/over-budget picks use
+        substring only to keep AI cost near one call per domain."""
+        if not cands:
+            return []
+        if examine_depth <= 1 and llm_budget["n"] > 0:
+            llm_budget["n"] -= 1
+            picked = filter_categories_by_intent(cands, intent)
+            if 0 < len(picked) < len(cands):
+                return picked
+            # fell open (no intent signal) — fall through to substring backstop
+        return _substring_pick(cands)
+
+    # Seed sub-pages: reuse a cached pick for this domain+industry if we have
+    # one (skips the landing detect + LLM), else compute and cache it.
+    from cache import get_cached_intent_subpages, set_cached_intent_subpages
+    cached = get_cached_intent_subpages(origin, canon)
+    if cached:
+        seed = [{"text": "", "href": h} for h in cached if _same_origin(h)]
+        print(f"  Intent sub-page crawl: using {len(seed)} cached seed links")
+    else:
+        seed = _pick(detect_category_links(page, ignore_visible=True, top_groups=3), 0)
+        seed = [c for c in seed if _same_origin(c["href"])]
+        if seed:
+            set_cached_intent_subpages(origin, canon, [c["href"] for c in seed])
+    if not seed:
+        return False
+
+    visited = {_norm(page.url)}
+    queue: deque = deque()
+    for c in seed:
+        n = _norm(c["href"])
+        if n not in visited:
+            visited.add(n)
+            queue.append((c["href"], 1))
+
+    print(f"  Intent sub-page crawl: {len(queue)} seed links matched intent")
+    visited_count = 0
+
+    while queue:
+        if visited_count >= INTENT_MAX_SUBPAGES:
+            break
+        if _count_json_member_records(results) >= 50 or len(html_collector) >= 40:
+            debug.decision("EXPAND", "intent sub-pages: early stop",
+                           f"visited {visited_count}, "
+                           f"{_count_json_member_records(results)} records, "
+                           f"{len(html_collector)} html pages")
+            break
+
+        href, depth = queue.popleft()
+        try:
+            page.goto(href, timeout=15000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+            except Exception:
+                pass
+            page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+            visited_count += 1
+            print(f"  Sub-page {visited_count}/{INTENT_MAX_SUBPAGES} (d{depth}): {href[:100]}")
+
+            link_collector.extend(collect_page_links(page))
+
+            try:
+                html = page.content()
+                if (any(kw in html.lower() for kw in _DIRECTORY_CONTENT_KEYWORDS)
+                        or _PHONE_RE.search(html)):
+                    html_collector.append(html)
+            except Exception:
+                pass
+
+            handle_pagination(page, threading.Event(),
+                              link_collector=link_collector,
+                              html_collector=html_collector)
+
+            # Go deeper: re-detect intent-matched children of THIS sub-page.
+            if depth < INTENT_SUBPAGE_DEPTH:
+                children = _pick(
+                    detect_category_links(page, ignore_visible=True, top_groups=3),
+                    depth)
+                for c in children:
+                    n = _norm(c["href"])
+                    if n not in visited and _same_origin(c["href"]):
+                        visited.add(n)
+                        queue.append((c["href"], depth + 1))
+        except Exception as e:
+            print(f"  Error on sub-page '{href[:80]}': {e}")
+            continue
+
+    if visited_count:
+        debug.decision("EXPAND", "intent sub-pages crawled",
+                       f"visited {visited_count} pages",
+                       data={"records": _count_json_member_records(results),
+                             "html_pages": len(html_collector)})
+    return visited_count > 0
 
 
 def find_content_frame(page):
@@ -767,9 +1153,233 @@ def _save_cookies(page, domain: str):
         print(f"  Failed to save cookies for {domain}: {e}")
 
 
+# --- CAPTCHA / ANTI-BOT CHALLENGE DETECTION & HUMAN HANDOFF ---
+
+# Unmistakable challenge copy — any one of these in the page text means the
+# WHOLE page is a "prove you're human" wall (not real content).
+_CAPTCHA_TEXT_SIGNALS = [
+    "activate and hold",                      # DataDome press-and-hold
+    "press and hold",
+    "hold the button",
+    "verify you are human",
+    "verify you are a human",
+    "please verify you are a human",
+    "are you a robot",
+    "robot or human",
+    "checking your browser before",           # Cloudflare interstitial
+    "just a moment",                          # Cloudflare <title>/body
+    "please enable javascript and cookies",   # DataDome
+    "complete the security check",
+    "additional verification required",
+    "unusual traffic from your",              # Google soft-block
+]
+
+# Very specific phrases that fire regardless of page size (a genuine challenge
+# wall even when the surrounding markup happens to be large).
+_CAPTCHA_STRONG_TEXT = {
+    "activate and hold", "press and hold", "hold the button",
+    "just a moment", "please enable javascript and cookies",
+    "checking your browser before",
+}
+
+# Challenge-only hosts. These load an iframe/script ONLY when a real challenge
+# is on screen, so their presence in the DOM is a strong signal. (reCAPTCHA
+# uses api2/bframe — the popped-open challenge — not the ever-present invisible
+# badge, to avoid pausing on a contact form that merely embeds reCAPTCHA.)
+_CAPTCHA_HOST_SIGNALS = {
+    "captcha-delivery.com": "DataDome",
+    "challenges.cloudflare.com": "Cloudflare Turnstile",
+    "hcaptcha.com": "hCaptcha",
+    "recaptcha/api2/bframe": "reCAPTCHA challenge",
+}
+
+# Page <title> substrings that mark a block/challenge page.
+_CAPTCHA_TITLE_SIGNALS = [
+    "just a moment", "attention required", "access denied",
+    "security check", "are you human", "robot or human",
+]
+
+_CAPTCHA_MAX_ATTEMPTS = 3
+
+
+def detect_captcha(page) -> str | None:
+    """Return the anti-bot vendor name if the CURRENT page is a challenge/block
+    wall, else None. Conservative by design — a false positive would needlessly
+    pause a scrape that could have continued."""
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    for sig in _CAPTCHA_TITLE_SIGNALS:
+        if sig in title:
+            return "anti-bot challenge"
+
+    try:
+        html = page.content().lower()
+    except Exception:
+        return None
+
+    # Strong: a known challenge host embedded in the page (iframe/script src).
+    for host, vendor in _CAPTCHA_HOST_SIGNALS.items():
+        if host in html:
+            return vendor
+
+    # Unmistakable, specific challenge copy — fire at any page size.
+    hits = {s for s in _CAPTCHA_TEXT_SIGNALS if s in html}
+    if hits & _CAPTCHA_STRONG_TEXT:
+        return "anti-bot challenge"
+    # Generic copy ("robot or human", "are you a robot") — only trust it on a
+    # tiny page. A real interstitial is small; a full content page that merely
+    # mentions the phrase in prose or a FAQ is not a challenge.
+    if hits and len(html) < 15000:
+        return "anti-bot challenge"
+    return None
+
+
+def handle_captcha(page, domain: str, captcha_callback) -> bool:
+    """If the current page is an anti-bot challenge, pause for a human to solve
+    it in the (headed) browser window, then verify it cleared before resuming.
+
+    captcha_callback(page, domain, vendor) -> bool
+        Returns True after the human reports they've solved it (we re-check and
+        loop if it's still up), or False to give up on this site. If None
+        (unattended run), we log and bail — nobody is there to solve it.
+
+    Returns True if the page is clear (no challenge, or solved), False if a
+    challenge remains / was skipped. Idempotent: no-op fast path when clear."""
+    vendor = detect_captcha(page)
+    if not vendor:
+        return True
+
+    print(f"\n  ╔══════════════════════════════════════════════╗")
+    print(f"  ║  CAPTCHA / ANTI-BOT CHALLENGE DETECTED        ║")
+    print(f"  ║  Vendor: {vendor[:35]:<35} ║")
+    print(f"  ║  A human must solve it in the browser window. ║")
+    print(f"  ╚══════════════════════════════════════════════╝")
+    debug.log("CAPTCHA", f"Challenge on {domain}: {vendor}", level="warn")
+
+    if captcha_callback is None:
+        print(f"  No captcha_callback (unattended run) — cannot solve, skipping site.")
+        return False
+
+    # Let the human actually SEE and interact with the challenge: drop the
+    # image/font block so image-based challenges render, and focus the window.
+    unblock_resources(page)
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    for attempt in range(1, _CAPTCHA_MAX_ATTEMPTS + 1):
+        cont = captcha_callback(page, domain, vendor)
+        if not cont:
+            print(f"  CAPTCHA solve skipped by user — scrape may return 0 results.")
+            block_unnecessary_resources(page)  # restore blocking for the rest of the run
+            return False
+        # A successful solve makes DataDome/Cloudflare RELOAD the page to the
+        # real content — checking too early sees the challenge still mid-reload
+        # and false-reports failure. Wait for the reload to settle first.
+        try:
+            page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+        except Exception:
+            pass
+        page.wait_for_timeout(2500)
+        if not detect_captcha(page):
+            print(f"  CAPTCHA cleared — resuming scrape on {page.url}")
+            debug.log("CAPTCHA", f"Challenge cleared on {domain}")
+            # Persist the vendor's clearance cookie so future runs on this
+            # domain aren't re-challenged from scratch (loaded by _load_cookies
+            # at the start of capture_responses).
+            try:
+                _save_cookies(page, domain)
+            except Exception:
+                pass
+            block_unnecessary_resources(page)
+            return True
+        remaining = _CAPTCHA_MAX_ATTEMPTS - attempt
+        if remaining > 0:
+            print(f"  Challenge still present. {remaining} attempt(s) left — finish "
+                  f"solving in the browser window, then respond again.")
+
+    print(f"  CAPTCHA still present after {_CAPTCHA_MAX_ATTEMPTS} attempts — giving up on this site.")
+    block_unnecessary_resources(page)
+    return False
+
+
+def _page_actually_loaded(page) -> bool:
+    """True when the page is showing real site content. A failed navigation
+    leaves the page on about:blank OR commits Chromium's own error UI
+    (chrome-error://chromewebdata/ — how DNS/connection failures surface on
+    the real-Chrome channel instead of raising)."""
+    url = page.url or ""
+    return bool(url) and not url.startswith(("about:", "chrome-error://"))
+
+
+def _navigate_with_fallback(page, link: str) -> str | None:
+    """Load the target URL. Returns the URL that actually loaded, else None.
+
+    goto() raises both on hard failures (DNS, refused connection, SSL) and on
+    slow loads that blow the nav timeout — only a page still showing no real
+    content afterwards counts as a failure. app.py guesses "https://" onto
+    bare domains, and plenty of small-org directory sites never got TLS, so
+    an https failure retries the http:// variant once before giving up.
+
+    Chromium quirk this has to survive: a failed navigation parks the page on
+    chrome-error://chromewebdata/ ASYNCHRONOUSLY, up to a few seconds after
+    goto() raised. The settle-poll below (a) catches slow navigations that
+    commit after goto's timeout raise, and (b) absorbs that pending error-page
+    commit so it can't interrupt the next candidate's navigation. If a stale
+    commit still lands mid-navigation, Playwright raises "...interrupted by
+    another navigation" — retried once from the now-settled page.
+    """
+    candidates = [link]
+    if link.startswith("https://"):
+        candidates.append("http://" + link[len("https://"):])
+
+    for i, candidate in enumerate(candidates):
+        for attempt in (1, 2):
+            nav_error = None
+            try:
+                # First candidate keeps Playwright's default nav timeout (slow
+                # but real directories); the http retry gets a shorter leash.
+                page.goto(candidate, **({} if i == 0 else {"timeout": 15000}))
+            except Exception as e:
+                nav_error = e
+                debug.log("BROWSER", f"goto failed for {candidate}: {e}", level="warn")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=NETWORK_IDLE_TIMEOUT)
+            except Exception:
+                pass
+
+            loaded = _page_actually_loaded(page)
+            if not loaded:
+                for _ in range(6):  # settle poll (~3s)
+                    page.wait_for_timeout(500)
+                    if _page_actually_loaded(page):
+                        loaded = True
+                        break
+            if loaded:
+                if candidate != link:
+                    print(f"  https failed — loaded via http fallback: {candidate}")
+                    debug.decision("BROWSER", "http fallback",
+                                   f"https did not load; {candidate} did")
+                return candidate
+
+            if (attempt == 1 and nav_error
+                    and "interrupted by another" in str(nav_error).lower()):
+                print(f"  Navigation to {candidate} was interrupted — retrying once")
+                continue
+            break
+
+        if i + 1 < len(candidates):
+            print(f"  {candidate} did not load — retrying over plain http")
+    return None
+
+
 def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                       priority_fields: list | None = None,
                       login_callback=None,
+                      captcha_callback=None,
                       intent: dict | None = None,
                       is_aggregator: bool = False) -> tuple[list, list]:
     """Main browser automation entry point.
@@ -783,6 +1393,13 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         Called when a login wall is detected. The callback should pause
         and let the user log in manually, then return True to retry or
         False to skip. If None and a login wall is hit, the scrape fails.
+
+    captcha_callback: Optional callable(page, domain, vendor) -> bool.
+        Called when an anti-bot challenge (DataDome press-and-hold,
+        Cloudflare, hCaptcha, reCAPTCHA) is detected. The callback should
+        pause and let the user solve it in the headed browser window, then
+        return True to re-check/resume or False to skip. If None, the
+        challenge is logged and the scrape continues (likely empty).
 
     intent: Optional dict from intent_filter.intent_from_plan. When set
         (Agent mode), used to (a) hint the AI navigator toward intent-
@@ -815,20 +1432,24 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     domain = urlparse(link).netloc.replace(".", "_")
 
     browser = launch_browser(playwright)
-    page = browser.new_page()
+    page = new_stealth_page(browser)
 
-    # Apply stealth patches to avoid bot detection (Cloudflare, DataDome, etc.)
-    try:
-        from playwright_stealth import Stealth
-        Stealth(
-            webgl_vendor=True,
-            webgl_renderer_override="Intel Iris OpenGL Engine",
-            webgl_vendor_override="Intel Inc.",
-            navigator_hardware_concurrency=True,
-            sec_ch_ua=True,
-        ).apply_stealth_sync(page)
-    except ImportError:
-        pass
+    # Apply the playwright-stealth JS patches — but ONLY on stock Playwright.
+    # patchright already applies its own, more careful patches (and closes the
+    # Runtime.enable CDP leak the stealth plugin can't touch); stacking the
+    # plugin on top re-introduces detectable modifications.
+    if not IS_PATCHRIGHT:
+        try:
+            from playwright_stealth import Stealth
+            Stealth(
+                webgl_vendor=True,
+                webgl_renderer_override="Intel Iris OpenGL Engine",
+                webgl_vendor_override="Intel Inc.",
+                navigator_hardware_concurrency=True,
+                sec_ch_ua=True,
+            ).apply_stealth_sync(page)
+        except ImportError:
+            pass
 
     # Block images, fonts, media, analytics — bot only needs JSON + HTML
     block_unnecessary_resources(page)
@@ -898,11 +1519,26 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
 
     page.on("response", on_response)
 
+    # --- Step 0: Initial navigation + anti-bot challenge gate ---
+    # Load the target FIRST so a DataDome/Cloudflare "prove you're human" wall
+    # can be cleared by a human before the navigation/search logic runs against
+    # it — running find_directory_url on a challenge page yields garbage. Once
+    # solved, the vendor's clearance cookie rides the browser context, so later
+    # navigations in this run are usually not re-challenged.
+    loaded_link = _navigate_with_fallback(page, link)
+    if loaded_link is None:
+        print(f"  NAVIGATION FAILED: {link} did not load (dead domain, refused "
+              f"connection, or not a web page) — aborting this scrape")
+        debug.log("BROWSER", f"Navigation failed, aborting: {link}", level="error")
+        browser.close()
+        return results, detail_urls
+    link = loaded_link  # http fallback may have downgraded the scheme
+    handle_captcha(page, domain, captcha_callback)
+
     # --- Step 1: Find and navigate to directory page ---
     if mode == "direct":
-        # Direct mode: user already picked the page, just load it
-        print(f"  Direct mode: loading {link}")
-        page.goto(link)
+        # Direct mode: user already picked the page — it's loaded above.
+        print(f"  Direct mode: using loaded page {link}")
         try:
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
         except Exception:
@@ -919,6 +1555,8 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                 page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
             except Exception:
                 pass
+            # A deeper page can trip its own challenge (rare once cleared above).
+            handle_captcha(page, domain, captcha_callback)
 
     # --- Login gate: detect and handle authentication walls ---
     # Runs after initial navigation in BOTH modes. If cookies were loaded
@@ -1002,7 +1640,33 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     except Exception as e:
         print(f"  URL enumeration error (non-fatal, falling through): {e}")
 
-    if mode != "direct":
+    hub_categories = []
+    search_triggered = False  # stays False when the hub check skips search
+    # --- Step 1.9: Listing-hub check (BEFORE search; both modes) ---
+    # Pages like walmart.com/store-directory/mn are partition indexes:
+    # dozens of same-template child links (one per city/category) and no
+    # member data of their own. Searching such a page grabs the site-wide
+    # search box and never comes back, so the child pages holding the
+    # actual records are never visited. Detect the hub shape first and
+    # skip search for it. All guards must hold: zero member-shaped JSON,
+    # <3 visible member cards (checked inside detect_category_links), and
+    # ≥CHILD_HUB_MIN_LINKS same-template children of THIS page's path —
+    # nav/footer noise on busy sites doesn't satisfy that. Aggregator+
+    # intent runs keep their intent-first search behavior.
+    # Direct mode runs this too: a pasted state/region index holds its
+    # records in the child pages — scraping the hub flat yields bare link
+    # text (city names, no contacts) that the cleaner rejects as garbage.
+    if not (is_aggregator and intent) and _count_json_member_records(results) == 0:
+        hub_categories = detect_category_links(
+            page, child_hub_of=page.url, min_links=CHILD_HUB_MIN_LINKS)
+    if hub_categories:
+        print(f"  Listing hub detected: {len(hub_categories)} child listing "
+              f"pages — iterating them instead")
+        debug.decision("SEARCH", "listing hub — iterate children",
+                       f"{len(hub_categories)} same-template child links of "
+                       f"{page.url}",
+                       data={"sample": [c["text"] for c in hub_categories[:8]]})
+    elif mode != "direct":
         # --- Step 2: Try search strategies ---
         pre_search_count = len(results)
         debug.log("SEARCH", f"Starting search. JSON results so far: {pre_search_count}")
@@ -1010,46 +1674,87 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                                           is_aggregator=is_aggregator,
                                           intent=intent,
                                           html_collector=all_page_htmls)
+        # A search submission can occasionally trip a fresh challenge.
+        handle_captcha(page, domain, captcha_callback)
         debug.log("SEARCH", f"Search complete. triggered={search_triggered}, "
                   f"results before={pre_search_count} after={len(results)}")
         if search_triggered and len(results) > pre_search_count:
             idle_timeout_value = SEARCH_IDLE_TIMEOUT
             print(f"Idle timeout set to: {idle_timeout_value}s (search mode)")
-        if search_triggered:
-            # Search results frequently lazy-load below the fold (Algolia-
-            # style grids, "infinite" result lists). Without this scroll, a
-            # searched directory captures exactly one viewport — there was
-            # previously NO code path where search and scrolling both ran.
-            human_scroll(page, done, scroll_target="body", adaptive=True)
+    if search_triggered:
+        # Search results frequently lazy-load below the fold (Algolia-
+        # style grids, "infinite" result lists). Without this scroll, a
+        # searched directory captures exactly one viewport — there was
+        # previously NO code path where search and scrolling both ran.
+        human_scroll(page, done, scroll_target="body", adaptive=True)
+
+    # --- Step 2.5: Intent-driven deep capture (Agent mode, targeted only) ---
+    # The search flow above (or a hub) may have left the user's TARGETED intent
+    # unfulfilled: a weak search, a complicated engine, or data that lives
+    # behind category/city sub-pages. When yield is low, first replay any
+    # captured directory-API XHRs with mutated params (cheapest, best-targeted
+    # source), then BFS-crawl intent-matched sub-pages. Both are pure no-ops
+    # when intent is None, so Playground / direct / "scrape everything" runs
+    # are untouched. Skipped for hubs (their own iterator owns partitions) and
+    # aggregators (they keep intent-first search; their trees explode).
+    intent_expanded = False
+    if intent and mode != "direct" and not hub_categories and not is_aggregator:
+        # Fail-open: this is new code on the critical path — a failure here
+        # must never sink an otherwise-working scrape.
+        try:
+            if (_count_json_member_records(results) < INTENT_LOW_RECORDS
+                    and count_visible_results(page) < INTENT_LOW_VISIBLE):
+                replay_directory_xhrs(page, results, intent)
+                if _count_json_member_records(results) < INTENT_LOW_RECORDS:
+                    intent_expanded = discover_intent_subpages(
+                        page, intent, results,
+                        link_collector=all_page_links,
+                        html_collector=all_page_htmls)
+        except Exception as e:
+            print(f"  Intent deep capture error (non-fatal): {e}")
+            debug.log("EXPAND", f"intent deep capture failed: {e}", level="error")
 
     # Enable and start the idle timer AFTER search/scroll decision.
     timer_enabled = True
     reset_idle_timer()
 
     # --- Step 3: If no search, try view-all / categories / scroll ---
-    # In direct mode, skip view-all/categories (user already chose the page).
-    # Still scroll for lazy-loaded content.
+    # In direct mode the user already chose the page, so view-all hunting and
+    # generic category discovery stay off — but a detected listing hub DOES
+    # get iterated (the pasted page's own children hold the records).
     categories_handled = False
     view_all_clicked = False
-    if not search_triggered and mode != "direct":
+    if not search_triggered and not intent_expanded and (mode != "direct" or hub_categories):
         visible_count = count_visible_results(page)
         debug.log("SEARCH", f"No search triggered. visible_results={visible_count}, "
                   f"json_results={len(results)}")
-        if not results and visible_count < CATEGORY_SKIP_VISIBLE_THRESHOLD:
-            # No search input, no JSON captured, no members visible.
+        # Count member RECORDS, not responses — junk JSON (Partytown proxies,
+        # cart GraphQL) fills `results` on sites like Walmart and used to
+        # block category discovery here even though it holds zero members.
+        if _count_json_member_records(results) == 0 and visible_count < CATEGORY_SKIP_VISIBLE_THRESHOLD:
+            # No search, no member-shaped JSON, no members visible.
             # Try the simplest discovery method first.
 
-            # 1. Try "View All" / "Show All" link (loads everything at once)
-            view_all_clicked = try_view_all(page)
-            debug.log("SEARCH", f"View All attempt: {'clicked' if view_all_clicked else 'not found'}")
+            # 1. Try "View All" / "Show All" link (loads everything at once).
+            # Not in direct mode — it only reaches this block for a hub, and
+            # the hub's children are iterated directly, no clicking around.
+            if mode != "direct":
+                view_all_clicked = try_view_all(page)
+                debug.log("SEARCH", f"View All attempt: {'clicked' if view_all_clicked else 'not found'}")
 
             # 2. If no View All, try category iteration
             if not view_all_clicked:
-                categories = detect_category_links(page)
-                # Agent mode narrows categories to the user's intent. Fall-open
-                # if intent is None or no matches found — never accidentally drop
-                # every category and end up scraping nothing.
-                categories = filter_categories_by_intent(categories, intent)
+                if hub_categories:
+                    # Child-partition hub (per-city / per-letter pages):
+                    # every partition must be crawled for complete data —
+                    # the industry intent filter does not apply to geography.
+                    categories = hub_categories
+                else:
+                    categories = detect_category_links(page)
+                    # Agent mode narrows categories to the user's intent. Fall-open
+                    # if intent is None or no matches found — never accidentally drop
+                    # every category and end up scraping nothing.
+                    categories = filter_categories_by_intent(categories, intent)
                 if categories:
                     print(f"  Iterating {len(categories)} categories...")
                     timer_enabled = False
@@ -1068,8 +1773,12 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
 
                             try:
                                 cat_html = page.content()
-                                if any(kw in cat_html.lower() for kw in
-                                       _DIRECTORY_CONTENT_KEYWORDS):
+                                # We navigated here on purpose — keep the HTML
+                                # on either signal. Phone numbers catch listing
+                                # pages that use none of the generic keywords.
+                                if (any(kw in cat_html.lower() for kw in
+                                        _DIRECTORY_CONTENT_KEYWORDS)
+                                        or _PHONE_RE.search(cat_html)):
                                     all_page_htmls.append(cat_html)
                             except Exception:
                                 pass
@@ -1087,9 +1796,14 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                     timer_enabled = True
                     reset_idle_timer()
 
-        # 3. Scroll — but only what's appropriate
-        if not categories_handled:
-            if results or view_all_clicked:
+        # 3. Scroll — but only what's appropriate. Direct mode scrolls in its
+        # own block below (running both would double-scroll a hub page whose
+        # iteration gate didn't hold). Member RECORDS gate the light scroll —
+        # junk JSON (cart GraphQL etc.) must not suppress the adaptive one.
+        # intent_expanded means the crawler already left the page on an
+        # exhausted sub-page — scrolling it would capture nothing new.
+        if not categories_handled and not intent_expanded and mode != "direct":
+            if _count_json_member_records(results) > 0 or view_all_clicked:
                 # Data already captured — just light scroll in case of lazy stragglers
                 print(f"Already captured data, minimal scrolling")
                 human_scroll(page, done, scroll_target="body", times=5)
@@ -1097,22 +1811,36 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                 # Nothing found yet — adaptive scroll for infinite scroll pages
                 human_scroll(page, scroll_target="body", done_event=done, adaptive=True)
 
-    # Direct mode: light scroll to trigger any lazy content
-    if mode == "direct" and not search_triggered:
-        print(f"  Direct mode: scrolling to load lazy content")
-        human_scroll(page, done, scroll_target="body", times=5)
+    # Direct mode: scroll to trigger lazy content. With data already captured
+    # a light scroll catches stragglers; with NOTHING captured yet, scroll
+    # adaptively — the user pointed at this exact page, and infinite-scroll
+    # listings keep loading well past a fixed 5-batch scroll (a fixed scroll
+    # silently truncated them to roughly one viewport). Member RECORDS, not
+    # raw responses: a captured cart/session blob used to force the light
+    # scroll here. After hub iteration there's nothing left to scroll — the
+    # child pages' HTML is already collected.
+    if mode == "direct" and not search_triggered and not categories_handled:
+        if _count_json_member_records(results) > 0:
+            print(f"  Direct mode: scrolling to load lazy content")
+            human_scroll(page, done, scroll_target="body", times=5)
+        else:
+            print(f"  Direct mode: adaptive scroll (no data captured yet)")
+            human_scroll(page, done, scroll_target="body", adaptive=True)
 
     # --- Step 3.5: Detect if results are inside an iframe ---
     # Some platforms (YourMembership, etc.) load search results in an iframe.
     # If so, we need to collect links, paginate, and capture HTML from the
     # iframe's Frame object — not the main page.
-    # Skip iframe detection if we already captured JSON directory data —
+    # Skip iframe detection if we already captured member-shaped JSON —
     # iframe is a fallback for sites that ONLY render results in an iframe.
+    # Count RECORDS, not responses: junk JSON (cart GraphQL etc.) used to
+    # suppress iframe detection on sites whose real data sits in a frame.
     content_frame = None
-    if not results:
+    json_member_count = _count_json_member_records(results)
+    if json_member_count == 0:
         content_frame = find_content_frame(page)
     else:
-        print(f"  Skipping iframe detection (already have {len(results)} captured responses)")
+        print(f"  Skipping iframe detection (already have {json_member_count} JSON member records)")
     content_context = content_frame if content_frame else page
     if content_frame:
         print(f"  Operating inside iframe for link collection and pagination")
@@ -1126,9 +1854,15 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     # --- Step 4.5: Capture initial page HTML before pagination ---
     # Pagination navigates away from each page, so we must capture page 1 now.
     # Subsequent pages are captured inside handle_pagination via html_collector.
+    # Direct mode: the user pasted THIS page as the directory — never gate it
+    # on the (English-only) keyword list, which drops foreign-language and
+    # unusually-worded listings. Auto mode keeps the keyword gate, with the
+    # same phone-number fallback the category iterator uses.
     try:
         initial_html = content_context.content()
-        if any(kw in initial_html.lower() for kw in _DIRECTORY_CONTENT_KEYWORDS):
+        if (mode == "direct"
+                or any(kw in initial_html.lower() for kw in _DIRECTORY_CONTENT_KEYWORDS)
+                or _PHONE_RE.search(initial_html)):
             all_page_htmls.append(initial_html)
             debug.log("CAPTURE", f"Captured initial HTML: {len(initial_html)} chars")
         else:
@@ -1142,9 +1876,15 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     # sites that show 600+ results on one page don't need pagination, and
     # false "next" button matches (carousel arrows, nav links) can navigate away.
     skip_pagination = False
+    # The intent sub-page crawler already paginated every page it visited; the
+    # page now sits on the last sub-page, so a fresh handle_pagination here
+    # would re-walk that one sub-page's numbered links and duplicate its HTML.
+    if intent_expanded:
+        print(f"  Skipping pagination — intent sub-page crawl already paginated each page")
+        skip_pagination = True
     try:
         visible_now = count_visible_results(content_context)
-        if visible_now >= 600:
+        if not skip_pagination and visible_now >= 600:
             print(f"  Skipping pagination — already have {visible_now} visible results")
             skip_pagination = True
     except:
@@ -1154,15 +1894,7 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     # Prevents false Next button matches (carousel arrows, nav links) from
     # navigating away when we already have what we need.
     if not skip_pagination:
-        json_record_count = 0
-        for r in results:
-            data = r.get("data", {})
-            if isinstance(data, list) and _looks_like_member_records(data):
-                json_record_count += len(data)
-            elif isinstance(data, dict) and "raw_html" not in data:
-                for val in data.values():
-                    if isinstance(val, list) and _looks_like_member_records(val):
-                        json_record_count += len(val)
+        json_record_count = _count_json_member_records(results)
         if json_record_count >= 50:
             print(f"  Skipping pagination — already have {json_record_count} JSON records")
             skip_pagination = True
@@ -1196,10 +1928,10 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     #   1. HTML + JSON in hand → exit immediately (nothing left to wait for)
     #   2. HTML only, zero JSON → short grace for straggler network responses
     #   3. Neither → keep the full timeout (still waiting for first data)
-    _has_json_results = any(
-        isinstance(r.get("data"), (list, dict)) and "raw_html" not in r.get("data", {})
-        for r in results
-    )
+    # "JSON in hand" means member RECORDS — a junk capture (cart GraphQL,
+    # i18n bundle) used to trigger the immediate exit and cut the idle wait
+    # the real data still needed.
+    _has_json_results = _count_json_member_records(results) > 0
     if all_page_htmls and _has_json_results:
         # Both sources satisfied — kill the timer and move on
         if idle_timer:
@@ -1230,10 +1962,13 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                 "data": {"raw_html": html}
             })
     else:
-        # Fallback: capture whatever is on screen now
+        # Fallback: capture whatever is on screen now. Same gate as Step 4.5 —
+        # direct mode trusts the user's page unconditionally.
         try:
             html = content_context.content()
-            if any(kw in html.lower() for kw in _DIRECTORY_CONTENT_KEYWORDS):
+            if (mode == "direct"
+                    or any(kw in html.lower() for kw in _DIRECTORY_CONTENT_KEYWORDS)
+                    or _PHONE_RE.search(html)):
                 source_url = content_frame.url if content_frame else page.url
                 print(f"Captured plain HTML from: {source_url}")
                 results.append({

@@ -3,26 +3,33 @@ Description=Trawlbase Scraper Backend
 After=network.target
 
 [Service]
-Type=notify
-User=trawlbase
-Group=trawlbase
-WorkingDirectory=/home/trawlbase/KosmicDir-Scraper
-Environment="PATH=/home/trawlbase/.local/bin:/usr/local/bin:/usr/bin:/bin"
-EnvironmentFile=/home/trawlbase/KosmicDir-Scraper/.env
-ExecStart=/home/trawlbase/.local/bin/gunicorn -c deploy/gunicorn_config.py app:app
+Type=simple
+User=stefan
+Group=stefan
+WorkingDirectory=/home/stefan/Projects/TrawlBase
+Environment="PATH=/home/stefan/Projects/TrawlBase/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/stefan/Projects/TrawlBase/.env
+ExecStart=/home/stefan/Projects/TrawlBase/.venv/bin/gunicorn -c deploy/gunicorn_config.py app:app
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
 RestartSec=5
 
-# Security hardening
+# Security hardening.
+# NOTE: ProtectHome is intentionally OFF — the app lives under /home/stefan, and
+# ProtectHome=yes/read-only would hide or lock the code, venv, and .env, so the
+# service would fail to start. ProtectSystem=strict already makes the whole tree
+# read-only; the ReadWritePaths below punch write holes only where we need them.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/Data-dump
-ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/Phase2-Dump
-ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/cookies
-ReadWritePaths=/home/trawlbase/KosmicDir-Scraper/Bot/selector_cache.json
+ProtectHome=no
+# Data-dump also holds analytics.db (+ SQLite -wal/-shm siblings) — see analytics.py
+ReadWritePaths=/home/stefan/Projects/TrawlBase/Data-dump
+ReadWritePaths=/home/stefan/Projects/TrawlBase/Phase2-Dump
+ReadWritePaths=/home/stefan/Projects/TrawlBase/Debug-dump
+ReadWritePaths=/home/stefan/Projects/TrawlBase/cookies
+# "-" = skip if missing so a fresh install still boots; setup.sh seeds this file
+ReadWritePaths=-/home/stefan/Projects/TrawlBase/Bot/selector_cache.json
 
 [Install]
 WantedBy=multi-user.target

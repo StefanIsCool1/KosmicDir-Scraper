@@ -15,6 +15,11 @@ from .preflight import preflight_all
 from .classifier import classify_all
 from .aggregator_fallback import build_fallback_candidates
 
+# Reuse Bot/debug.py's trace singleton (stdlib-only module — keeps Phase 0's
+# no-Playwright rule intact). Same additive-import pattern as intent.py.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Bot"))
+from debug import debug  # type: ignore  # noqa: E402
+
 
 def _maybe_api_route(plan: dict, emit) -> dict | None:
     """If the plan maps to a supported authoritative API, return an API-branch
@@ -88,15 +93,28 @@ def _qualify_and_classify(candidates: list[dict], emit) -> tuple[list, list, lis
         "message": f"Qualifying {len(candidates)} candidates (parallel HTTP)...",
         "total": len(candidates),
     })
-    passed, rejected_pre = preflight_all(candidates, event_cb=emit)
+    with debug.span("PHASE0", f"preflight ({len(candidates)} candidates)"):
+        passed, rejected_pre = preflight_all(candidates, event_cb=emit)
     emit({"type": "preflight_done", "passed": len(passed), "rejected": len(rejected_pre)})
+    debug.log("PHASE0", f"Preflight: {len(passed)} passed, {len(rejected_pre)} rejected",
+              data={"rejected": [
+                  {"url": r.get("url", "")[:100], "reason": r.get("reason", "")}
+                  for r in rejected_pre[:20]
+              ]})
 
     emit({
         "type": "stage", "stage": "classify",
         "message": f"Classifying {len(passed)} qualified URLs...",
         "total": len(passed),
     })
-    classified = classify_all(passed, event_cb=emit)
+    with debug.span("PHASE0", f"classify ({len(passed)} URLs)"):
+        classified = classify_all(passed, event_cb=emit)
+    for d in classified["directories"]:
+        debug.decision("PHASE0", "route DIRECTORY → Phase 1",
+                       data={"url": d.get("url", "")[:120]})
+    for w in classified["websites"]:
+        debug.decision("PHASE0", "route WEBSITE → Phase 2",
+                       data={"url": w.get("url", "")[:120]})
     return (
         classified["directories"],
         classified["websites"],
@@ -134,7 +152,9 @@ def run_discovery(goal: str, event_cb=None) -> dict:
 
     # --- Step 1: Intent ---
     emit({"type": "stage", "stage": "intent", "message": "Parsing your goal..."})
-    plan = parse_intent(goal)
+    debug.log("PHASE0", f"Discovery started for goal: {goal[:200]}")
+    with debug.span("PHASE0", "intent parsing (1 LLM call)"):
+        plan = parse_intent(goal)
 
     # If the intent parser decided this isn't an actionable scraping goal
     # (greeting, vague request, tool question), bail out here. The frontend
@@ -163,6 +183,9 @@ def run_discovery(goal: str, event_cb=None) -> dict:
     # sees `api_vertical` and fetches the data directly.
     api_result = _maybe_api_route(plan, emit)
     if api_result is not None:
+        debug.decision("PHASE0", "API route (NPI)",
+                       "goal answerable by authoritative registry — no scraping",
+                       data=api_result.get("api_params"))
         return api_result
 
     # --- Step 2: Source discovery (web search) ---
@@ -172,8 +195,10 @@ def run_discovery(goal: str, event_cb=None) -> dict:
         "message": f"Searching {len(queries)} queries for candidate sources...",
         "query_count": len(queries),
     })
-    candidates = discover_candidates(plan, event_cb=emit)
+    with debug.span("PHASE0", f"source discovery ({len(queries)} search queries)"):
+        candidates = discover_candidates(plan, event_cb=emit)
     emit({"type": "candidates_found", "count": len(candidates)})
+    debug.log("PHASE0", f"Discovery found {len(candidates)} candidate URLs")
 
     if not candidates:
         emit({"type": "warning", "message": "No candidates returned from web search."})
@@ -190,6 +215,9 @@ def run_discovery(goal: str, event_cb=None) -> dict:
     if not directories:
         fb_candidates = build_fallback_candidates(plan)
         if fb_candidates:
+            debug.decision("PHASE0", "aggregator fallback",
+                           f"0 dedicated directories qualified — trying "
+                           f"{len(fb_candidates)} general business listings")
             emit({
                 "type": "stage", "stage": "discovery",
                 "message": ("No dedicated directory found — searching general "

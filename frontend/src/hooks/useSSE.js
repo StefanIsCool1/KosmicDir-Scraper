@@ -23,7 +23,7 @@ export default function useSSE() {
     setResult(null)
   }, [])
 
-  const startScrape = useCallback(async (url, { mode = 'auto', debug = false, append = false, priorityFields, accurateEnrichment = false } = {}) => {
+  const startScrape = useCallback(async (url, { mode = 'auto', debug = false, append = false, priorityFields, accurateEnrichment = false, goal = '' } = {}) => {
     if (!append) {
       reset()
       // Inject stealth banner at the start of every scrape
@@ -43,7 +43,7 @@ export default function useSSE() {
       const resp = await fetch('/scrape/single', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ link: url, mode, debug, priority_fields: priorityFields, accurate_enrichment: accurateEnrichment }),
+        body: JSON.stringify({ link: url, mode, debug, priority_fields: priorityFields, accurate_enrichment: accurateEnrichment, goal }),
       })
 
       if (!resp.ok) {

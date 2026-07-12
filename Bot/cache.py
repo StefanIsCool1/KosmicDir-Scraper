@@ -70,5 +70,32 @@ def set_cached_url_template(domain: str, plan: dict):
           f"({len(plan.get('values', []))} values)")
 
 
+# --- INTENT SUB-PAGE NAV CACHE ---
+# Stored under "intent_nav_<domain>" keys as {canonical: [hrefs...]} in the
+# same selector_cache.json. Lets the intent sub-page crawler skip the landing-
+# page detect + LLM pick on a repeat run for the same domain+industry — the
+# same ~one-AI-call-per-domain discipline as the selector cache.
+
+def get_cached_intent_subpages(domain: str, canonical: str) -> list | None:
+    """Get cached intent-matched seed sub-page hrefs, or None if not cached."""
+    entry = _selector_cache.get(f"intent_nav_{domain}")
+    if isinstance(entry, dict):
+        return entry.get((canonical or "").lower())
+    return None
+
+
+def set_cached_intent_subpages(domain: str, canonical: str, hrefs: list):
+    """Cache the intent-matched seed sub-page hrefs for a domain+industry."""
+    key = f"intent_nav_{domain}"
+    entry = _selector_cache.get(key)
+    if not isinstance(entry, dict):
+        entry = {}
+    entry[(canonical or "").lower()] = hrefs
+    _selector_cache[key] = entry
+    save_selector_cache()
+    print(f"  Cached {len(hrefs)} intent sub-page seeds for {domain} "
+          f"('{canonical}')")
+
+
 # Load cache on module import
 load_selector_cache()
