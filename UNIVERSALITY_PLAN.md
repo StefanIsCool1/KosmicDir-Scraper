@@ -333,6 +333,96 @@ drift.)
 archetype, selector, live count, expected count. No new SSE event types; the vocabulary is a
 frontend contract.
 
+## Progress
+
+### Phase 1 — landed 2026-07-17
+
+**What shipped** (flag: `config.py:REPETITION_COUNTING`, default ON, kill via
+`TRAWL_REPETITION_COUNTING=0`):
+
+- `Bot/repetition.py` — `find_repeated_records(html)` per spec: junk strip →
+  per-child signature (tag + depth-3 descendant-tag multiset + text-length
+  bucket, no class names) → largest runs of ≥4 near-identical adjacent
+  siblings (separators skipped) → record-density scoring → 1:1-wrapper
+  descent → selector emission (stable class > container-anchored path >
+  unstable/hashed class > positional nth-of-type), round-trip validated on
+  the stripped AND intact trees.
+- `Bot/archetype.py` — PageProfile selector lifecycle (derive lazily,
+  re-derive on <3 live matches, negative-cache guarded by URL/DOM-size
+  change, `last_good_selector` revalidation after empty pages; frame-aware
+  by keying on the passed context) + `rendered_record_count()`, the single
+  counting authority (structural count cross-checked vs distinct
+  detail-link count; >2× divergence logs a warning and takes the smaller).
+- Wire-ins: `count_visible_results` tries the profile selector first
+  (JS-side, same rendered/≥15-char guards), legacy MAX + link fallback kept
+  verbatim; STOP_THRESHOLD trips at the pre-search and intent gates consult
+  the authority (an exact count below threshold overrides the stop; no
+  exact evidence = legacy behavior); the blank-total branch's bespoke
+  detail-link logic is subsumed by the authority; `extract_sample_html`
+  gained Strategy 2.5 (structural candidates, same score competition).
+- `tests/` — pytest corpus (per Verification tier 1): 10 fixtures harvested
+  from Data-dump raw captures (`tests/harvest_fixtures.py`, truths in
+  `tests/fixture_truth.py` — a .py module, *.json is gitignored), 32 tests,
+  no network/LLM/browser. Includes two synthetic findadentist variants
+  (hashed-CSS, fully classless).
+
+**Exit criteria:** hashed-CSS fixture → `div.css-… > div`, 100/100 exact ✓.
+Nav-heavy: enigma's 693 dropdown options / 401 industry links never elected ✓
+(the page's real 20-cafe table is found instead — see deviations).
+Finalsite wrapper fixture → 50/50 exact, samples are `fsConstituentItem` ✓;
+GrowthZone fixture counts 212 where legacy `[class*='card']` reads 1608 ✓.
+Truncation-past-600: mechanism verified offline (the 1608→212 deflation is
+the number the 600-gates read) and live on members.buildingncw.org — blank
+rendered 50, authority said partial vs site total 213, wildcards re-drove,
+full 213 extracted. A ≥1,000-member live confirmation is still owed on the
+next big-directory run. **Live smoke:** members.buildingncw.org returned
+213 vs the stored 212 — site drift, not regression: the site's own counter
+and its 213 unique `/Details/{ID}` links both say 213 today.
+
+**Deviations from spec (and why):**
+
+1. The density gate grew three sub-rules beyond "contact regex or detail
+   link": anchor-dominance suppression (a run whose text lives ≥90% inside
+   links is a link list), a structured-anchor exemption (whole-card-anchor
+   rosters like Berkeley's wrap image+h2+fields in one `<a>` and must
+   pass), and a majority-template requirement (a run's detail links must
+   share one URL template — kills footer link columns and hyphenated-slug
+   nav lists that pass a naive detail-link test).
+2. The enigma "nav-heavy negative" turned out to contain a real 20-cafe
+   listing (classless table the junk-strip pass was destroying). The
+   criterion is enforced as "never elect nav runs" (`test_navheavy_never_
+   elects_nav`), not "return None"; a second detection pass over the
+   intact tree rescues listings that stripping removes, and positional
+   nth-of-type paths are only emitted from the tree they were computed on
+   (stripping shifts sibling indexes).
+3. Strategy 2.5 also fires when strategies 0–2 produced only weak
+   candidates (best score < 20), not just zero — a hidden 4-row
+   keyboard-shortcuts table otherwise blocks the rescue on classless pages.
+4. Wrapper descent returns the hop chain: descended nodes no longer share
+   a parent, so container-anchored selectors route
+   `container > wrapper_tag > card_tag`.
+5. PageProfile ships as the lifecycle skeleton only: `archetype` stays
+   UNKNOWN, `form_kind`/`pager_kind`/`expected_count`/Phase-0 priors are
+   declared but unpopulated — classification belongs to later phases.
+
+**Notes for Phase 2:**
+
+- Populate `PageProfile.expected_count` from `read_result_count` at the
+  derive points; `rendered_record_count()` is the ready-made input for the
+  `_finish_scrape` count gate (it already returns `(count, exact)`).
+- Profile derivation currently happens lazily at first count (in practice:
+  the pre-search gate). If the count gate wants a landing-time profile,
+  call `archetype.count_records(page)` explicitly at the end of
+  `find_directory_url`.
+- The re-profile point "once after the first search submit" is implicit:
+  the old selector matches <3 on the swapped DOM and re-derives. Verified
+  live (derive fired right after the blank submit on GrowthZone).
+- Strategy 2.5 candidates carry class `"(structural)"` and flow into the
+  existing selector cache — the Phase 2 cache fingerprint work should treat
+  them like any learned selector.
+- `debug.decision("PROFILE", ...)` traces every derive; grep Debug-dump
+  for `PROFILE` when auditing counts.
+
 ## Out of scope (explicit)
 
 - **Login walls / CAPTCHA / anti-bot** — the cookie-persistence + Live View layer already

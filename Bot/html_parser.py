@@ -22,7 +22,7 @@ from config import (
     CARD_CANDIDATE_TAGS, LAYOUT_CLASS_EXACT, LAYOUT_CLASS_FRAGMENTS,
     CARD_CLASS_HINTS, CONTACT_SIGNALS,
     SCALAR_KEYS, EXTRACTION_NULL_THRESHOLD, MIN_CARDS_FOR_LEARNING,
-    RELEARN_MIN_CARDS,
+    RELEARN_MIN_CARDS, REPETITION_COUNTING,
     EXTERNAL_SKIP_DOMAINS, MIN_REGEX_RESULTS, FAX_CONTEXT_WINDOW,
 )
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
@@ -782,6 +782,39 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
         if candidates:
             print(f"  Sample: classless sibling grouping found "
                   f"{len(candidates)} candidate group(s)")
+
+    # --- Strategy 2.5: structural repetition detection ---
+    # Hashed/utility-CSS grids and flat lists form no class group (Strategy
+    # 1) and no classless <tr>/<li> container (Strategy 2), so they used to
+    # fall through to the blind densest-chunk sample below. The class-blind
+    # repetition detector gives them a real card_selector instead. It also
+    # competes when strategies 0-2 produced only a WEAK group (score < 20 —
+    # e.g. a 4-row keyboard-shortcuts table on an otherwise classless page);
+    # the shared score scale then picks the winner. Local import:
+    # repetition must stay import-light and html_parser-free.
+    if REPETITION_COUNTING and (
+        not candidates or max(c["score"] for c in candidates) < 20
+    ):
+        try:
+            from repetition import find_repeated_records_in_soup
+            r_sel, r_count, r_samples = find_repeated_records_in_soup(soup)
+        except Exception as e:
+            debug.log("PARSE", f"structural repetition sampling failed: {e}",
+                      level="warn")
+            r_sel, r_count, r_samples = None, 0, []
+        if r_sel and len(r_samples) >= MIN_CARDS_FOR_LEARNING:
+            score = score_candidate_group(soup, r_samples[0].name,
+                                          "(structural)", r_samples)
+            candidates.append({
+                "tag": r_samples[0].name,
+                "class": "(structural)",
+                "selector": r_sel,
+                "count": r_count,
+                "score": score,
+                "sample": r_samples[:4],
+            })
+            print(f"  Sample: structural repetition found {r_count} "
+                  f"record(s) via '{r_sel}'")
 
     if not candidates:
         print("  Sample: no repeating card candidates found, scanning for densest content region")

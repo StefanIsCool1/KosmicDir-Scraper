@@ -311,6 +311,13 @@ LOAD_MORE_SELECTORS = (
 )
 
 # --- RESULT COUNTING (for search strategy evaluation) ---
+
+# UNIVERSALITY_PLAN Phase 1: class-blind structural repetition counting
+# (Bot/repetition.py via Bot/archetype.py) runs before the class-substring
+# selectors below. Default ON; set TRAWL_REPETITION_COUNTING=0 to fall back
+# to the legacy counter alone without a code revert.
+REPETITION_COUNTING = os.environ.get("TRAWL_REPETITION_COUNTING", "1").strip() != "0"
+
 RESULT_COUNT_SELECTORS = [
     "[class*='member']",
     "[class*='listing']",

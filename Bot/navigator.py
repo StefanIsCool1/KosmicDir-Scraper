@@ -6,6 +6,7 @@ Handles: AI-based multi-depth directory URL discovery, smart search strategy,
 
 import re
 from urllib.parse import urlparse, parse_qs, unquote
+import archetype
 from debug import debug
 from llm import ask
 from config import (
@@ -897,12 +898,29 @@ def count_visible_results(page) -> int:
     """Estimate how many member cards are currently visible on the page.
 
     Counts only elements that plausibly ARE cards: rendered (non-zero rect)
-    with at least 15 chars of text. Takes the MAX across selectors instead of
-    the first selector with >=3 — '[class*="card"]' matching 3 promo tiles
-    must not shadow a real 40-row listing under a later selector. This count
-    gates search skipping, category iteration, scroll growth, and pagination
-    skipping, so false positives here cascade through the whole scrape.
+    with at least 15 chars of text. This count gates search skipping,
+    category iteration, scroll growth, and pagination skipping, so false
+    positives here cascade through the whole scrape.
+
+    Three rungs (UNIVERSALITY_PLAN Phase 1):
+    1. Structural repetition selector from the page profile — class-blind,
+       counts real records instead of every element whose class contains
+       'card' (which inflates several-fold on verbose markup and reads ~0
+       on hashed CSS).
+    2. Legacy class-substring MAX across selectors — kept, never removed.
+    3. Link-selector count when even that finds <3.
     """
+    # Rung 1: profile selector, counted live with the same guards.
+    try:
+        structural = archetype.count_records(page)
+        if structural is not None and structural >= 3:
+            return structural
+    except Exception:
+        pass
+
+    # Rung 2 (legacy): MAX across selectors instead of the first selector
+    # with >=3 — '[class*="card"]' matching 3 promo tiles must not shadow a
+    # real 40-row listing under a later selector.
     # One evaluate for ALL selectors instead of 11 separate round-trips.
     # Each round-trip re-forces layout on the page; batching into a single JS
     # pass lets the browser reuse one layout across every selector (the DOM
@@ -1421,7 +1439,15 @@ def trigger_search(page, results_list: list,
         pre_visible = count_visible_results(page)
         print(f"  Pre-search: {pre_visible} visible results")
         if pre_visible >= STOP_THRESHOLD:
-            if is_aggregator and intent:
+            # The stop gate consults the counting authority: an inflated
+            # class-substring count here used to end the scrape at ~100 real
+            # members (R2). Only an EXACT distinct count >= threshold may
+            # skip the search; without exact evidence keep legacy behavior.
+            exact_count, exact = archetype.rendered_record_count(page)
+            if exact and exact_count is not None and exact_count < STOP_THRESHOLD:
+                print(f"  Pre-search: heuristic says {pre_visible} but only "
+                      f"{exact_count} distinct records — searching anyway")
+            elif is_aggregator and intent:
                 print(f"  Aggregator + intent: ignoring pre-loaded results, will narrow by intent")
             else:
                 print(f"  Page already showing {pre_visible} results, no search needed")
@@ -1523,6 +1549,11 @@ def trigger_search(page, results_list: list,
                 best_visible = visible
                 best_query = iq
             if visible >= STOP_THRESHOLD:
+                exact_count, exact = archetype.rendered_record_count(page)
+                if exact and exact_count is not None and exact_count < STOP_THRESHOLD:
+                    print(f"  Intent query '{iq}': heuristic {visible} but only "
+                          f"{exact_count} distinct records — trying next")
+                    continue
                 print(f"  Intent query '{iq}': {visible} visible — stopping (intent-narrowed)")
                 return True
 
@@ -1617,29 +1648,25 @@ def trigger_search(page, results_list: list,
     # alphabet iteration below is the sole way to reach the rest.
     if (count_type == "number" and count_number > 0 and visible_blank >= 3
             and not is_starts_with_site(page)):
-        # visible_blank over-counts card sub-parts several-fold, so it can't
-        # be compared against the site total directly. Unique detail-page
-        # links are an EXACT rendered-member count when the site has them
-        # (one profile link per card): GrowthZone's blank search renders 50
-        # of "212 results" — 50 unique /Details/{ID} links → partial, keep
-        # going ('%' renders all 212 at once). Without a detail-link pattern,
-        # trust small totals (plausibly one render batch) and treat large
-        # ones as partial — the wildcards cost seconds and the best-query
-        # re-execution restores blank if nothing beats it.
-        rendered_exact = 0
-        try:
-            from detail_crawler import collect_page_links, detect_detail_links
-            rendered_exact = len(detect_detail_links(collect_page_links(page)))
-        except Exception:
-            rendered_exact = 0
-        complete = (rendered_exact >= count_number if rendered_exact
+        # visible_blank can over-count card sub-parts several-fold, so it
+        # can't be compared against the site total directly. The counting
+        # authority (structural repetition count cross-checked against
+        # unique detail-page links) gives an EXACT rendered-member count
+        # when either signal exists: GrowthZone's blank search renders 50
+        # of "212 results" → partial, keep going ('%' renders all 212 at
+        # once). Without exact evidence, trust small totals (plausibly one
+        # render batch) and treat large ones as partial — the wildcards
+        # cost seconds and the best-query re-execution restores blank if
+        # nothing beats it.
+        rendered_exact, exact = archetype.rendered_record_count(page)
+        complete = (rendered_exact >= count_number if exact and rendered_exact is not None
                     else count_number <= 60)
         if complete:
             print(f"  Blank returned site-reported total ({count_number}) with "
-                  f"{rendered_exact or visible_blank} rendered — full listing "
+                  f"{rendered_exact if exact else visible_blank} rendered — full listing "
                   f"captured, skipping wildcards")
             return True
-        rendered_desc = str(rendered_exact) if rendered_exact else f"~{visible_blank}"
+        rendered_desc = str(rendered_exact) if exact else f"~{visible_blank}"
         print(f"  Site reports {count_number} but blank rendered {rendered_desc} "
               f"— partial batch, trying wildcards for a fuller render")
 
