@@ -322,6 +322,17 @@ RESULT_COUNT_SELECTORS = [
     "[class*='doctor']",
     "[class*='restaurant']",
     "[class*='attorney']",
+    # Staff/roster directories (schools, universities, government).
+    # Finalsite renders div.fsConstituentItem — without 'constituent' here a
+    # 50-card page counted ~7 via the link fallback, and every downstream
+    # decision (search strategy, alphabet commit, pagination skip) ran blind.
+    # The `i` flag is required: class names camelCase ('fsConstituentItem'),
+    # and attribute selectors are case-sensitive by default.
+    "[class*='constituent' i]",
+    "[class*='staff' i]",
+    "[class*='faculty' i]",
+    "[class*='employee' i]",
+    "[class*='people' i]",
     "table tbody tr",
 ]
 
@@ -392,6 +403,14 @@ EXTRACTION_NULL_THRESHOLD = 0.70  # if more than 70% of fields are null, extract
 
 # Minimum cards needed before calling Haiku (avoids learning from tiny samples)
 MIN_CARDS_FOR_LEARNING = 3
+
+# Minimum candidate cards a page must show before an INVALID cached-selector
+# result is allowed to delete the cache and re-learn. Near-empty pages (an
+# alphabet letter with 0-2 staff, a no-results skeleton) legitimately yield
+# nothing under good cached selectors; re-learning on them caches nav chrome
+# and poisons every subsequent page. A genuine redesign re-learns on the next
+# full listing page instead.
+RELEARN_MIN_CARDS = 10
 
 # --- REGEX FALLBACK ---
 # Domains to skip when extracting member websites (never a member's own site)

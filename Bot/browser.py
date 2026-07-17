@@ -34,9 +34,10 @@ from config import (
     new_stealth_page,
 )
 from _pw import IS_PATCHRIGHT
-from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all
+from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all, STOP_THRESHOLD
 from intent_filter import filter_categories_by_intent
 from debug import debug
+from live_view import live
 from playwright.sync_api import Playwright
 from detail_crawler import collect_page_links, detect_detail_links, is_shallow_data, html_has_contact_info, CONTACT_KEYS
 
@@ -816,19 +817,115 @@ def human_scroll(page, done_event, scroll_target="body", times=20, adaptive=Fals
             page.mouse.wheel(0, distance)
             time.sleep(random.uniform(0.15, 1))
 
-    # Try site-specific scroll container (some sites use custom scrollable divs)
+    # Try site-specific scroll container (some sites use custom scrollable divs).
+    # Guard with count() FIRST: hover() otherwise auto-waits the full 30s default
+    # action timeout for the element to appear, so on the (vast majority of)
+    # sites that lack this test-id, every single human_scroll call stalled ~30s
+    # here before the bare except swallowed the timeout. count() is instant.
     try:
         container = page.get_by_test_id("scrolling-container")
-        container.hover()
-        page.mouse.wheel(0, 300)
-    except:
+        if container.count() > 0:
+            container.first.hover(timeout=1000)
+            page.mouse.wheel(0, 300)
+    except Exception:
         pass
 
 
-def handle_pagination(page, done_event, link_collector=None, html_collector=None):
+def _pick_pagination_param(current_url: str, hrefs: list) -> tuple | None:
+    """Find the query param that paginates the CURRENT page, from its links.
+
+    A server-rendered pager exposes sibling links that differ only by one
+    numeric query param (?const_page=2 ... ?const_page=42 on Finalsite).
+    Fingerprint: link on the SAME path as the current page whose param value
+    is exactly 2 (the "page 2" link), plus either a page-ish param name or a
+    small numeric range (id-like params are huge, ?per_page=50 size switchers
+    never link a value of 2).
+
+    `links` items are either href strings or (href, link_text) pairs.
+    Returns (param_name, page2_href, last_page_seen) or None.
+    """
+    from urllib.parse import urlparse, urljoin, parse_qs
+    try:
+        cur_path = urlparse(current_url).path.rstrip("/")
+    except Exception:
+        return None
+    values_by_param: dict = {}
+    href_by_param_val: dict = {}
+    text_by_param_val: dict = {}
+    for item in hrefs:
+        h, txt = (item, "") if isinstance(item, str) else (
+            (item[0], str(item[1] or "")) if item and len(item) >= 2 else (None, ""))
+        if not h:
+            continue
+        h = h.strip()
+        if h.startswith(("javascript:", "#", "mailto:", "tel:")):
+            continue
+        try:
+            u = urlparse(urljoin(current_url, h))
+        except Exception:
+            continue
+        if u.path.rstrip("/") != cur_path or not u.query:
+            continue
+        qs = parse_qs(u.query, keep_blank_values=True)
+        for k, vals in qs.items():
+            if len(vals) == 1 and vals[0].isdigit():
+                n = int(vals[0])
+                values_by_param.setdefault(k, set()).add(n)
+                href_by_param_val.setdefault((k, n), h)
+                text_by_param_val.setdefault((k, n), txt.strip())
+    best = None
+    for k, nums in values_by_param.items():
+        if 2 not in nums or len(nums) < 2:
+            continue
+        pageish = any(t in k.lower() for t in ("page", "pg"))
+        # Non-page-named params qualify only when they LOOK like a pager:
+        # consecutive small values AND the value-2 link is literally labeled
+        # "2" — filters ?lang=2 switchers, years, ids, size selectors.
+        if not pageish and not (3 in nums and max(nums) <= 200
+                                and text_by_param_val.get((k, 2)) == "2"):
+            continue
+        key = (pageish, len(nums))
+        if best is None or key > best[0]:
+            best = (key, k, max(nums))
+    if best is None:
+        return None
+    _, param, last = best
+    return param, href_by_param_val[(param, 2)], last
+
+
+def _max_param_value(current_url: str, hrefs: list, param: str) -> int:
+    """Largest numeric value of `param` among same-path links (pager windows
+    shift as you advance — later pages expose higher page numbers).
+    `hrefs` items are href strings or (href, link_text) pairs."""
+    from urllib.parse import urlparse, urljoin, parse_qs
+    try:
+        cur_path = urlparse(current_url).path.rstrip("/")
+    except Exception:
+        return 0
+    best = 0
+    for item in hrefs:
+        h = item if isinstance(item, str) else (item[0] if item else None)
+        if not h:
+            continue
+        try:
+            u = urlparse(urljoin(current_url, h.strip()))
+        except Exception:
+            continue
+        if u.path.rstrip("/") != cur_path or not u.query:
+            continue
+        vals = parse_qs(u.query, keep_blank_values=True).get(param) or []
+        if len(vals) == 1 and vals[0].isdigit():
+            best = max(best, int(vals[0]))
+    return best
+
+
+def handle_pagination(page, done_event, link_collector=None, html_collector=None,
+                      keepalive=None):
     """Click through pagination to capture all pages.
 
-    Handles two types of pagination:
+    Handles three types of pagination:
+    0. URL-template pagers (?page=N links) — navigates directly via goto();
+       immune to shifting number windows and misidentified buttons.
     1. Simple Next/→ buttons — clicks Next repeatedly
     2. Numbered page groups (e.g. [1] 2 3 ... 10 →) — clicks each number
        sequentially, then → to load next group, then continues numbering.
@@ -838,6 +935,10 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
         done_event: Threading event that signals when to stop
         link_collector: Optional list to accumulate page links into.
         html_collector: Optional list to capture page HTML after each pagination click.
+        keepalive: Optional zero-arg callback invoked after each captured
+                   page — the caller's idle timer only resets on directory-
+                   keyword responses, so a long walk on a site whose URLs
+                   carry no keyword would otherwise starve it mid-run.
 
     Returns the number of extra pages loaded.
     """
@@ -973,7 +1074,86 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
 
     last_content_hash = _content_snapshot()
 
+    def _keepalive():
+        if keepalive:
+            try:
+                keepalive()
+            except Exception:
+                pass
+
+    def _get_hrefs():
+        try:
+            return page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(e => [e.getAttribute('href'), "
+                "(e.textContent || '').trim().slice(0, 30)])")
+        except Exception:
+            return []
+
+    def _paginate_by_url() -> int:
+        """Strategy 0: walk a ?page=N URL template via goto().
+
+        Server-rendered pagers (Finalsite's ?const_page=2..42) are plain GET
+        links — navigating the template directly is far more reliable than
+        locating and clicking a button per page: no shifting number windows,
+        no wrong-element clicks, and one page.goto() per page instead of
+        several locator scans over a heavy DOM."""
+        picked = _pick_pagination_param(page.url, _get_hrefs())
+        if not picked:
+            return 0
+        param, page2_href, last_page = picked
+        from urllib.parse import urlparse, urljoin, parse_qs, urlencode
+        try:
+            base = urlparse(urljoin(page.url, page2_href))
+        except Exception:
+            return 0
+        print(f"  Pagination: URL template ?{param}=N detected "
+              f"(highest page link: {last_page})")
+        loaded = 0
+        n = 2
+        prev_hash = _content_snapshot()
+        while (not done_event.is_set() and loaded < max_pages
+               and n <= last_page):
+            qs = parse_qs(base.query, keep_blank_values=True)
+            qs[param] = [str(n)]
+            target = base._replace(query=urlencode(qs, doseq=True)).geturl()
+            try:
+                page.goto(target, wait_until="domcontentloaded",
+                          timeout=NETWORK_IDLE_TIMEOUT)
+                page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+            except Exception as e:
+                print(f"  Pagination: page {n} navigation failed "
+                      f"({type(e).__name__}), stopping with {loaded} loaded")
+                break
+            cur_hash = _content_snapshot()
+            if cur_hash == prev_hash:
+                print(f"  Pagination: page {n} identical to page {n-1}, stopping")
+                break
+            prev_hash = cur_hash
+            loaded += 1
+            print(f"  Pagination: page {n} (URL)")
+            _collect_links()
+            _capture_html()
+            _keepalive()
+            # Pager windows shift as we advance — later pages expose higher
+            # page links than page 1 did (e.g. "1 2 3 … next set").
+            seen_max = _max_param_value(page.url, _get_hrefs(), param)
+            if seen_max > last_page:
+                last_page = seen_max
+            n += 1
+        return loaded
+
+    url_pages = _paginate_by_url()
+    if url_pages:
+        print(f"  Pagination complete: {url_pages} page(s) via URL template")
+        return url_pages
+
     while not done_event.is_set() and pages_loaded < max_pages:
+        # Live View "Take control": no-op unless the user armed a manual pause
+        # for this run. Pagination is the longest scraper loop, so it's the
+        # natural place to yield to a human who wants to poke around mid-scrape.
+        live.checkpoint()
+
         found_next = False
         next_num = current_page_num + 1
 
@@ -1002,6 +1182,7 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
                 print(f"  Pagination: page {current_page_num}")
                 _collect_links()
                 _capture_html()
+                _keepalive()
                 found_next = True
         except:
             pass
@@ -1045,6 +1226,7 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
                     print(f"  Pagination: next/arrow → page {current_page_num}")
                     _collect_links()
                     _capture_html()
+                    _keepalive()
                     found_next = True
         except:
             pass
@@ -1074,6 +1256,7 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
                 current_page_num += 1
                 print(f"  Load More: click #{pages_loaded}")
                 _collect_links()
+                _keepalive()
                 found_next = True
         except:
             pass
@@ -1381,7 +1564,9 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                       login_callback=None,
                       captcha_callback=None,
                       intent: dict | None = None,
-                      is_aggregator: bool = False) -> tuple[list, list]:
+                      is_aggregator: bool = False,
+                      landing_hint: str | None = None,
+                      live_session_id: str | None = None) -> tuple[list, list]:
     """Main browser automation entry point.
 
     Launches browser, navigates to directory page, captures all responses.
@@ -1414,6 +1599,12 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         would pull every industry. Defaults to False — Playground callers
         and any non-aggregator URL behave exactly as before.
 
+    landing_hint: Absolute same-site URL of a likely directory sub-page found
+        by Phase 0's classifier on this landing page. Forwarded to
+        find_directory_url so auto mode starts the AI walk there instead of
+        re-deriving the first hop. Ignored in direct mode; fail-open (falls
+        back to `link`) if it doesn't load. Only /discover sets this.
+
     Returns:
         Tuple of (results, detail_urls):
         - results: list of dicts [{"url": str, "data": dict}, ...]
@@ -1433,6 +1624,13 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
 
     browser = launch_browser(playwright)
     page = new_stealth_page(browser)
+
+    # Live View: bind this page to the scrape's session so the frontend can
+    # stream it and take control during a pause. No-op unless the session was
+    # registered (i.e. the user is on a live-capable endpoint) — Playground
+    # batch / CLI runs pass live_session_id=None and are untouched.
+    if live_session_id:
+        live.attach(live_session_id, page)
 
     # Apply the playwright-stealth JS patches — but ONLY on stock Playwright.
     # patchright already applies its own, more careful patches (and closes the
@@ -1547,7 +1745,8 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         search_triggered = False
         debug.log("NAV", f"Direct mode — skipping navigation and search")
     else:
-        directory_url = find_directory_url(page, link, intent=intent)
+        directory_url = find_directory_url(page, link, intent=intent,
+                                           landing_hint=landing_hint)
         debug.log("NAV", f"Directory URL resolved: {directory_url}")
         if page.url.rstrip("/") != directory_url.rstrip("/"):
             page.goto(directory_url)
@@ -1686,7 +1885,21 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         # style grids, "infinite" result lists). Without this scroll, a
         # searched directory captures exactly one viewport — there was
         # previously NO code path where search and scrolling both ran.
-        human_scroll(page, done, scroll_target="body", adaptive=True)
+        #
+        # BUT: trigger_search very often returns early with "page already
+        # showing N results, no search needed" (pre_visible >= STOP_THRESHOLD).
+        # That's a fully server-rendered listing — everything is already in the
+        # DOM. An adaptive scroll there just bounces a static page through its
+        # entire batch budget (and here the idle timer isn't armed yet, so it
+        # can't bail early), which is the single biggest "stuck scrolling" cost.
+        # A light fixed scroll catches any lazy stragglers without the wasted
+        # batches. Mirrors the existing "visible >= STOP_THRESHOLD → skip
+        # pagination" rule below, so it's the same already-have-enough signal.
+        if count_visible_results(page) >= STOP_THRESHOLD:
+            print("  Page already fully rendered — light scroll only (skipping adaptive)")
+            human_scroll(page, done, scroll_target="body", times=5)
+        else:
+            human_scroll(page, done, scroll_target="body", adaptive=True)
 
     # --- Step 2.5: Intent-driven deep capture (Agent mode, targeted only) ---
     # The search flow above (or a hub) may have left the user's TARGETED intent
@@ -1694,11 +1907,15 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     # behind category/city sub-pages. When yield is low, first replay any
     # captured directory-API XHRs with mutated params (cheapest, best-targeted
     # source), then BFS-crawl intent-matched sub-pages. Both are pure no-ops
-    # when intent is None, so Playground / direct / "scrape everything" runs
-    # are untouched. Skipped for hubs (their own iterator owns partitions) and
-    # aggregators (they keep intent-first search; their trees explode).
+    # when intent is None, so Playground / "scrape everything" runs are
+    # untouched — including Playground's direct mode. Agent-mode direct
+    # scrapes (Phase 0 confirmed the listing on this page) DO get the rescue:
+    # if the confirmed page under-delivers, the crawler expands from it along
+    # intent-matched sub-pages rather than leaving a thin result. Skipped for
+    # hubs (their own iterator owns partitions) and aggregators (they keep
+    # intent-first search; their trees explode).
     intent_expanded = False
-    if intent and mode != "direct" and not hub_categories and not is_aggregator:
+    if intent and not hub_categories and not is_aggregator:
         # Fail-open: this is new code on the critical path — a failure here
         # must never sink an otherwise-working scrape.
         try:
@@ -1818,8 +2035,11 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     # silently truncated them to roughly one viewport). Member RECORDS, not
     # raw responses: a captured cart/session blob used to force the light
     # scroll here. After hub iteration there's nothing left to scroll — the
-    # child pages' HTML is already collected.
-    if mode == "direct" and not search_triggered and not categories_handled:
+    # child pages' HTML is already collected. Same for an intent sub-page
+    # crawl: it leaves the page on an exhausted sub-page, so scrolling it
+    # would capture nothing new (mirrors the auto-mode scroll gate above).
+    if (mode == "direct" and not search_triggered and not categories_handled
+            and not intent_expanded):
         if _count_json_member_records(results) > 0:
             print(f"  Direct mode: scrolling to load lazy content")
             human_scroll(page, done, scroll_target="body", times=5)
@@ -1907,7 +2127,8 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         idle_timeout_value = PAGINATION_IDLE_TIMEOUT
         reset_idle_timer()
         extra_pages = handle_pagination(content_context, done, link_collector=all_page_links,
-                                        html_collector=all_page_htmls)
+                                        html_collector=all_page_htmls,
+                                        keepalive=reset_idle_timer)
         if extra_pages > 0:
             reset_idle_timer()  # give time for last page's responses
         else:
@@ -1942,7 +2163,12 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         # Have HTML but JSON might still be in-flight — give it a short window
         if idle_timer:
             idle_timer.cancel()
-        page.wait_for_timeout(1500)  # 1.5 s grace for straggler JSON
+        try:
+            page.wait_for_timeout(1500)  # 1.5 s grace for straggler JSON
+        except Exception:
+            # Browser/page died mid-run (crash, closed target) — the HTML
+            # already captured is still perfectly good, keep going.
+            print("  Page gone during grace wait — salvaging captured HTML")
         done.set()
         print("  Early exit: HTML captured (no JSON), short grace period done")
 
@@ -1954,7 +2180,10 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
     # If no pagination, all_page_htmls has just the initial page (same as before).
     # If pagination used Load More (no navigation), capture final page state now.
     if all_page_htmls:
-        source_url = content_frame.url if content_frame else page.url
+        try:
+            source_url = content_frame.url if content_frame else page.url
+        except Exception:
+            source_url = link  # page gone (crash) — salvage under the entry URL
         print(f"Captured {len(all_page_htmls)} HTML page(s)")
         for html in all_page_htmls:
             results.append({
@@ -2105,12 +2334,18 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                     unique_uids.append(uid)
             uid_list = unique_uids
             # Build detail URLs using the page's base URL + hash fragment
-            base_url = page.url.split("#")[0].rstrip("/")
+            try:
+                base_url = page.url.split("#")[0].rstrip("/")
+            except Exception:
+                base_url = link.split("#")[0].rstrip("/")
             detail_urls = [f"{base_url}#!biz/id/{uid}" for uid in uid_list]
             print(f"\n  Shallow JSON data with UIDs detected (MembershipWorks pattern)")
             print(f"  Constructed {len(detail_urls)} detail URLs from JSON uid fields")
 
-    browser.close()
+    try:
+        browser.close()
+    except Exception:
+        pass  # browser already gone (crash) — captured data is unaffected
     print(f"Total results captured: {len(results)}")
 
     # Debug summary of everything captured

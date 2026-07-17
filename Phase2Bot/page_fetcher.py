@@ -8,6 +8,7 @@ import random
 import re
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from curl_cffi.requests import Session
 from curl_cffi import CurlError
 from bs4 import BeautifulSoup
@@ -813,12 +814,17 @@ def _verify_and_pick_website(
     if not candidates:
         return None
 
-    # Step 3+4: fetch and score; keep only those that fetched AND cleared threshold
+    # Step 3+4: fetch and score; keep only those that fetched AND cleared threshold.
+    # The candidates are different domains, so the per-domain rate limit in
+    # fetch_page doesn't serialize them — fetch all (≤3) concurrently.
+    with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        scores = list(pool.map(
+            lambda c: _score_candidate(c[0], phone, contacts, street_address, company_words),
+            candidates,
+        ))
+
     qualified: list[tuple[float, int, str]] = []  # (effective_score, rank_idx, return_url)
-    for rank_idx, (fetch_url, return_url) in enumerate(candidates):
-        raw_score, fetch_ok = _score_candidate(
-            fetch_url, phone, contacts, street_address, company_words
-        )
+    for rank_idx, ((raw_score, fetch_ok), (_fetch_url, return_url)) in enumerate(zip(scores, candidates)):
         if not fetch_ok:
             # Per spec: unfetchable candidates are thrown out entirely
             continue

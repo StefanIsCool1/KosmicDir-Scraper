@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
-import sys, os, csv, json, io, builtins, queue, threading, time, uuid, re
+import sys, os, csv, json, io, builtins, queue, threading, time, uuid, re, traceback
 
 os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
@@ -10,6 +10,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "Bot"))
 from Bot.main import scrape_directory, PHASE2_ONLY_FIELDS, read_members, read_metadata
 from Bot.debug import debug
 from Bot.intent_filter import intent_from_plan
+# Bare import (Bot/ is on sys.path via the append above) so this resolves to the
+# SAME top-level `live_view` module that Bot/browser.py imports — one shared
+# registry. Importing it as `Bot.live_view` would create a second instance.
+from live_view import live
 from Phase2Bot.email_extractor import enrich_from_websites
 from DiscoveryBot import run_discovery, parse_intent
 from exporter import export_final_dataset, records_to_csv
@@ -38,6 +42,29 @@ DEBUG_DUMP = os.path.join(os.path.dirname(__file__), "Debug-dump")
 # Active scrape sessions for interactive prompts
 # {session_id: {"queue": Queue, "response_event": Event, "response_value": str}}
 active_sessions = {}
+
+
+def _same_site_hint(base_url: str, raw_href: str) -> str | None:
+    """Resolve Phase 0's landing_link href against the page it was found on.
+
+    Returns an absolute http(s) URL only when it stays on the same site
+    (subdomains ok) — a footer link to an external 'directory' must not
+    teleport the scrape off-site. None on any mismatch or parse failure.
+    """
+    from urllib.parse import urljoin, urlparse
+    try:
+        cand = urljoin(base_url, raw_href)
+        if not cand.startswith(("http://", "https://")):
+            return None
+        base_host = urlparse(base_url).netloc.lower().removeprefix("www.")
+        hint_host = urlparse(cand).netloc.lower().removeprefix("www.")
+        if not base_host or not hint_host:
+            return None
+        if hint_host == base_host or hint_host.endswith("." + base_host):
+            return cand
+    except Exception:
+        pass
+    return None
 
 
 def classify_message(msg: str) -> str:
@@ -175,6 +202,29 @@ def _sse_error_response(message: str) -> Response:
     return Response(stream(), mimetype="text/event-stream")
 
 
+def _emit_paused(event_queue, session_id, reason, message, vendor=None):
+    """Tell the main scrape stream the run has paused for a human. Emits BOTH a
+    human-readable log line (so the terminal shows it even with no new frontend
+    handling) and a structured `paused` event the Live View UI reacts to
+    (flash the button, flip to interactive). Also flips the live session's
+    status so a stream already open updates immediately."""
+    live.set_status(session_id, reason, vendor=vendor)
+    event_queue.put({"type": "log", "message": f"⏸ {message}", "category": "SYSTEM"})
+    event_queue.put({
+        "type": "paused",
+        "reason": reason,
+        "vendor": vendor,
+        "message": message,
+        "session_id": session_id,
+    })
+
+
+def _emit_resumed(event_queue, session_id):
+    """Counterpart to _emit_paused — the human resumed or skipped."""
+    live.set_status(session_id, "running")
+    event_queue.put({"type": "resumed", "session_id": session_id})
+
+
 @app.route("/scrape/single", methods=["POST"])
 def scrape_single():
     """Stream scrape progress as SSE events. Supports interactive prompts."""
@@ -204,6 +254,10 @@ def scrape_single():
         "response_event": response_event,
         "response_value": None,
     }
+    # Enable Live View for this run: binds the scraper's browser page (created
+    # later, deep in capture_responses) to this session id so the frontend can
+    # stream it and take control during a pause. Torn down in the finally below.
+    live.register(session_id)
 
     def prompt_via_frontend(detail_url_count, message=None):
         """Replacement for input() — sends prompt to frontend, waits for response."""
@@ -217,35 +271,39 @@ def scrape_single():
             "detail_url_count": detail_url_count,
         })
         session["response_event"].wait(timeout=300)
-        answer = session.get("response_value", "n")
+        # `or "n"` (not a .get default): the key always exists and is None on
+        # timeout / after a reset — .get's default never applies, and
+        # None.lower() used to kill the whole scrape thread here.
+        answer = str(session.get("response_value") or "n")
         session["response_event"].clear()
         session["response_value"] = None  # reset for next prompt
         return answer.lower() in ("y", "yes")
 
     def login_via_frontend(page, domain):
-        """Login-wall handler for the web UI. The old default called terminal
-        input(), which hangs the scrape — nobody is at the server's stdin.
-        The (headed) browser window runs on the backend machine, so the user
-        logs in there and confirms through the frontend terminal."""
-        return prompt_via_frontend(
-            0,
-            f"Login wall detected on {domain.replace('_', '.')}. "
-            f"Log in using the browser window that opened, then respond "
-            f"'y' to continue (or 'n' to skip this site).",
-        )
+        """Login-wall handler for the web UI. On a headless VPS there's no
+        visible browser window, so the user drives it through Live View: the
+        run pauses, they open Live View, log in inside the streamed page, then
+        press Resume. Returns True to re-verify/continue, False to skip."""
+        _emit_paused(event_queue, session_id, "login",
+                     f"Login wall on {domain.replace('_', '.')} — open Live View, "
+                     f"log in inside the page, then press Resume.")
+        cont = live.control_until_resume(session_id, page, reason="login")
+        _emit_resumed(event_queue, session_id)
+        return cont
 
     def captcha_via_frontend(page, domain, vendor):
-        """CAPTCHA / anti-bot-challenge handler for the web UI. Same round-trip
-        as login: the headed browser window (on the backend machine) shows the
-        challenge, the user solves it there, then confirms through the frontend
-        terminal to resume. Returns True to re-check/resume, False to skip."""
-        return prompt_via_frontend(
-            0,
-            f"{vendor} detected on {domain.replace('_', '.')}. "
-            f"Solve the challenge in the browser window that opened "
-            f"(e.g. press & hold the button / complete the check), then respond "
-            f"'y' to resume (or 'n' to skip this site).",
-        )
+        """CAPTCHA / anti-bot-challenge handler for the web UI. The scraper
+        pauses here; the user opens Live View, solves the challenge inside the
+        streamed page (click tiles / press & hold), then presses Resume.
+        Returns True to re-check/resume, False to skip this site."""
+        _emit_paused(event_queue, session_id, "captcha",
+                     f"{vendor} challenge detected on {domain.replace('_', '.')} — "
+                     f"the scraper is PAUSED. Open Live View to solve it, then "
+                     f"press Resume.", vendor=vendor)
+        cont = live.control_until_resume(session_id, page, reason="captcha",
+                                         vendor=vendor)
+        _emit_resumed(event_queue, session_id)
+        return cont
 
     def bot_thread():
         original_print = builtins.print
@@ -283,6 +341,7 @@ def scrape_single():
                 intent=intent,
                 login_callback=login_via_frontend,
                 captcha_callback=captcha_via_frontend,
+                live_session_id=session_id,
             )
 
             phase1_records = len(members)
@@ -370,10 +429,14 @@ def scrape_single():
             event_queue.put(result)
 
         except Exception as e:
-            original_print(f"ERROR: {e}")
+            # Full traceback to the server log — the bare message alone made
+            # crashes like "'NoneType' object has no attribute 'lower'"
+            # undebuggable from journalctl.
+            original_print(f"ERROR: {e}\n{traceback.format_exc()}")
             event_queue.put({"type": "error", "message": str(e)})
         finally:
             builtins.print = original_print
+            live.unregister(session_id)  # tear down Live View for this run
             event_queue.put(None)  # sentinel — stream ends
             active_sessions.pop(session_id, None)
 
@@ -384,12 +447,16 @@ def scrape_single():
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
         while True:
             try:
-                event = event_queue.get(timeout=600)
+                event = event_queue.get(timeout=15)
                 if event is None:
                     break
                 yield f"data: {json.dumps(event)}\n\n"
             except queue.Empty:
-                break
+                # No scraper output for a while (e.g. a long silent detail crawl):
+                # send an SSE comment as a keepalive so nginx / the browser don't
+                # drop the idle connection. Both frontend parsers skip frames that
+                # don't start with "data: ". Only the None sentinel ends the stream.
+                yield ": keepalive\n\n"
 
     return Response(stream(), mimetype="text/event-stream")
 
@@ -448,6 +515,7 @@ def scrape_csv():
                 success = records > 0
             except Exception as e:
                 logs.append(f"ERROR: {e}")
+                original_print(f"ERROR: {e}\n{traceback.format_exc()}")
                 success, records = False, 0
             finally:
                 builtins.print = original_print
@@ -558,7 +626,7 @@ def phase2_enrich():
                 "output_file": os.path.basename(output_path),
             })
         except Exception as e:
-            original_print(f"ERROR: {e}")
+            original_print(f"ERROR: {e}\n{traceback.format_exc()}")
             event_queue.put({"type": "error", "message": str(e)})
         finally:
             builtins.print = original_print
@@ -572,12 +640,16 @@ def phase2_enrich():
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
         while True:
             try:
-                event = event_queue.get(timeout=600)
+                event = event_queue.get(timeout=15)
                 if event is None:
                     break
                 yield f"data: {json.dumps(event)}\n\n"
             except queue.Empty:
-                break
+                # No scraper output for a while (e.g. a long silent detail crawl):
+                # send an SSE comment as a keepalive so nginx / the browser don't
+                # drop the idle connection. Both frontend parsers skip frames that
+                # don't start with "data: ". Only the None sentinel ends the stream.
+                yield ": keepalive\n\n"
 
     return Response(stream(), mimetype="text/event-stream")
 
@@ -610,6 +682,9 @@ def discover():
         "response_event": threading.Event(),
         "response_value": None,
     }
+    # Live View for the Agent run too — each per-site scrape below binds its
+    # browser page to this session id. Torn down in the finally.
+    live.register(session_id)
 
     def discover_thread():
         original_print = builtins.print
@@ -733,6 +808,29 @@ def discover():
                 with open(struct_path, "w") as f:
                     json.dump({"metadata": metadata, "members": members}, f, indent=4)
 
+                # Same final deliverable as the scrape path (cleaned JSON +
+                # Excel) — the frontend result bubble only renders download
+                # links off final_json/final_xlsx, so without this the NPI
+                # route produced a file the UI never surfaced.
+                npi_final_json = None
+                npi_final_xlsx = None
+                if members:
+                    try:
+                        export_info = export_final_dataset(
+                            [fname], [DATA_DUMP], DATA_DUMP,
+                            fname.rsplit("_structured.json", 1)[0],
+                            goal=goal, industry=term, locations=[state],
+                        )
+                        if export_info:
+                            npi_final_json = export_info["json_file"]
+                            npi_final_xlsx = export_info.get("xlsx_file")
+                    except Exception as e:
+                        event_queue.put({
+                            "type": "log",
+                            "message": f"Final export failed (structured file unaffected): {e}",
+                            "category": "ERROR",
+                        })
+
                 where = f"{term} in {state}" + (f", {city}" if city else "")
                 event_queue.put({
                     "type": "complete",
@@ -742,6 +840,9 @@ def discover():
                     "websites_found": 0,
                     "websites": [],
                     "output_files": [fname],
+                    "merged_file": npi_final_json,
+                    "final_json": npi_final_json,
+                    "final_xlsx": npi_final_xlsx,
                     "per_site": [{
                         "url": f"NPI registry — {where}",
                         "records": len(members),
@@ -866,9 +967,9 @@ def discover():
                 })
 
             # --- Phase 1: Auto-scrape each directory ---
-            # We pass mode="direct" because Phase 0 already verified card
-            # structure exists on the URL. Prompts are auto-declined (batch
-            # mode — no human in the loop for detail crawl or Phase 2).
+            # Per-directory mode is decided from Phase 0's own fetch (see the
+            # loop below). Prompts are auto-declined (batch mode — no human in
+            # the loop for detail crawl or Phase 2).
             #
             # Agent mode also passes the parsed intent through, so Phase 1's
             # AI navigator can pick intent-relevant sub-directory links and
@@ -913,12 +1014,31 @@ def discover():
                 return False
 
             for i, d in enumerate(directories):
-                url = d["url"]
-                # Always use auto mode. Phase 0 verified the URL belongs to
-                # a directory site, but the actual listing may be one click
-                # away (when DDG returned the homepage). Phase 1's AI
-                # navigator handles both cases uniformly.
-                scrape_mode = "auto"
+                # Scrape the URL preflight actually validated (post-redirect),
+                # not the raw search-result URL.
+                url = d.get("final_url") or d["url"]
+
+                # Phase 0 already fetched this page and recorded where the
+                # listing lives:
+                #   needs_navigation=False → cards / multi-entry signals are on
+                #     THIS page. Scrape it as-is (mode="direct") — re-running
+                #     the AI navigator on a confirmed listing page is how the
+                #     scrape gets "lost" on a worse sub-page than the one the
+                #     user just approved.
+                #   needs_navigation=True → the listing is a click away (or the
+                #     page is JS-rendered). Auto mode, seeded with Phase 0's
+                #     landing_link when it found one, so the navigator starts
+                #     on the likely directory sub-page instead of re-deriving
+                #     the first hop from the homepage.
+                # Aggregators always stay on auto: their value is the
+                # intent-driven search-box fill, not the landing page as-is.
+                needs_nav = d.get("needs_navigation", True)
+                is_agg = d.get("is_aggregator", False)
+                scrape_mode = "auto" if (needs_nav or is_agg) else "direct"
+
+                landing_hint = None
+                if scrape_mode == "auto" and not is_agg and d.get("landing_link"):
+                    landing_hint = _same_site_hint(url, d["landing_link"])
 
                 # --- Skip gate: user can abort this directory before Phase 1 ---
                 if _check_skip():
@@ -938,6 +1058,42 @@ def discover():
                     "url": url,
                     "mode": scrape_mode,
                 })
+                if scrape_mode == "direct":
+                    event_queue.put({
+                        "type": "log",
+                        "message": f"Listing confirmed on this page during discovery — scraping it directly (no navigation)",
+                        "category": "NAV",
+                    })
+                elif landing_hint:
+                    event_queue.put({
+                        "type": "log",
+                        "message": f"Starting navigation from the directory link found during discovery: {landing_hint}",
+                        "category": "NAV",
+                    })
+
+                def _agent_login(page, domain):
+                    """Agent-run login handler. Pauses for the human to log in
+                    via Live View instead of auto-skipping — the old behavior
+                    silently dropped every login-gated directory."""
+                    _emit_paused(event_queue, session_id, "login",
+                                 f"Login wall on {domain.replace('_', '.')} — open "
+                                 f"Live View, log in inside the page, then Resume "
+                                 f"(or Skip to move on).")
+                    cont = live.control_until_resume(session_id, page, reason="login")
+                    _emit_resumed(event_queue, session_id)
+                    return cont
+
+                def _agent_captcha(page, domain, vendor):
+                    """Agent-run CAPTCHA handler. Pauses so the human can solve
+                    the challenge in Live View, then resumes this site's scrape."""
+                    _emit_paused(event_queue, session_id, "captcha",
+                                 f"{vendor} challenge on {domain.replace('_', '.')} — "
+                                 f"the scraper is PAUSED. Open Live View to solve it, "
+                                 f"then press Resume.", vendor=vendor)
+                    cont = live.control_until_resume(session_id, page,
+                                                     reason="captcha", vendor=vendor)
+                    _emit_resumed(event_queue, session_id)
+                    return cont
 
                 try:
                     members = scrape_directory(
@@ -946,10 +1102,11 @@ def discover():
                         mode=scrape_mode,
                         priority_fields=priority_fields,
                         intent=intent,
-                        is_aggregator=d.get("is_aggregator", False),
-                        # Batch mode: skip login-gated sites instead of
-                        # hanging on the terminal input() default.
-                        login_callback=lambda page, domain: False,
+                        is_aggregator=is_agg,
+                        landing_hint=landing_hint,
+                        login_callback=_agent_login,
+                        captcha_callback=_agent_captcha,
+                        live_session_id=session_id,
                     )
 
                     from urllib.parse import urlparse as _urlparse
@@ -1141,10 +1298,11 @@ def discover():
                 },
             })
         except Exception as e:
-            original_print(f"ERROR: {e}")
+            original_print(f"ERROR: {e}\n{traceback.format_exc()}")
             event_queue.put({"type": "error", "message": str(e)})
         finally:
             builtins.print = original_print
+            live.unregister(session_id)  # tear down Live View for this run
             event_queue.put(None)  # sentinel
             active_sessions.pop(session_id, None)
 
@@ -1155,12 +1313,16 @@ def discover():
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
         while True:
             try:
-                event = event_queue.get(timeout=600)
+                event = event_queue.get(timeout=15)
                 if event is None:
                     break
                 yield f"data: {json.dumps(event)}\n\n"
             except queue.Empty:
-                break
+                # No scraper output for a while (e.g. a long silent detail crawl):
+                # send an SSE comment as a keepalive so nginx / the browser don't
+                # drop the idle connection. Both frontend parsers skip frames that
+                # don't start with "data: ". Only the None sentinel ends the stream.
+                yield ": keepalive\n\n"
 
     return Response(stream(), mimetype="text/event-stream")
 
@@ -1225,6 +1387,91 @@ def download_file(filename):
             mimetype="application/json",
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
+
+
+# --- LIVE VIEW ---
+# Stream the scraper's browser to the frontend and relay the user's clicks/keys
+# back into it while a run is paused (CAPTCHA / login / manual take-control).
+# All four endpoints are keyed by the scrape's SSE session id and are no-ops for
+# a session that isn't live-registered (Playground batch, CLI). See
+# Bot/live_view.py for the threading model.
+
+
+@app.route("/live/stream", methods=["GET"])
+def live_stream():
+    """SSE stream of JPEG frames + status for one scrape session.
+
+    Emits:
+      {"type":"meta", ...}                        once, on connect
+      {"type":"status","status":..., "vendor":?}  whenever the run's state flips
+      {"type":"frame","seq":N,"data":"<b64 jpeg>"}on each new frame
+    Ends when the session is torn down (scrape finished)."""
+    sid = request.args.get("session", "").strip()
+
+    def stream():
+        last_seq = -1
+        last_status = None
+        yield f"data: {json.dumps({'type': 'meta', **live.get_status(sid)})}\n\n"
+        stale = 0
+        while True:
+            if not live.is_registered(sid):
+                yield f"data: {json.dumps({'type': 'status', 'status': 'closed'})}\n\n"
+                break
+            st = live.get_status(sid)
+            if st.get("status") != last_status:
+                last_status = st.get("status")
+                yield f"data: {json.dumps({'type': 'status', **st})}\n\n"
+                stale = 0
+            seq, frame = live.get_frame(sid)
+            if frame is not None and seq != last_seq:
+                last_seq = seq
+                yield f"data: {json.dumps({'type': 'frame', 'seq': seq, 'data': frame})}\n\n"
+                stale = 0
+            else:
+                stale += 1
+                if stale >= 150:  # ~15 s with no new frame — keep nginx alive
+                    yield ": keepalive\n\n"
+                    stale = 0
+            time.sleep(0.1)
+
+    return Response(stream(), mimetype="text/event-stream")
+
+
+@app.route("/live/input", methods=["POST"])
+def live_input():
+    """Relay one input command from the frontend into the paused browser page.
+
+    Body: {"session": "<id>", "cmd": {"type":"click","x":0.5,"y":0.3}, ...}
+    x/y are fractions of the displayed frame (0..1); the backend scales them to
+    the browser viewport. Applied only while the run is paused."""
+    data = request.get_json(force=True, silent=True) or {}
+    sid = (data.get("session") or "").strip()
+    cmd = data.get("cmd")
+    if not sid or not isinstance(cmd, dict):
+        return jsonify({"error": "session and cmd required"}), 400
+    live.enqueue_input(sid, cmd)
+    return jsonify({"ok": True})
+
+
+@app.route("/live/control", methods=["POST"])
+def live_control():
+    """Resume / skip / request-pause a run from the frontend.
+
+    Body: {"session": "<id>", "action": "resume"|"skip"|"pause"}"""
+    data = request.get_json(force=True, silent=True) or {}
+    sid = (data.get("session") or "").strip()
+    action = (data.get("action") or "").strip()
+    if not live.set_control(sid, action):
+        return jsonify({"error": "unknown session or action"}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/live/status", methods=["GET"])
+def live_status():
+    """One-shot status probe (the frontend uses the /live/stream feed for live
+    updates; this is for a quick check on demand)."""
+    sid = request.args.get("session", "").strip()
+    return jsonify(live.get_status(sid))
 
 
 # --- ANALYTICS ---

@@ -175,7 +175,8 @@ Respond with a single word/command. Do not explain."""
     return {"action": "none"}
 
 
-def find_directory_url(page, link: str, intent: dict | None = None) -> str:
+def find_directory_url(page, link: str, intent: dict | None = None,
+                       landing_hint: str | None = None) -> str:
     """Navigate to a site and find the member directory page.
 
     Multi-depth: clicks through up to 3 pages to find the actual directory.
@@ -189,20 +190,49 @@ def find_directory_url(page, link: str, intent: dict | None = None) -> str:
     `intent` is forwarded to ai_analyze_page so the AI picks intent-relevant
     sub-directory links when there are multiple. Playground callers pass None.
 
+    `landing_hint` is an absolute same-site URL that Phase 0's classifier
+    already spotted as the likely directory sub-page (e.g. the
+    "/member-directory" link on a chamber homepage). When given, the AI walk
+    starts THERE instead of re-deriving the first hop from `link` — one less
+    LLM round and one less chance to wander. Fail-open: if the hint 404s or
+    doesn't load, the walk starts from `link` exactly as before.
+
     Returns the URL of the page we ended up on.
     """
+    start = link
+    if landing_hint and landing_hint.rstrip("/") != link.rstrip("/"):
+        try:
+            resp = page.goto(landing_hint)
+            if resp is not None and resp.status >= 400:
+                print(f"  Landing hint returned HTTP {resp.status} — "
+                      f"starting from {link} instead")
+                debug.log("NAV", f"Landing hint rejected (HTTP {resp.status}): "
+                          f"{landing_hint}", level="warn")
+            else:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                except:
+                    pass
+                start = page.url or landing_hint
+                print(f"  Starting from Phase 0's directory link: {landing_hint}")
+                debug.log("NAV", f"Landing hint applied: {landing_hint}")
+        except Exception as e:
+            print(f"  Landing hint failed to load ({e}) — starting from {link}")
+            debug.log("NAV", f"Landing hint failed: {landing_hint} ({e})", level="warn")
+
     # Skip the load if the caller already navigated here (browser.py's Step-0
-    # anti-bot gate loads `link` first). Avoids a redundant reload and the
-    # duplicate response capture that comes with it. Falls back to goto when
-    # called with a blank/other page.
-    if page.url.rstrip("/") != link.rstrip("/"):
-        page.goto(link)
+    # anti-bot gate loads `link` first; the hint branch above may have moved
+    # us since). Avoids a redundant reload and the duplicate response capture
+    # that comes with it. Falls back to goto when called with a blank/other
+    # page — including after a rejected hint, which needs to return to `link`.
+    if page.url.rstrip("/") != start.rstrip("/"):
+        page.goto(start)
         try:
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
         except:
             pass
 
-    current_url = link
+    current_url = start
     visited = set()
 
     for depth in range(MAX_NAVIGATION_DEPTH):
@@ -274,6 +304,20 @@ def find_directory_url(page, link: str, intent: dict | None = None) -> str:
                         continue
             except:
                 pass
+
+        # Deterministic stay-guard: we're already STANDING on a listing. The
+        # AI navigator is nondeterministic and occasionally clicks away from
+        # a correct directory page (Minnetonka: clicked "District Programs"
+        # off the very staff directory it was pointed at). When the current
+        # page shows a directory search form plus a real set of result cards
+        # — or a listing so large no homepage looks like it — no click can
+        # improve on it; stay without asking.
+        visible_here = count_visible_results(page)
+        if (has_search and visible_here >= 10) or visible_here >= 40:
+            print(f"  Depth {depth}: already on a listing ({visible_here} visible "
+                  f"cards, search={has_search}) — staying")
+            debug.log("NAV", f"Stay-guard: {visible_here} cards, search={has_search}")
+            return current_url
 
         # Grab visible page text for AI context (helps detect member listings on screen)
         page_text = get_compressed_page_text(page)
@@ -859,19 +903,32 @@ def count_visible_results(page) -> int:
     gates search skipping, category iteration, scroll growth, and pagination
     skipping, so false positives here cascade through the whole scrape.
     """
-    best = 0
-    for sel in RESULT_COUNT_SELECTORS:
-        try:
-            count = page.eval_on_selector_all(sel, """els => els.filter(el => {
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return false;
-                const t = (el.innerText || '').trim();
-                return t.length >= 15;
-            }).length""")
-            if count > best:
-                best = count
-        except Exception:
-            continue
+    # One evaluate for ALL selectors instead of 11 separate round-trips.
+    # Each round-trip re-forces layout on the page; batching into a single JS
+    # pass lets the browser reuse one layout across every selector (the DOM
+    # doesn't mutate mid-count), which is dramatically faster on heavy DOMs
+    # where this function is called ~10x per scrape. Same semantics: rendered
+    # element, >=15 chars of text, MAX count across selectors.
+    try:
+        best = page.evaluate(
+            """(selectors) => {
+                let best = 0;
+                for (const sel of selectors) {
+                    let count = 0;
+                    for (const el of document.querySelectorAll(sel)) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) continue;
+                        const t = (el.innerText || '').trim();
+                        if (t.length >= 15) count++;
+                    }
+                    if (count > best) best = count;
+                }
+                return best;
+            }""",
+            RESULT_COUNT_SELECTORS,
+        )
+    except Exception:
+        best = 0
 
     if best >= 3:
         return best
@@ -918,9 +975,19 @@ def search_all_letters(page, search_input, submit_btn=None, html_collector=None)
                     into. Without it, HTML-only sites (no JSON XHR) lose every
                     letter except the last — the final capture in browser.py
                     only sees the page state after the last query.
+
+    Per letter: skip capture when the letter yields nothing (a no-results
+    skeleton fed to the parser used to poison the selector cache), and walk
+    the letter's OWN pagination — result sets bigger than one page ("j" on a
+    2000-person directory) silently lost every page but the first.
     """
+    # Local import: browser.py imports this module at load time.
+    import threading
+    from browser import handle_pagination
+
     chars = "abcdefghijklmnopqrstuvwxyz0123456789"
     print(f"  Iterating alphabet search ({len(chars)} queries)...")
+    empty_letters = 0
 
     for char in chars:
         try:
@@ -935,30 +1002,62 @@ def search_all_letters(page, search_input, submit_btn=None, html_collector=None)
             except:
                 pass
             page.wait_for_timeout(PAGE_WAIT_AFTER_ACTION)
+
+            visible = count_visible_results(page)
+            if visible == 0:
+                empty_letters += 1
+                print(f"  '{char}': no results, skipping capture")
+                continue
+
             if html_collector is not None:
                 try:
                     html_collector.append(page.content())
                 except Exception:
                     pass
+
+            # Result sets larger than ~one page carry their own pagination;
+            # smaller ones can't (saves ~5s of selector timeouts per letter).
+            if visible >= 8:
+                extra = handle_pagination(page, threading.Event(),
+                                          html_collector=html_collector)
+                if extra:
+                    print(f"  '{char}': {visible} visible + {extra} more page(s)")
         except Exception as e:
             print(f"  Error searching '{char}': {e}")
             continue
 
-    print("  Alphabet search complete")
+    print(f"  Alphabet search complete"
+          + (f" ({empty_letters} empty queries skipped)" if empty_letters else ""))
 
 
-def get_compressed_page_text(page) -> str:
-    """Grab visible text from the page, compressed for AI input.
-    Strips HTML, collapses whitespace, takes first 1000 chars.
-    Result is ~250 tokens — cheap to send to Haiku."""
+def _full_page_text(page) -> str:
+    """Full visible page text, whitespace-collapsed. Counter regexes scan
+    this WHOLE string: pagers render mid-page (Minnetonka's "showing 1 - 50
+    of 2056 constituents" sits ~9k chars from either end of a 38k-char page),
+    so any fixed-window sample misses them."""
     try:
-        text = page.inner_text("body")[:5000]
+        text = page.inner_text("body")
     except:
         return ""
     # Collapse all whitespace (newlines, tabs, multiple spaces) into single spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    # First 1000 chars — count is always near the top, before the member cards
-    return text[:1000]
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _head_tail(text: str, n: int = 1000) -> str:
+    """Head+tail sample of collapsed text (~500 tokens) for AI input."""
+    if len(text) <= 2 * n:
+        return text
+    return text[:n] + " … " + text[-n:]
+
+
+def get_compressed_page_text(page) -> str:
+    """Grab visible text from the page, compressed for AI navigation context.
+    Strips HTML, collapses whitespace, takes the first 1000 chars (~250
+    tokens). HEAD ONLY on purpose: appending the footer (head+tail sampling)
+    fed nav-link soup to the AI navigator and made its stay/click judgment
+    flakier — counter reading, which needs deeper text, uses
+    _full_page_text/_head_tail in read_result_count instead."""
+    return _full_page_text(page)[:1000]
 
 
 def read_result_count(page, query: str = "") -> dict:
@@ -969,11 +1068,14 @@ def read_result_count(page, query: str = "") -> dict:
         {"type": "number", "count": N} — found specific count
         {"type": "unknown"} — no count visible
     """
-    text = get_compressed_page_text(page)
-    if not text:
+    full_text = _full_page_text(page)
+    if not full_text:
         return {"type": "unknown"}
 
-    text_lower = text.lower()
+    sample = _head_tail(full_text)
+    full_lower = full_text.lower()
+    text = sample
+    text_lower = sample.lower()
 
     # --- Regex pre-check: catch common "X results" patterns ---
     # This avoids an AI call when the count is in a standard format.
@@ -983,33 +1085,59 @@ def read_result_count(page, query: str = "") -> dict:
         r'builders?|vendors?|providers?|businesses?|organizations?|'
         r'doctors?|physicians?|attorneys?|lawyers?|restaurants?|'
         r'clinics?|specialists?|consultants?|therapists?|'
-        r'firms?|dentists?'
+        r'firms?|dentists?|'
+        # Staff/roster vocabulary — school and institutional directories say
+        # "of 2056 constituents" (Finalsite), "300 staff", "45 faculty".
+        r'constituents?|staff|people|employees?|faculty|'
+        r'teachers?|educators?|contacts?|agents?|professionals?|profiles?'
     )
-    result_patterns = [
+    # ANCHORED patterns (counter-specific phrasings) scan the FULL page text:
+    # pagers render mid-page (Minnetonka's "showing 1 - 50 of 2056
+    # constituents" sits ~9k chars from either end), out of reach of any
+    # fixed sampling window. Multiple matches take the LARGEST — card/bio
+    # prose contains small "one of 3 physicians" phrases, but the site total
+    # dominates them.
+    anchored_patterns = [
         # "Results Found: 48", "Results: 48"
         r'results?\s*(?:found)?\s*:\s*(\d[\d,]*)',
-        # "48 results found", "48 members found"
-        rf'(\d[\d,]*)\s+(?:{_E})\s*(?:found)?',
         # "Showing 48 results", "Displaying 48 members"
         rf'(?:showing|displaying)\s+(\d[\d,]*)\s+(?:{_E})',
-        # "1-20 of 48 results", "Showing 1-20 of 48"
+        # "1-20 of 48 results", "showing 1 - 50 of 2056 constituents"
         rf'of\s+(\d[\d,]*)\s+(?:{_E}|total)',
         # "Total: 48", "Total Members: 48"
         rf'total\s*(?:{_E})?\s*:\s*(\d[\d,]*)',
     ]
-
-    for pattern in result_patterns:
-        match = re.search(pattern, text_lower)
-        if match:
+    best_anchored = 0
+    for pattern in anchored_patterns:
+        for match in re.finditer(pattern, full_lower):
             count = int(match.group(1).replace(",", ""))
-            if count > 0:
-                print(f"    Regex result count: {count}")
-                return {"type": "number", "count": count}
+            if count > best_anchored:
+                best_anchored = count
+    if best_anchored > 0:
+        print(f"    Regex result count: {best_anchored}")
+        return {"type": "number", "count": best_anchored}
 
-    # Check for "all results" / "showing all" phrases
+    # Bare "48 members" is too loose for card/footer prose ("serving 500
+    # businesses since 1985") — only trusted in the head/tail sample, where
+    # status lines live.
+    match = re.search(rf'(\d[\d,]*)\s+(?:{_E})\s*(?:found)?', text_lower)
+    if match:
+        count = int(match.group(1).replace(",", ""))
+        if count > 0:
+            print(f"    Regex result count: {count}")
+            return {"type": "number", "count": count}
+
+    # Check for "all results" / "showing all" phrases.
+    # These must be VERB-ANCHORED status lines ("Showing all members"), never
+    # a bare "all <entity>": directory pages are littered with "All Members" /
+    # "All Listings" nav links, A-Z quicklink bars ending in "All", and card
+    # text like "serving all businesses" — with head+tail sampling, the bare
+    # pattern false-positived on those and stopped the search with only the
+    # first render batch captured (buildingncw: stopped at 50 of 212).
+    # (A bare "all 212 members" is already caught as a NUMBER by the patterns
+    # above, which run first.)
     all_patterns = [
-        rf'showing\s+all\s+(?:{_E})',
-        rf'all\s+(?:\d[\d,]*\s+)?(?:{_E})',
+        rf'(?:showing|displaying|viewing|found)\s+all\s+(?:\d[\d,]*\s+)?(?:{_E})',
         r'your\s+search\s+results?\s+include\s+all',
     ]
     for pattern in all_patterns:
@@ -1017,12 +1145,19 @@ def read_result_count(page, query: str = "") -> dict:
             print(f"    Regex: detected 'all' results")
             return {"type": "all"}
 
-    # --- AI fallback: send more text (first 800 chars) for better coverage ---
+    # --- AI fallback: send the full head+tail sample (~2000 chars) — the
+    # counter is as likely below the listing as above it ---
     try:
-        prompt = f"""How many total results does this directory page show?
+        prompt = f"""How many total results does this directory page say it has?
 Reply ONLY: a number, "all", or "unknown".
+Rules:
+- Only report a number the page EXPLICITLY states as its result total \
+("212 results", "showing 1-50 of 212"). Never count the listings yourself.
+- Navigation/footer links ("All Members", an A-Z bar ending in "All") are \
+NOT a result count. Only reply "all" for a status line like "Showing all results".
+- If no explicit total is stated, reply "unknown".
 
-{text[:800]}"""
+{text}"""
         answer = ask(prompt, max_tokens=10).strip().lower()
         print(f"    AI result count: {answer}")
 
@@ -1453,8 +1588,10 @@ def trigger_search(page, results_list: list,
     #  STEP 3: Decide based on count
     # ─────────────────────────────────────────────────
 
-    # "all" or high count → we have everything, stop
-    if count_type == "all":
+    # "all" or high count → we have everything, stop.
+    # 'all' only counts when a listing actually rendered — an 'all' phrase on
+    # a page with nothing visible is a false positive, keep searching.
+    if count_type == "all" and visible_blank >= 3:
         print(f"  Blank shows all results, stopping")
         return True
     if count_type == "number" and count_number >= STOP_THRESHOLD:
@@ -1463,6 +1600,48 @@ def trigger_search(page, results_list: list,
     if visible_blank >= STOP_THRESHOLD:
         print(f"  Blank shows {visible_blank} visible results, stopping")
         return True
+
+    # The site reported its OWN total after the blank search, blank rendered a
+    # listing, AND the render plausibly covers that total — only then is blank
+    # the "show all" query and the %/all/a wildcards (each a full page reload
+    # + go-back, ~5-8s apiece) pure re-fetches of the same set.
+    # When the site says N but blank rendered FEWER than N, blank showed only
+    # its first page/batch — GrowthZone renders 50 of "212 results" on blank
+    # while '%' renders all 212 at once. Declaring victory here truncated the
+    # scrape to one batch whenever downstream pagination couldn't find a
+    # pager, so fall through to the wildcards instead; the best-query
+    # re-execution at the end keeps blank as the fallback if none beats it.
+    # (visible_blank over-counts sibling card parts, so this check errs toward
+    # trying wildcards — the cheap direction.)
+    # Excluded: starts-with engines, where blank only shows the "A" page and the
+    # alphabet iteration below is the sole way to reach the rest.
+    if (count_type == "number" and count_number > 0 and visible_blank >= 3
+            and not is_starts_with_site(page)):
+        # visible_blank over-counts card sub-parts several-fold, so it can't
+        # be compared against the site total directly. Unique detail-page
+        # links are an EXACT rendered-member count when the site has them
+        # (one profile link per card): GrowthZone's blank search renders 50
+        # of "212 results" — 50 unique /Details/{ID} links → partial, keep
+        # going ('%' renders all 212 at once). Without a detail-link pattern,
+        # trust small totals (plausibly one render batch) and treat large
+        # ones as partial — the wildcards cost seconds and the best-query
+        # re-execution restores blank if nothing beats it.
+        rendered_exact = 0
+        try:
+            from detail_crawler import collect_page_links, detect_detail_links
+            rendered_exact = len(detect_detail_links(collect_page_links(page)))
+        except Exception:
+            rendered_exact = 0
+        complete = (rendered_exact >= count_number if rendered_exact
+                    else count_number <= 60)
+        if complete:
+            print(f"  Blank returned site-reported total ({count_number}) with "
+                  f"{rendered_exact or visible_blank} rendered — full listing "
+                  f"captured, skipping wildcards")
+            return True
+        rendered_desc = str(rendered_exact) if rendered_exact else f"~{visible_blank}"
+        print(f"  Site reports {count_number} but blank rendered {rendered_desc} "
+              f"— partial batch, trying wildcards for a fuller render")
 
     # ─────────────────────────────────────────────────
     #  STEP 4: Try more strategies to get better results
@@ -1494,6 +1673,25 @@ def trigger_search(page, results_list: list,
 
         # --- Special handling for "a": check starts-with ---
         if strat_query == "a" and visible >= 3 and is_starts_with_site(page):
+            # The field filters by prefix — but that doesn't mean the alphabet
+            # is the only way in. If the earlier blank submit rendered a real
+            # listing, the site shows EVERYTHING unfiltered and paginates it
+            # (Finalsite: blank = all 2056 constituents across 42 pages).
+            # Paginating that view downstream beats 36 prefix queries, each
+            # of which needs its own pagination walk. Re-run blank and verify
+            # it's a mixed-name listing (a site that default-shows only "A"
+            # entries on blank would pass visible>=3 but fail the mix check).
+            if visible_blank >= 3 and go_back_to_form():
+                blank_vis = execute_query("")
+                if blank_vis >= 3 and not is_starts_with_site(page):
+                    print(f"  Blank shows a full mixed-name listing "
+                          f"({blank_vis} visible) — paginating it instead of "
+                          f"iterating the alphabet")
+                    return True
+                # Blank really is prefix-limited — restore the 'a' state and
+                # fall through to the alphabet.
+                if go_back_to_form():
+                    execute_query("a")
             print(f"  Detected starts-with site, iterating alphabet")
             search_all_letters(page, search_input, submit_btn=submit_btn,
                                html_collector=html_collector)

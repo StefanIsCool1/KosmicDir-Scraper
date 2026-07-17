@@ -9,7 +9,16 @@ Group=stefan
 WorkingDirectory=/home/stefan/Projects/TrawlBase
 Environment="PATH=/home/stefan/Projects/TrawlBase/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/stefan/Projects/TrawlBase/.env
-ExecStart=/home/stefan/Projects/TrawlBase/.venv/bin/gunicorn -c deploy/gunicorn_config.py app:app
+# Run the browser HEADED inside a virtual X display (Xvfb) so Live View can
+# stream it and a human can solve CAPTCHAs in the browser. No GPU needed —
+# Chromium software-renders (SwiftShader) on CPU; Xvfb is the in-memory display
+# it draws into. We deliberately do NOT set SCRAPER_HEADLESS here: under Xvfb the
+# default headed launch (Bot/config.py) works and fingerprints better than
+# headless. `xvfb-run -a` picks a free display; the screen must be at least the
+# 1440x900 scraper viewport (extra height leaves room for browser chrome).
+# PrivateTmp=yes is fine: xvfb-run and gunicorn's Playwright children share the
+# same private /tmp, so they see the same /tmp/.X11-unix socket.
+ExecStart=/usr/bin/xvfb-run -a --server-args="-screen 0 1440x1000x24" /home/stefan/Projects/TrawlBase/.venv/bin/gunicorn -c deploy/gunicorn_config.py app:app
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
 RestartSec=5

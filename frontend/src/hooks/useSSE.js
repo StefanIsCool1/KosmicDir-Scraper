@@ -12,6 +12,7 @@ export default function useSSE() {
   const [awaitingInput, setAwaitingInput] = useState(false)
   const [promptMessage, setPromptMessage] = useState('')
   const [result, setResult] = useState(null)
+  const [paused, setPaused] = useState(false) // Live View: run paused for a human
   const readerRef = useRef(null)
 
   const reset = useCallback(() => {
@@ -21,6 +22,7 @@ export default function useSSE() {
     setAwaitingInput(false)
     setPromptMessage('')
     setResult(null)
+    setPaused(false)
   }, [])
 
   const startScrape = useCallback(async (url, { mode = 'auto', debug = false, append = false, priorityFields, accurateEnrichment = false, goal = '' } = {}) => {
@@ -81,6 +83,13 @@ export default function useSSE() {
               setAwaitingInput(true)
               setPromptMessage(event.message)
               setLines((prev) => [...prev, { text: event.message, category: 'SYSTEM' }])
+            } else if (event.type === 'paused') {
+              // The run paused for a human (CAPTCHA / login). The matching `log`
+              // event already printed the message; this just flags the state so
+              // the Live View button flashes and the modal auto-opens.
+              setPaused(true)
+            } else if (event.type === 'resumed') {
+              setPaused(false)
             } else if (event.type === 'complete') {
               setResult(event)
               setStatus('done')
@@ -197,6 +206,7 @@ export default function useSSE() {
     awaitingInput,
     promptMessage,
     result,
+    paused,
     startScrape,
     startEnrich,
     sendInput,

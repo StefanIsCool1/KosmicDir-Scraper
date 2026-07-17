@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import {
   Search, User, Check, Loader2, X,
   FileJson, FileSpreadsheet, Download,
-  Folder, Globe, ChevronDown, ChevronRight,
+  Folder, Globe, ChevronDown, ChevronRight, Eye,
 } from 'lucide-react'
 import { lineStyle } from '../../lib/terminalTheme'
 
@@ -288,7 +288,7 @@ function ScopeBubble({ question, options = [], answered = false, chosenLabel, on
 }
 
 
-function TerminalBubble({ lines = [], isComplete = false, outputFiles = [] }) {
+function TerminalBubble({ lines = [], isComplete = false, outputFiles = [], paused = false, onOpenLive }) {
   const scrollRef = useRef(null)
   useEffect(() => {
     if (scrollRef.current) {
@@ -296,15 +296,42 @@ function TerminalBubble({ lines = [], isComplete = false, outputFiles = [] }) {
     }
   }, [lines])
 
+  // Only the ACTIVE run's terminal (not a finished/restored one) should surface
+  // the pause callout, so gate on !isComplete as well as the global paused flag.
+  const showPauseCallout = paused && !isComplete
+
   return (
     <div className="flex max-w-[85%] flex-col overflow-hidden border border-hairline bg-white">
       {/* Title bar — matches the Playground OutputTerminal */}
       <div className="flex items-center justify-between border-b border-hairline px-3 py-2">
         <span className="font-mono text-[11px] text-gray-500">trawlbase — scraping</span>
-        {isComplete && (
+        {isComplete ? (
           <span className="font-mono text-[10px] font-medium text-black">done</span>
-        )}
+        ) : paused ? (
+          <span className="animate-pulse font-mono text-[10px] font-medium text-black">⏸ paused</span>
+        ) : null}
       </div>
+
+      {/* Pause callout — the scraper is blocked on a CAPTCHA/login the human
+          must clear. Prominent, sticky above the log so it's visible even
+          when the console has scrolled. */}
+      {showPauseCallout && (
+        <div className="flex flex-col gap-2 border-b border-black bg-black px-3 py-2.5 text-white sm:flex-row sm:items-center">
+          <p className="min-w-0 flex-1 text-[11px] leading-relaxed">
+            <span className="font-semibold">Scraper paused.</span> It hit a CAPTCHA
+            or login it can't pass. Open Live View to solve it in the page, then
+            press Resume.
+          </p>
+          <button
+            type="button"
+            onClick={onOpenLive}
+            className="inline-flex shrink-0 items-center justify-center gap-1.5 border border-white bg-white px-3 py-1.5 text-[11px] font-semibold text-black transition-colors hover:bg-transparent hover:text-white"
+          >
+            <Eye size={12} aria-hidden="true" />
+            Open Live View
+          </button>
+        </div>
+      )}
 
       {/* Body */}
       <div ref={scrollRef} className="h-[320px] overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed">
@@ -364,6 +391,7 @@ function ResultBubble({ result }) {
     stats = {},
     final_json = null,
     final_xlsx = null,
+    output_files = [],
   } = result
   const rejected = stats.rejected_count || 0
   const totalEnriched = per_site.reduce((acc, s) => acc + (s.enriched || 0), 0)
@@ -416,12 +444,39 @@ function ResultBubble({ result }) {
           )}
         </div>
       )}
+      {/* Fallback: no consolidated dataset (e.g. final export failed) but the
+          run still produced per-source files — link those so results are
+          never invisible. */}
+      {!final_json && records > 0 && output_files.length > 0 && (
+        <div className="mt-1 flex flex-col gap-1.5 border-t border-accent-100 pt-2">
+          {output_files.map((file) => (
+            <div key={file} className="flex items-center gap-2">
+              <Download size={11} className="text-gray-400 shrink-0" />
+              <span className="flex-1 truncate text-[11px] text-gray-600 font-mono">{file}</span>
+              <a
+                href={`/download/${file}?format=json`}
+                download
+                className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-0.5 text-[10px] text-gray-600 hover:bg-gray-50"
+              >
+                <FileJson size={10} /> JSON
+              </a>
+              <a
+                href={`/download/${file}?format=csv`}
+                download
+                className="inline-flex items-center gap-1 rounded-md bg-accent px-2 py-0.5 text-[10px] text-white hover:bg-accent-600"
+              >
+                <FileSpreadsheet size={10} /> CSV
+              </a>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
 
-export default function ChatMessage({ message }) {
+export default function ChatMessage({ message, paused = false, onOpenLive }) {
   const isUser = message.role === 'user'
 
   if (message.type === 'status') {
@@ -472,6 +527,8 @@ export default function ChatMessage({ message }) {
           lines={message.lines || []}
           isComplete={message.isComplete}
           outputFiles={message.outputFiles || []}
+          paused={paused}
+          onOpenLive={onOpenLive}
         />
       </div>
     )

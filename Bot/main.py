@@ -652,7 +652,9 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                      intent: dict | None = None,
                      is_aggregator: bool = False,
                      login_callback=None,
-                     captcha_callback=None) -> list:
+                     captcha_callback=None,
+                     landing_hint: str | None = None,
+                     live_session_id: str | None = None) -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
@@ -683,6 +685,17 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                        business aggregator (SuperPages, YellowPages, BBB, etc.).
                        Combined with `intent`, makes the search box use the
                        industry term instead of a wildcard. Defaults to False.
+        landing_hint: Absolute same-site URL of a likely directory sub-page,
+                      found by Phase 0's classifier on the landing page
+                      (e.g. the "/member-directory" link). Auto mode starts the
+                      AI navigation from this page instead of re-deriving the
+                      first hop from the homepage. Ignored in direct mode;
+                      fail-open if it doesn't load. Only /discover sets this.
+        live_session_id: The scrape's SSE session id, when the caller registered
+                      it with Bot/live_view. Binds the browser page to the Live
+                      View stream so the frontend can watch it and take control
+                      during a CAPTCHA/login pause. None (Playground batch, CLI)
+                      disables live view entirely — a pure no-op.
     """
     if priority_fields is None:
         priority_fields = []
@@ -702,6 +715,7 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
         debug.log("BROWSER", f"Scrape started: {url}", data={
             "mode": mode, "priority_fields": priority_fields,
             "intent": bool(intent), "is_aggregator": is_aggregator,
+            "landing_hint": landing_hint,
         })
 
     try:
@@ -715,6 +729,8 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                     captcha_callback=captcha_callback,
                     intent=intent,
                     is_aggregator=is_aggregator,
+                    landing_hint=landing_hint,
+                    live_session_id=live_session_id,
                 )
         return _finish_scrape(url, domain, data_dump_dir, results, detail_urls,
                               prompt_callback, priority_fields, intent)

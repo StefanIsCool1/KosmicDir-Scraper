@@ -91,8 +91,9 @@ Then set secrets and open the firewall:
 nano ~/Projects/TrawlBase/.env      # DEEPSEEK_API_KEY + ANALYTICS_PASSWORD (don't leave the default!)
 
 sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'         # ports 80 + 443
-sudo ufw enable
+sudo ufw allow 80/tcp               # HTTP  (raw ports work even before nginx is
+sudo ufw allow 443/tcp             # HTTPS  installed; 'Nginx Full' profile does not)
+sudo ufw enable                    # safe — OpenSSH is already allowed above
 
 sudo systemctl start trawlbase
 sudo systemctl status trawlbase     # should be active (running)
@@ -158,4 +159,26 @@ Ubuntu/Debian. Adjust if yours differs.)
 | certbot fails | DNS not propagated yet, or port 80 blocked (`sudo ufw status`) |
 | Analytics 500 / no data | `.env` missing `ANALYTICS_PASSWORD`; DB is `Data-dump/analytics.db` |
 | `stats.` shows the main site | Old build deployed — rebuild + `deploy/sync.sh`; `main.jsx` does the host split |
+| `npm run build` → `CustomEvent is not defined` | Node too old (Vite 8 needs Node 20+). `setup.sh` installs Node 20 from NodeSource; if you hit this, `curl -fsSL https://deb.nodesource.com/setup_20.x \| sudo -E bash - && sudo apt-get install -y nodejs` |
 | SSE / live scrape stalls | nginx buffering — already off in `nginx.conf`; confirm you deployed the current one |
+| Scrapes fail instantly with `Target page…has been closed` / `Missing X server` | Xvfb not installed or the service wasn't updated. `sudo apt-get install -y xvfb`, then redeploy `deploy/trawlbase.service` (see below) |
+| Live View shows "Waiting for the first frame…" forever | The service is still running headless (old unit, or `SCRAPER_HEADLESS=1` in `.env`). Update the unit + remove the env override |
+
+### Updating an existing deployment for Live View
+
+Live View needs the browser to run **headed inside Xvfb** (the old unit forced
+headless). On a box provisioned before this change:
+
+```bash
+sudo apt-get install -y xvfb                       # virtual X display
+# copy the new files (deploy/sync.sh does this, or manually):
+sudo cp /home/stefan/Projects/TrawlBase/deploy/trawlbase.service /etc/systemd/system/trawlbase.service
+sudo cp /home/stefan/Projects/TrawlBase/deploy/nginx.conf /etc/nginx/sites-available/trawlbase
+# drop any leftover SCRAPER_HEADLESS=1 from .env
+sudo systemctl daemon-reload
+sudo systemctl restart trawlbase                   # a HUP reload won't pick up the new ExecStart wrapper
+sudo nginx -t && sudo systemctl reload nginx        # for the new /live route
+```
+
+Restarting (not just `kill -HUP`) is required — the `xvfb-run` wrapper is in
+`ExecStart`, which only re-reads on a full restart.

@@ -69,7 +69,24 @@ export function AgentProvider({ children }) {
   const [messages, setMessages] = useState(initial.current.messages)
   const [isRunning, setIsRunning] = useState(false)
   const [accurateEnrichment, setAccurateEnrichment] = useState(initial.current.accurate)
+  // Live View: the current run's session id + whether it paused for a human,
+  // plus whether the viewer modal is open (shared so the header button AND the
+  // in-chat terminal callout both control the one modal).
+  const [liveSessionId, setLiveSessionId] = useState(null)
+  const [paused, setPaused] = useState(false)
+  const [liveViewOpen, setLiveViewOpen] = useState(false)
   const { trackEvent } = useAnalytics()
+
+  const openLiveView = useCallback(() => setLiveViewOpen(true), [])
+  const closeLiveView = useCallback(() => setLiveViewOpen(false), [])
+
+  // Auto-open the viewer on the rising edge of a pause (CAPTCHA / login) so the
+  // user doesn't have to hunt for the button while the clock ticks.
+  const prevPaused = useRef(false)
+  useEffect(() => {
+    if (paused && !prevPaused.current) setLiveViewOpen(true)
+    prevPaused.current = paused
+  }, [paused])
 
   // Per-stream mutable bag — survives renders without triggering them.
   const streamRef = useRef({
@@ -189,6 +206,18 @@ export function AgentProvider({ children }) {
     switch (event.type) {
       case 'session':
         streamRef.current.sessionId = event.session_id
+        setLiveSessionId(event.session_id)
+        break
+
+      case 'paused':
+        // Run paused for a human (CAPTCHA / login). The matching `log` event
+        // already printed the message into the terminal bubble; flag the state
+        // so the Live View button flashes and its modal auto-opens.
+        setPaused(true)
+        break
+
+      case 'resumed':
+        setPaused(false)
         break
 
       case 'stage':
@@ -197,6 +226,7 @@ export function AgentProvider({ children }) {
         break
 
       case 'needs_clarification': {
+        streamRef.current.finished = true
         updateLastStep(statusId, { label: 'Need more info', status: 'done' })
         setMessages((prev) => [...prev, { role: 'agent', text: event.question }])
         break
@@ -353,6 +383,7 @@ export function AgentProvider({ children }) {
         break
 
       case 'complete':
+        streamRef.current.finished = true
         updateLastStep(statusId, { status: 'done' })
         if (terminalId) {
           patchMessage(terminalId, { isComplete: true })
@@ -367,8 +398,12 @@ export function AgentProvider({ children }) {
         break
 
       case 'error':
+        streamRef.current.finished = true
         if (terminalId) {
+          // Close the terminal too — a crashed run used to leave the cursor
+          // blinking forever, which read as "stuck".
           appendTerminalLines(terminalId, [{ text: `⚠ ${event.message}`, category: 'ERROR' }])
+          patchMessage(terminalId, { isComplete: true })
         } else {
           setMessages((prev) => [...prev, { role: 'agent', type: 'error', text: event.message }])
         }
@@ -392,6 +427,7 @@ export function AgentProvider({ children }) {
       sourcesId: null,
       scopeId: null,
       terminalId: null,
+      finished: false,
       counters: {
         candidateCount: 0,
         preflightPassed: 0,
@@ -407,6 +443,9 @@ export function AgentProvider({ children }) {
       { id: statusId, role: 'agent', type: 'status', steps: [] },
     ])
     setIsRunning(true)
+    setLiveSessionId(null)
+    setPaused(false)
+    setLiveViewOpen(false)
 
     trackEvent('discover_started', { goal: text })
 
@@ -452,6 +491,23 @@ export function AgentProvider({ children }) {
           }
         }
       }
+
+      // Stream closed without a complete / error / clarification event: the
+      // connection dropped mid-run. The backend thread keeps going and still
+      // writes its files — say so instead of leaving the terminal "stuck".
+      if (!streamRef.current.finished) {
+        const { statusId: sId, terminalId: tId } = streamRef.current
+        updateLastStep(sId, { status: 'done' })
+        if (tId) patchMessage(tId, { isComplete: true })
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: 'agent',
+            type: 'error',
+            text: 'Lost the connection to this run. The scrape keeps running on the server and its files are still saved — re-run the same request in a minute and already-scraped sources will be picked up from cache.',
+          },
+        ])
+      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -460,7 +516,7 @@ export function AgentProvider({ children }) {
     } finally {
       setIsRunning(false)
     }
-  }, [isRunning, handleEvent, accurateEnrichment, trackEvent])
+  }, [isRunning, handleEvent, accurateEnrichment, trackEvent, updateLastStep, patchMessage])
 
   // Start a fresh conversation (only allowed when nothing is streaming).
   const newChat = useCallback(() => {
@@ -470,6 +526,9 @@ export function AgentProvider({ children }) {
       scopeId: null, terminalId: null, counters: null,
     }
     setMessages([INITIAL_MESSAGE])
+    setLiveSessionId(null)
+    setPaused(false)
+    setLiveViewOpen(false)
     try { window.sessionStorage.removeItem(STORE_KEY) } catch { /* ignore */ }
   }, [isRunning])
 
@@ -480,6 +539,11 @@ export function AgentProvider({ children }) {
     setAccurateEnrichment,
     handleSend,
     newChat,
+    liveSessionId,
+    paused,
+    liveViewOpen,
+    openLiveView,
+    closeLiveView,
   }
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>

@@ -47,17 +47,23 @@ log "Updating apt and installing system packages..."
 
 apt-get update -qq
 
-# Chromium deps for Playwright (headless browser)
+# Chromium deps for Playwright (headless browser).
+# Node.js is intentionally NOT here — Ubuntu's apt ships an old major (18 on
+# 24.04) that Vite 8 / react-router 7 reject. We install Node 20 LTS from
+# NodeSource in step 1b below.
+# xvfb: virtual X display so the browser runs HEADED on this GPU-less server
+# (needed for Live View + human CAPTCHA solving). See deploy/trawlbase.service.
 apt-get install -y -qq \
     python3 python3-pip python3-venv \
-    nodejs npm \
     nginx \
     curl unzip git \
+    xvfb \
     libnss3 libnspr4 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
     libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
     libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
     libgstreamer-plugins-base1.0-0 || \
     apt-get install -y -qq \
+    xvfb \
     libnss3 libnspr4 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
     libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
     libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2  # fallback for older distros
@@ -66,6 +72,22 @@ apt-get install -y -qq \
 apt-get install -y -qq certbot python3-certbot-nginx 2>/dev/null || true
 
 log "System packages installed"
+
+# ── 1b. Node.js 20 LTS (from NodeSource) ───────────────────────────
+# Vite 8 / rolldown / react-router 7 need Node 20+; the distro package is too
+# old. Skip if a new-enough Node is already installed.
+NODE_MAJOR="$(node -v 2>/dev/null | sed -E 's/v([0-9]+).*/\1/')"
+if [[ -z "$NODE_MAJOR" || "$NODE_MAJOR" -lt 20 ]]; then
+    log "Installing Node.js 20 LTS from NodeSource..."
+    # Remove the distro Node/npm first — Ubuntu 24.04's standalone `npm` package
+    # conflicts with NodeSource's bundled npm.
+    apt-get remove -y -qq nodejs npm libnode72 2>/dev/null || true
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y -qq nodejs
+    log "Node.js $(node -v) installed"
+else
+    log "Node.js $(node -v) already present (>= 20)"
+fi
 
 # ── 2. Ensure deploy user exists ───────────────────────────────────
 if ! id -u "$DEPLOY_USER" &>/dev/null; then
@@ -95,8 +117,14 @@ su - "$DEPLOY_USER" -c "cd $PROJECT_DIR && python3 -m venv .venv && .venv/bin/pi
 log "Python packages installed"
 
 # ── 5. Playwright Chromium ─────────────────────────────────────────
+# System libs were already apt-installed in step 1 (we're root here). Install
+# any that Playwright still wants as root (no sudo prompt), THEN download the
+# browser as the deploy user WITHOUT --with-deps — otherwise Playwright shells
+# out to `sudo` under `su`, which has no terminal and fails.
+log "Installing Playwright browser system deps..."
+"$PROJECT_DIR/.venv/bin/playwright" install-deps chromium || true
 log "Installing Playwright Chromium (this downloads ~150 MB)..."
-su - "$DEPLOY_USER" -c "cd $PROJECT_DIR && .venv/bin/playwright install --with-deps chromium"
+su - "$DEPLOY_USER" -c "cd $PROJECT_DIR && .venv/bin/playwright install chromium"
 log "Playwright Chromium installed"
 
 # ── 6. Node dependencies + frontend build ──────────────────────────

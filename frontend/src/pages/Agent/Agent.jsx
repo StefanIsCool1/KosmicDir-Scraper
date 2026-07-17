@@ -2,6 +2,7 @@ import { useRef, useEffect } from 'react'
 import { RotateCcw } from 'lucide-react'
 import ChatMessage from './ChatMessage'
 import ChatInput from './ChatInput'
+import { LiveViewButton, LiveViewModal } from '../../components/LiveView'
 import { useAgent } from '../../context/AgentContext'
 
 const SUGGESTIONS = [
@@ -21,6 +22,11 @@ export default function Agent() {
     setAccurateEnrichment,
     handleSend,
     newChat,
+    liveSessionId,
+    paused,
+    liveViewOpen,
+    openLiveView,
+    closeLiveView,
   } = useAgent()
   const scrollRef = useRef(null)
 
@@ -47,6 +53,13 @@ export default function Agent() {
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
+            {/* Live View — appears while a scrape is running; flashes on a
+                CAPTCHA pause the user needs to solve. Opens the shared modal
+                (the in-chat terminal callout opens the same one). */}
+            {isRunning && liveSessionId && (
+              <LiveViewButton paused={paused} onClick={openLiveView} />
+            )}
+
             {/* New chat — clears the saved transcript. Disabled mid-scrape. */}
             {hasHistory && (
               <button
@@ -95,7 +108,12 @@ export default function Agent() {
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-5">
             <div className="flex flex-col gap-4">
               {messages.map((msg, i) => (
-                <ChatMessage key={msg.id ?? i} message={msg} />
+                <ChatMessage
+                  key={msg.id ?? i}
+                  message={msg}
+                  paused={paused}
+                  onOpenLive={openLiveView}
+                />
               ))}
             </div>
 
@@ -120,6 +138,12 @@ export default function Agent() {
           <ChatInput onSend={handleSend} disabled={isRunning} />
         </div>
       </div>
+
+      {/* Shared Live View modal — opened by the header button, the in-chat
+          terminal callout, or auto-opened on a CAPTCHA pause. */}
+      {liveViewOpen && liveSessionId && isRunning && (
+        <LiveViewModal sessionId={liveSessionId} onClose={closeLiveView} />
+      )}
     </div>
   )
 }

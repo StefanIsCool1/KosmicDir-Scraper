@@ -22,6 +22,7 @@ from config import (
     CARD_CANDIDATE_TAGS, LAYOUT_CLASS_EXACT, LAYOUT_CLASS_FRAGMENTS,
     CARD_CLASS_HINTS, CONTACT_SIGNALS,
     SCALAR_KEYS, EXTRACTION_NULL_THRESHOLD, MIN_CARDS_FOR_LEARNING,
+    RELEARN_MIN_CARDS,
     EXTERNAL_SKIP_DOMAINS, MIN_REGEX_RESULTS, FAX_CONTEXT_WINDOW,
 )
 from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
@@ -1488,6 +1489,12 @@ def _dynamic_schema_has_data_fields(selectors: dict) -> bool:
     return False
 
 
+# Person-schema fields that carry actual data (vs. name/website, which nav
+# links also have). Used by the person link-list guard below.
+_PERSON_DATA_FIELDS = ("pronouns", "title", "department", "office",
+                       "email", "phone")
+
+
 def _selectors_valid(selectors: dict, members: list) -> bool:
     """Dispatch validity check by entity_type (business → SCALAR_KEYS)."""
     if isinstance(selectors, dict):
@@ -1500,7 +1507,21 @@ def _selectors_valid(selectors: dict, members: list) -> bool:
                 return False
             name_field = selectors.get("name_field") \
                 or ("full_name" if etype == "person" else "")
-            return _dynamic_extraction_valid(members, name_field)
+            if not _dynamic_extraction_valid(members, name_field):
+                return False
+            if etype == "person":
+                # Person link-list guard (the dynamic-schema guard above
+                # can't cover person — its fields are flat keys, and the
+                # learner may emit selectors that match nothing). A small set
+                # of records carrying ONLY names is the shape of nav chrome:
+                # 3 of 4 fsStyleAutoclear footer links "validated" as people
+                # and poisoned the cache. A long run of name-only records
+                # (>=10) is a genuine name-only roster — keep those.
+                with_data = sum(1 for m in members
+                                if any(m.get(f) for f in _PERSON_DATA_FIELDS))
+                if with_data == 0 and len(members) < 10:
+                    return False
+            return True
     return is_extraction_valid(members)
 
 
@@ -1649,6 +1670,20 @@ def is_extraction_valid(members: list) -> bool:
 
 # --- MAIN PARSE ENTRY POINT ---
 
+def _candidate_card_count(raw_html: str) -> int:
+    """How many repeating card candidates the page's own structure shows.
+    0 when structural detection finds no repeating card at all (skeleton /
+    no-results pages fall back to the 'densest content region', which is
+    exactly the case this exists to catch)."""
+    try:
+        _, card_sel = extract_sample_html(raw_html)
+        if not card_sel:
+            return 0
+        return len(BeautifulSoup(raw_html, "html.parser").select(card_sel))
+    except Exception:
+        return 0
+
+
 def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
     """Parse member directory HTML using learned CSS selectors, with regex fallback.
 
@@ -1662,15 +1697,30 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
 
     # Step 1: use cached selectors if available (zero AI cost)
     cached = get_cached_selectors(domain)
+    stale_selectors = None
     if cached:
         print(f"  Using cached selectors for {domain}")
         members = apply_selectors(raw_html, cached)
         if _selectors_valid(cached, members):
             debug.log("PARSE", f"Step 1 (cached selectors): extracted {len(members)} members")
             return members
+        # Before blaming the cache, look at the page. A near-empty page (an
+        # alphabet letter with 0-2 staff, a no-results skeleton) yields
+        # nothing under perfectly GOOD selectors; deleting the cache and
+        # re-learning HERE learns nav chrome and poisons every later page.
+        # Keep the cache and return nothing — main.py's second pass re-applies
+        # the final selectors to this page, so tiny real yields still land.
+        page_cards = _candidate_card_count(raw_html)
+        if page_cards < RELEARN_MIN_CARDS:
+            print(f"  Cached selectors found nothing, but page shows only "
+                  f"{page_cards} candidate card(s) — keeping cache, skipping re-learn")
+            debug.log("PARSE", f"Thin page ({page_cards} candidate cards) — "
+                      f"cache kept, no re-learn")
+            return []
         print(f"  Cached selectors invalid for {domain}, re-learning...")
         debug.log("PARSE", "Cached selectors failed validation, re-learning", level="warn")
         delete_cached_selectors(domain)
+        stale_selectors = cached
 
     # Step 1.5: schema.org JSON-LD — zero AI cost, no CSS dependence.
     # Only trusted when it covers at least as much as the visible card
@@ -1724,6 +1774,18 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
     except Exception as e:
         print(f"  WARNING: Selector learning error for {domain}: {e}")
         debug.log("PARSE", f"Step 2 error: {e}", level="error")
+
+    # Learning failed the yield check — but learn_selectors caches its schema
+    # BEFORE that check runs, so scrub it: a schema that can't extract from
+    # the very page it was learned on must never shadow later pages. If we
+    # displaced a previously-good cache in Step 1, restore it — it validated
+    # on a real listing at least once; the new schema never has.
+    delete_cached_selectors(domain)
+    if stale_selectors is not None:
+        set_cached_selectors(domain, stale_selectors)
+        print(f"  Restored previous selectors for {domain} "
+              f"(re-learned schema failed validation)")
+        debug.log("PARSE", "Restored prior cached selectors after failed re-learn")
 
     # Step 2.5: header-mapped table fallback. The LLM failed or its selectors
     # didn't validate — a deterministic column mapping (any entity type) is

@@ -3,16 +3,32 @@ import { useLocation } from 'react-router-dom'
 
 const STORAGE_KEY = 'twl_vid'
 
+// crypto.randomUUID() only exists in a secure context (HTTPS or localhost), so
+// it's undefined on plain http://. Fall back to a random v4-style id so a
+// missing API can never crash the app at module load. Not security-sensitive —
+// this is just an opaque visitor tag.
+function genId() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+  } catch { /* fall through to the manual generator */ }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16)
+  })
+}
+
 function getVisitorId() {
   try {
     let id = localStorage.getItem(STORAGE_KEY)
     if (!id) {
-      id = crypto.randomUUID()
+      id = genId()
       localStorage.setItem(STORAGE_KEY, id)
     }
     return id
   } catch {
-    return crypto.randomUUID()
+    return genId()
   }
 }
 

@@ -91,7 +91,7 @@ export default function Playground() {
 
   return (
     <div className="min-h-screen bg-white pt-20">
-      <div className="mx-auto max-w-site px-6 py-12">
+      <div className="mx-auto max-w-site px-6 py-8">
         {/* Header */}
         <div className="mx-auto flex max-w-2xl items-start justify-between">
           <div>
@@ -122,16 +122,20 @@ export default function Playground() {
         </div>
 
         {/* Output — full width, cleanly at the bottom. */}
-        <div className="mt-12">
+        <div className="mt-8">
           <OutputTerminal
             lines={lines}
             isComplete={isComplete}
             isRunning={isRunning}
+            hasError={isBackendActive && sse.status === 'error'}
             awaitingInput={sse.awaitingInput}
+            promptMessage={sse.promptMessage}
             onInput={sse.sendInput}
             outputFile={sse.result?.output_file}
             detailed={detailed}
             onDetailedChange={setDetailed}
+            liveSessionId={sse.sessionId}
+            livePaused={sse.paused}
           />
         </div>
       </div>

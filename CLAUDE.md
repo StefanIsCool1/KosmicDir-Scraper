@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`AGENTS.md` contains the canonical pipeline diagram, module-by-module layout, API endpoint table, and SSE event vocabulary. Read it first when touching anything beyond a single file — this CLAUDE.md only covers what's not already there.
+`AGENTS.md` contains the canonical pipeline diagram, module-by-module layout, API endpoint table, SSE event vocabulary, and the **production deployment flow + gotchas**. Read it first when touching anything beyond a single file — this CLAUDE.md only covers what's not already there. For deploying/updating the VPS specifically, `deploy/DEPLOY.md` is the step-by-step runbook (DNS, provisioning, certbot, the `sync trawlbase` update loop).
 
 ## Commands
 

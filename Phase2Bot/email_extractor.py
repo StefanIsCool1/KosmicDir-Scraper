@@ -8,7 +8,8 @@ import os
 import sys
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 # Add Bot/ to path so we can reuse existing regex patterns and utilities
@@ -26,7 +27,7 @@ from Phase2Bot.page_fetcher import (
     _ddg_fetch_results,
 )
 from Phase2Bot.vertical_enrichment import (
-    enrich_by_vertical, reset_vertical_cache,
+    enrich_by_vertical, classify_vertical, reset_vertical_cache,
     VERTICAL_HEALTHCARE, VERTICAL_LAWYER, VERTICAL_REAL_ESTATE, VERTICAL_BUSINESS,
 )
 
@@ -693,101 +694,14 @@ def enrich_from_websites(json_path, event_callback=None, accurate_enrichment: bo
     if email_derived:
         log(f"  Derived {email_derived} websites from contact email domains (DDG skipped)")
 
-    # Vertical-aware enrichment: route each record by profession before
-    # falling through to generic DDG. Healthcare records hit NPI Registry
-    # (free CMS API) for phone + address + taxonomy. Lawyer/RE records get
-    # tuned DDG queries that prefer authoritative profile sites. Business
-    # records are passed through unchanged.
-    reset_vertical_cache()
-    # Reset the DDG search kill-switch BEFORE the vertical loop — lawyer/RE
-    # enrichment below uses DDG, so a stale flag from a previous run would
-    # silently skip it. (It used to be reset only later, before the
-    # missing-website search.)
-    reset_search_state()
-    vertical_counts = {VERTICAL_HEALTHCARE: 0, VERTICAL_LAWYER: 0,
-                       VERTICAL_REAL_ESTATE: 0, VERTICAL_BUSINESS: 0}
-    npi_phone_filled = 0
-    lawyer_website_filled = 0
-    realestate_website_filled = 0
+    log(f"  {len(has_website)} have website, {len(no_website)} need lookups, {len(complete)} already complete")
 
-    # Iterate over a copy so we can safely move records into has_website.
-    for m in list(no_website):
-        vertical, enrichment = enrich_by_vertical(m, ddg_fetcher=_ddg_fetch_results)
-        vertical_counts[vertical] = vertical_counts.get(vertical, 0) + 1
-
-        if not enrichment:
-            continue
-
-        # Merge enrichment fields, never overwriting non-empty existing values
-        got_phone = False
-        for k, v in enrichment.items():
-            if v and not m.get(k):
-                m[k] = v
-                if k == "phone":
-                    got_phone = True
-
-        if vertical == VERTICAL_HEALTHCARE and got_phone:
-            npi_phone_filled += 1
-
-        # If the vertical lookup produced a website (lawyer/RE paths), move
-        # the record into has_website so the standard enrichment loop runs.
-        if m.get("website"):
-            has_website.append(m)
-            no_website.remove(m)
-            if vertical == VERTICAL_LAWYER:
-                lawyer_website_filled += 1
-            elif vertical == VERTICAL_REAL_ESTATE:
-                realestate_website_filled += 1
-
-    if any(vertical_counts.values()):
-        log(f"  Vertical classification: "
-            f"{vertical_counts[VERTICAL_HEALTHCARE]} healthcare, "
-            f"{vertical_counts[VERTICAL_LAWYER]} lawyer, "
-            f"{vertical_counts[VERTICAL_REAL_ESTATE]} real_estate, "
-            f"{vertical_counts[VERTICAL_BUSINESS]} business")
-    if npi_phone_filled:
-        log(f"  NPI Registry: filled phone for {npi_phone_filled} healthcare records")
-    if lawyer_website_filled:
-        log(f"  Lawyer directories: found website for {lawyer_website_filled} records")
-    if realestate_website_filled:
-        log(f"  Real estate directories: found website for {realestate_website_filled} records")
-
-    log(f"  {len(has_website)} have website, {len(no_website)} need Google search, {len(complete)} already complete")
-
-    # --- Phase A: Google search for missing websites (sequential to avoid CAPTCHA) ---
-    # Extract source domain from filename (e.g. "business_hbagbr_org" → "business.hbagbr.org")
+    # Source domain from filename (e.g. "business_hbagbr_org" → "business.hbagbr.org"),
+    # used by the DDG search to reject results that point back at the directory itself.
     source_domain = os.path.basename(json_path).replace("_structured.json", "").replace("_", ".")
-
     found_websites = {}  # {company_name: url}
-    if no_website:
-        log(f"  Searching DuckDuckGo for {len(no_website)} missing websites...")
-        for i, m in enumerate(no_website):
-            name = m.get("company_name", "")
-            if not name or len(name) < 3:
-                continue
-            found_url, query = ddg_search_website(
-                company_name=name,
-                street_address=m.get("street_address"),
-                category=m.get("category"),
-                phone=m.get("phone"),
-                source_domain=source_domain,
-                contacts=m.get("contacts"),
-                accurate=accurate_enrichment,
-            )
-            if found_url:
-                m["website"] = found_url
-                found_websites[name] = found_url
-                log(f"    [{i+1}/{len(no_website)}] {name} → {found_url}")
-                has_website.append(m)
-            else:
-                log(f"    [{i+1}/{len(no_website)}] {name} → not found")
-        log(f"  DuckDuckGo: found {len(found_websites)}/{len(no_website)} websites")
 
-    # Rebuild enrichable list (only entries that now have a website)
-    enrichable = has_website
-
-    WORKERS = 8
-    log(f"  Enriching {len(enrichable)} entries with {WORKERS} parallel workers...")
+    WORKERS = max(1, int(os.environ.get("PHASE2_WORKERS") or 8))
 
     def _enrich_one(idx, member):
         """Enrich a single member. Returns (idx, enriched_record, found_list_or_none)."""
@@ -860,31 +774,156 @@ def enrich_from_websites(json_path, event_callback=None, accurate_enrichment: bo
             record["enrichment_status"] = "error"
             return idx, record, None
 
-    results: list[dict | None] = [None] * len(enrichable)
-    success = 0
-    failed = 0
+    # The fetch pool starts BEFORE the website lookups below: records that
+    # already have a website begin enriching immediately, and every record
+    # whose website turns up later (NPI / lawyer / RE / DDG) is handed to the
+    # pool the moment it's found. Total time is ~max(lookup time, fetch time)
+    # instead of their sum. The pool is drained after the DDG loop.
+    executor = ThreadPoolExecutor(max_workers=WORKERS)
+    futures: list = []
+    progress = {"done": 0, "success": 0, "failed": 0}
+    progress_lock = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {
-            pool.submit(_enrich_one, i, m): i
-            for i, m in enumerate(enrichable)
-        }
-        done_count = 0
-        for future in as_completed(futures):
-            idx, enriched, found = future.result()
-            results[idx] = enriched
-            done_count += 1
-            name = enrichable[idx].get("company_name", "Unknown")
-
+    def _log_done(future):
+        """Completion callback — runs on the worker thread that finished."""
+        _idx, enriched, found = future.result()
+        name = enriched.get("company_name", "Unknown")
+        with progress_lock:
+            progress["done"] += 1
+            done, total = progress["done"], len(futures)
             if found:
-                log(f"  [{done_count}/{len(enrichable)}] {name} — {', '.join(found)}")
-                success += 1
+                progress["success"] += 1
+                log(f"  [{done}/{total}] {name} — {', '.join(found)}")
             elif enriched.get("enrichment_status") == "failed":
-                log(f"  [{done_count}/{len(enrichable)}] {name} — failed to fetch")
-                failed += 1
+                progress["failed"] += 1
+                log(f"  [{done}/{total}] {name} — failed to fetch")
             else:
-                log(f"  [{done_count}/{len(enrichable)}] {name} — no new data")
-                failed += 1
+                progress["failed"] += 1
+                log(f"  [{done}/{total}] {name} — no new data")
+
+    def _submit(member):
+        # Main-thread only: the futures index doubles as the results slot.
+        future = executor.submit(_enrich_one, len(futures), member)
+        futures.append(future)
+        future.add_done_callback(_log_done)
+
+    if has_website:
+        # Wording is a contract: frontend formatTerminalLine.js / simpleFeed.js
+        # match /^Enriching (\d+) entries with (\d+)/ to seed the progress total
+        # (per-record [done/total] ticks then grow it via Math.max).
+        log(f"  Enriching {len(has_website)} entries with {WORKERS} parallel workers "
+            f"(more stream in as websites are found)...")
+    for m in has_website:
+        _submit(m)
+
+    # Vertical-aware enrichment: route each record by profession before
+    # falling through to generic DDG. Healthcare records hit NPI Registry
+    # (free CMS API) for phone + address + taxonomy. Lawyer/RE records get
+    # tuned DDG queries that prefer authoritative profile sites. Business
+    # records are passed through unchanged.
+    vertical_counts = {VERTICAL_HEALTHCARE: 0, VERTICAL_LAWYER: 0,
+                       VERTICAL_REAL_ESTATE: 0, VERTICAL_BUSINESS: 0}
+    npi_phone_filled = 0
+    lawyer_website_filled = 0
+    realestate_website_filled = 0
+
+    # Classify every no-website record up front — cached by (category,
+    # name-shape), so this costs at most a few LLM calls. Splitting by
+    # vertical lets healthcare NPI lookups run in parallel (npi_lookup opens
+    # a fresh session per call, so it's thread-safe, and the classifier cache
+    # is fully warmed here) while lawyer/RE keep the serial DDG path.
+    classified = [(m, classify_vertical(m)) for m in no_website]
+    for _, v in classified:
+        vertical_counts[v] = vertical_counts.get(v, 0) + 1
+
+    def _apply_vertical(m, vertical, enrichment):
+        """Merge vertical fields (never overwriting non-empty values); if the
+        record gained a website, move it out of no_website into the pool."""
+        nonlocal npi_phone_filled, lawyer_website_filled, realestate_website_filled
+        if not enrichment:
+            return
+        got_phone = False
+        for k, v in enrichment.items():
+            if v and not m.get(k):
+                m[k] = v
+                if k == "phone":
+                    got_phone = True
+        if vertical == VERTICAL_HEALTHCARE and got_phone:
+            npi_phone_filled += 1
+        if m.get("website"):
+            if vertical == VERTICAL_LAWYER:
+                lawyer_website_filled += 1
+            elif vertical == VERTICAL_REAL_ESTATE:
+                realestate_website_filled += 1
+            no_website.remove(m)
+            _submit(m)
+
+    healthcare = [m for m, v in classified if v == VERTICAL_HEALTHCARE]
+    if healthcare:
+        with ThreadPoolExecutor(max_workers=6) as npi_pool:
+            npi_enrichments = list(npi_pool.map(
+                lambda m: enrich_by_vertical(m)[1], healthcare))
+        for m, enrichment in zip(healthcare, npi_enrichments):
+            _apply_vertical(m, VERTICAL_HEALTHCARE, enrichment)
+
+    for m, vertical in classified:
+        if vertical not in (VERTICAL_LAWYER, VERTICAL_REAL_ESTATE):
+            continue
+        _, enrichment = enrich_by_vertical(m, ddg_fetcher=_ddg_fetch_results)
+        _apply_vertical(m, vertical, enrichment)
+
+    if any(vertical_counts.values()):
+        log(f"  Vertical classification: "
+            f"{vertical_counts[VERTICAL_HEALTHCARE]} healthcare, "
+            f"{vertical_counts[VERTICAL_LAWYER]} lawyer, "
+            f"{vertical_counts[VERTICAL_REAL_ESTATE]} real_estate, "
+            f"{vertical_counts[VERTICAL_BUSINESS]} business")
+    if npi_phone_filled:
+        log(f"  NPI Registry: filled phone for {npi_phone_filled} healthcare records")
+    if lawyer_website_filled:
+        log(f"  Lawyer directories: found website for {lawyer_website_filled} records")
+    if realestate_website_filled:
+        log(f"  Real estate directories: found website for {realestate_website_filled} records")
+
+    # --- Phase A: search for missing websites. The queries stay sequential —
+    # parallel DDG queries from one IP trip the 429 kill-switch
+    # (_search_stopped) almost immediately — but each hit is handed straight
+    # to the fetch pool, so enrichment overlaps the remaining searches.
+    if no_website:
+        log(f"  Searching DuckDuckGo for {len(no_website)} missing websites...")
+        for i, m in enumerate(no_website):
+            name = m.get("company_name", "")
+            if not name or len(name) < 3:
+                continue
+            found_url, query = ddg_search_website(
+                company_name=name,
+                street_address=m.get("street_address"),
+                category=m.get("category"),
+                phone=m.get("phone"),
+                source_domain=source_domain,
+                contacts=m.get("contacts"),
+                accurate=accurate_enrichment,
+            )
+            if found_url:
+                m["website"] = found_url
+                found_websites[name] = found_url
+                log(f"    [{i+1}/{len(no_website)}] {name} → {found_url}")
+                _submit(m)
+            else:
+                log(f"    [{i+1}/{len(no_website)}] {name} → not found")
+        log(f"  DuckDuckGo: found {len(found_websites)}/{len(no_website)} websites")
+
+    # All lookups done — wait out whatever the pool is still fetching.
+    if futures:
+        log(f"  Website lookups finished — {progress['done']}/{len(futures)} fetches done, waiting for the rest...")
+    executor.shutdown(wait=True)
+
+    results: list[dict | None] = [None] * len(futures)
+    for future in futures:
+        idx, enriched, _found = future.result()
+        results[idx] = enriched
+    success = progress["success"]
+    failed = progress["failed"]
 
     # Add entries that still have no website (search didn't find them)
     no_website_remaining = [m for m in no_website if m.get("company_name") not in found_websites]

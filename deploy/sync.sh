@@ -49,7 +49,9 @@ fi
 #    NEVER deleted (they're server-owned: data, cookies, .env, the DB, venv).
 #    Trailing slash on the source = copy CONTENTS of the dir, not the dir itself.
 echo "▶ Syncing → $REMOTE:$REMOTE_DIR"
-rsync -avz --delete "${DRY_RUN[@]}" \
+# ${arr[@]+"${arr[@]}"} expands to nothing when empty without tripping `set -u`
+# on Bash 3.2 (macOS default), where a bare "${arr[@]}" would error.
+rsync -avz --delete ${DRY_RUN[@]+"${DRY_RUN[@]}"} \
     -e ssh \
     --exclude '.git/' \
     --exclude '.venv/' \
