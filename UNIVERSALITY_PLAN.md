@@ -423,6 +423,118 @@ and its 213 unique `/Details/{ID}` links both say 213 today.
 - `debug.decision("PROFILE", ...)` traces every derive; grep Debug-dump
   for `PROFILE` when auditing counts.
 
+### Phase 2 — landed 2026-07-17
+
+**What shipped** (flag: `config.py:PHASE2_RECONCILIATION`, default ON, kill
+via `TRAWL_PHASE2_RECONCILIATION=0`; constants `COUNT_GATE_RATIO=0.8`,
+`COUNT_GATE_CLAMP_FACTOR=10`, `NAME_ONLY_CRAWL_RATIO=0.7`,
+`MAX_CACHED_LAYOUTS=4`):
+
+- **Count gate (R3).** `navigator.read_result_count` now records every read
+  into `archetype.note_expected_count` (profile `expected_count` + a
+  run-level max, reset per scrape via `archetype.reset()` at the top of
+  `scrape_directory`); raw pre-dedup parse yields and live rendered counts
+  accumulate as `note_observed` evidence. `main.count_gate_verdict`
+  (pure, unit-tested) flags `cleaned < 0.8 × expected`; the clamp degrades
+  a stated total >10× all extraction evidence to unknown (marketing copy);
+  "all"/unknown/<3-record scrapes fall open. On a verdict, `_finish_scrape`
+  re-drives the FULL browser capture once (`redrive_fn` = the same
+  `capture_responses` closure — selector cache warm, results merged, raw
+  dump rewritten, re-parsed), and the structured metadata gains additive
+  `partial: true` + `expected_count`. Propagated: `exporter.consolidate`
+  tags the source entry and the consolidated metadata/`export_final_dataset`
+  return; SSE `complete` gains additive `partial`(+`expected_count`) on the
+  Playground single path and `partial` on the /discover final event — no
+  event renames.
+- **Completeness gate (R4).** `_finish_scrape` now parses BEFORE the
+  detail-crawl decision (both gates need per-record evidence);
+  `main._name_only_ratio` reads per-record coverage — name present but no
+  phone/email/address (business), no person data fields (person), no
+  non-identity/non-url field (dynamic). At ≥70% with detail links present:
+  Agent mode (`intent` non-None) auto-crawls, overriding the raw-JSON
+  "fields already found" skip that caused R4; Playground/CLI get their y/n
+  prompt with an explanatory message. When a crawl runs, the parse re-runs
+  with detail members merged (cheap — selectors cached, intent filter
+  memoized per record).
+- **Cache layouts (R5).** `cache.layout_fingerprint` =
+  sha1(card_selector + sorted field keys)[:16]; entries gain
+  `{fingerprint, learned_at}`. The most recently validated schema stays
+  under the plain domain key (every legacy reader unchanged); alternates
+  live under `layouts_{domain}` (cap 4 total). `set_cached_selectors`
+  demotes a different-fingerprint primary instead of destroying it;
+  `parse_member_html` Step 1 tries every layout (primary first) and
+  promotes a validating alternate; `remove_cached_layout` scrubs a
+  failed-validation learn by fingerprint and auto-promotes the demoted
+  primary back — replacing the old delete/restore dance (kept verbatim
+  under the flag-off path). Legacy entries read as a fingerprint-less
+  primary; `delete_cached_selectors` (the garbage-gate purge) removes all
+  layouts.
+- **Sample diversity + union schema (R6).** `_pick_diverse_samples`
+  replaces first-4 sampling at all four `extract_sample_html` candidate
+  sites: first card + field-richest + up to 3 novel regex signatures
+  (email/phone/link/img), ≤5 total. After learning,
+  `_augment_sparse_fields` audits the schema against ALL detected cards;
+  email/phone present on ≥20% of cards but captured on fewer than half of
+  those triggers ONE re-ask on the card exhibiting the most misses
+  (selector validated against that card before merging). The union schema
+  is what gets cached/fingerprinted. ≤1 extra LLM call per new domain.
+- `tests/test_phase2_gates.py` — 23 tests, one per exit criterion plus gate
+  unit coverage, cache/exporter propagation, and negative/parity cases.
+  Selector cache isolated to a tmp file per test; no network/LLM/browser.
+
+**Exit criteria:** short-count fixture (40 of a stated 100) sets `partial`,
+re-drives exactly once, and the recovery clears the flag ✓ (and stays
+partial when the re-drive finds nothing ✓; never re-drives without a stated
+total ✓). Name-only roster (12 names + profile links) auto-crawls in Agent
+mode without prompting, prompts in Playground ✓. Two-layout domain
+(card grid + table) keeps both schemas, parses each page via the right one,
+and promotes on use ✓. Sparse-field fixture (email on 10 of 20 cards,
+missed by the learned schema) triggers exactly one re-ask and caches the
+union schema capturing all 10 ✓. **Live smoke:** members.buildingncw.org
+CLI run unchanged at 213 members (site total 213 — reconciled, no partial
+flag, no re-drive).
+
+**Deviations from spec (and why):**
+
+1. "Name-only" in the completeness gate means *no contact data*
+   (phone/email/address), not literally no other field: a link-index
+   roster's records typically carry the profile href as `website`, and a
+   literally-name-only business list is already zeroed by cleaner's
+   `is_extraction_garbage` before the gate could see it.
+2. The count gate compares the CLEANED, PRE-intent-filter count against
+   the stated total — the site total counts every industry, so gating the
+   post-intent count would re-drive every narrowed agent scrape.
+3. The sanity clamp uses max(raw pre-dedup parse yield, best live rendered
+   count, cleaned count) as "pagination evidence" — browser.py (pages
+   walked) is Phase 3 territory and stayed untouched.
+4. `_finish_scrape` was reordered (parse → gates → detail crawl → re-parse
+   with detail members) because both gates need per-record evidence. Cost:
+   when a detail crawl yields ≥10 members, the old flow skipped listing-HTML
+   selector learning entirely; the new preliminary parse learns it (~1 LLM
+   call per new domain, then cached forever).
+5. The business-email re-ask is skipped when the schema scopes contacts to
+   `contact_card` sub-blocks — a card-relative selector would be applied
+   relative to the wrong element.
+6. The re-drive re-runs the whole capture (navigate/search/paginate/XHR)
+   rather than resuming pagination mid-stream: `_finish_scrape` runs after
+   the Playwright context closed. Phase 1's counting fixes make shortfall
+   causes (flaky loads, engine switches) exactly the ones a fresh pass with
+   a warm selector cache fixes.
+
+**Notes for Phase 3:**
+
+- `PageProfile.expected_count` is now populated (via `note_expected_count`)
+  — the expected-aware XHR caps (R7) can read
+  `archetype.run_count_evidence()` or the profile directly.
+- The re-drive closure (`_run_capture` in `scrape_directory`) is where a
+  smarter Phase 3 re-drive (targeted XHR replay instead of a full re-run)
+  should slot in — signature is already `() -> (results, detail_urls)`.
+- SSE `partial` is additive on `complete`; the frontend can surface it
+  whenever — nothing renames.
+- `intent_record_filter`'s per-record memo cache is what makes multi-parse
+  passes affordable; don't break the module-level `_RECORD_CACHE` when
+  touching that file.
+
 ## Out of scope (explicit)
 
 - **Login walls / CAPTCHA / anti-bot** — the cookie-persistence + Live View layer already

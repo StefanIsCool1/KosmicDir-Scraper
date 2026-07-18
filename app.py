@@ -423,6 +423,15 @@ def scrape_single():
             if ran_phase2:
                 result["enriched"] = enriched_count
                 result["field_coverage"] = field_coverage
+            # Additive (Phase 2 count gate): surface a short-count scrape
+            # next to field_coverage — no event renames.
+            try:
+                _meta = read_metadata(os.path.join(DATA_DUMP, structured_file))
+            except Exception:
+                _meta = None
+            if _meta and _meta.get("partial"):
+                result["partial"] = True
+                result["expected_count"] = _meta.get("expected_count")
             if debug_mode:
                 result["debug_entries"] = debug.get_entries()
                 result["debug_summary"] = debug.get_summary()
@@ -1244,6 +1253,7 @@ def discover():
             # across sources, canonical field order, source-tagged records.
             merged_file = None
             final_xlsx = None
+            export_info = None
             if output_files:
                 try:
                     plan_industry = (result.get("plan") or {}).get("industry") or {}
@@ -1280,7 +1290,7 @@ def discover():
                         "category": "ERROR",
                     })
 
-            event_queue.put({
+            _final_complete = {
                 "type": "complete",
                 "success": total_records > 0,
                 "records": total_records,
@@ -1296,7 +1306,12 @@ def discover():
                     "rejected_count": result.get("rejected_count", 0),
                     "reject_reasons": result.get("reject_reasons", {}),
                 },
-            })
+            }
+            # Additive (Phase 2 count gate): flag when any source extracted
+            # less than its site's stated total — no event renames.
+            if export_info and export_info.get("partial"):
+                _final_complete["partial"] = True
+            event_queue.put(_final_complete)
         except Exception as e:
             original_print(f"ERROR: {e}\n{traceback.format_exc()}")
             event_queue.put({"type": "error", "message": str(e)})

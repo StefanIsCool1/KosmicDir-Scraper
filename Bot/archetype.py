@@ -75,10 +75,52 @@ class PageProfile:
 # resurrects a stale selector, which the <3-live-matches rule re-derives.
 _profiles: OrderedDict[int, PageProfile] = OrderedDict()
 
+# Run-level count evidence (Phase 2). `expected` is the largest number-typed
+# read_result_count() result seen this run; `observed` the best
+# extraction-side count (live rendered counts, raw parse yields). Both feed
+# the finish-time count gate in main.py; reset() clears them at run
+# boundaries alongside the profiles.
+_run_expected: int | None = None
+_run_observed: int = 0
+
 
 def reset() -> None:
-    """Drop all cached profiles (test isolation / run boundaries)."""
+    """Drop all cached profiles and run-level count evidence (test
+    isolation / run boundaries)."""
+    global _run_expected, _run_observed
     _profiles.clear()
+    _run_expected = None
+    _run_observed = 0
+
+
+def note_expected_count(context, info) -> None:
+    """Record a read_result_count() result: populates the context's
+    profile.expected_count and the run-level expected total. Only
+    number-typed results register — "all"/"unknown" never gate."""
+    global _run_expected
+    if not isinstance(info, dict) or info.get("type") != "number":
+        return
+    n = info.get("count")
+    if not isinstance(n, int) or n <= 0:
+        return
+    prof = _profiles.get(id(context))
+    if prof is not None:
+        prof.expected_count = n
+    if _run_expected is None or n > _run_expected:
+        _run_expected = n
+
+
+def note_observed(n) -> None:
+    """Record extraction-side evidence (a live rendered count or a raw
+    parse yield) for the count gate's marketing-copy sanity clamp."""
+    global _run_observed
+    if isinstance(n, int) and n > _run_observed:
+        _run_observed = n
+
+
+def run_count_evidence() -> tuple[int | None, int]:
+    """(expected_total, best_observed) accumulated since the last reset()."""
+    return _run_expected, _run_observed
 
 
 def _store(key: int, prof: PageProfile) -> None:
@@ -177,11 +219,15 @@ def count_records(context) -> int | None:
     if prof is not None:
         n = _count_via_profile(context, prof)
         if n is not None:
+            note_observed(n)
             return n
         if not _should_rederive(context, prof):
             return None
     prof = _derive(context)
-    return _count_via_profile(context, prof)
+    n = _count_via_profile(context, prof)
+    if n is not None:
+        note_observed(n)
+    return n
 
 
 def rendered_record_count(page) -> tuple[int | None, bool]:
@@ -219,5 +265,6 @@ def rendered_record_count(page) -> tuple[int | None, bool]:
     if rep is not None:
         return rep, True
     if links >= _MIN_LIVE_MATCHES:
+        note_observed(links)
         return links, True
     return None, False

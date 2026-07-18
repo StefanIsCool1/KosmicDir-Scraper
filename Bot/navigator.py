@@ -1085,7 +1085,20 @@ def read_result_count(page, query: str = "") -> dict:
         {"type": "all"} — page says showing all results
         {"type": "number", "count": N} — found specific count
         {"type": "unknown"} — no count visible
+
+    Every read is recorded into the page profile / run summary
+    (archetype.note_expected_count) so the finish-time count gate can
+    reconcile extracted vs expected (UNIVERSALITY_PLAN Phase 2).
     """
+    info = _read_result_count(page, query)
+    try:
+        archetype.note_expected_count(page, info)
+    except Exception:
+        pass
+    return info
+
+
+def _read_result_count(page, query: str = "") -> dict:
     full_text = _full_page_text(page)
     if not full_text:
         return {"type": "unknown"}

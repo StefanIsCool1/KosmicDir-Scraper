@@ -308,11 +308,18 @@ def consolidate(paths: list) -> dict:
             entity_type = meta["entity_type"]
             name_field = meta.get("name_field") or name_field
         source_url = meta.get("source_url") or os.path.basename(path)
-        sources.append({
+        source_entry = {
             "source_url": source_url,
             "file": os.path.basename(path),
             "records": len(members),
-        })
+        }
+        if meta.get("partial"):
+            # Phase 2 count gate: this source extracted less than the site's
+            # stated total — carried through so the deliverable says so.
+            source_entry["partial"] = True
+            if meta.get("expected_count"):
+                source_entry["expected_count"] = meta["expected_count"]
+        sources.append(source_entry)
 
         for m in members:
             if not isinstance(m, dict):
@@ -346,6 +353,7 @@ def consolidate(paths: list) -> dict:
         "name_field": name_field,
         "duplicates_merged": duplicates_merged,
         "dropped_empty": dropped_empty,
+        "partial": any(s.get("partial") for s in sources),
     }
 
 
@@ -472,6 +480,10 @@ def export_final_dataset(output_files: list, search_dirs: list, out_dir: str,
         "name_field": result["name_field"],
         "field_coverage": _field_coverage(members),
     }
+    if result.get("partial"):
+        # Additive (Phase 2 count gate): at least one source extracted less
+        # than its site's stated total.
+        metadata["partial"] = True
 
     os.makedirs(out_dir, exist_ok=True)
     json_name = f"{base_name}_final.json"
@@ -495,4 +507,5 @@ def export_final_dataset(output_files: list, search_dirs: list, out_dir: str,
         "total": len(members),
         "sources": result["sources"],
         "duplicates_merged": result["duplicates_merged"],
+        "partial": result.get("partial", False),
     }

@@ -27,7 +27,12 @@ from cleaner import (
 )
 from detail_crawler import crawl_detail_pages
 from cache import delete_cached_selectors, get_cached_selectors
+from config import (
+    PHASE2_RECONCILIATION, COUNT_GATE_RATIO, COUNT_GATE_CLAMP_FACTOR,
+    NAME_ONLY_CRAWL_RATIO,
+)
 from debug import debug
+import archetype
 
 # Fields that can only be found via Phase 2 (website enrichment), not detail pages.
 PHASE2_ONLY_FIELDS = {"social_media"}
@@ -210,7 +215,7 @@ def is_member_list(data: list) -> bool:
 def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
                            detail_members: list | None = None,
                            intent: dict | None = None,
-                           source_url: str = "") -> list:
+                           source_url: str = "") -> tuple[list, dict | None]:
     """Parse all captured responses, save both raw and structured data.
 
     Handles:
@@ -219,6 +224,11 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
     - JSON dict responses (single member or config-like data)
     - Raw HTML responses (parse with selector learning strategy)
     - Pre-parsed detail page members (from detail_crawler)
+
+    Returns (members, count_gate_verdict): the verdict is None when the
+    scrape reconciles against the site's stated total (or no total exists),
+    else {"expected": E, "extracted": N} — mirrored into metadata as
+    partial=true + expected_count (Phase 2, R3).
     """
     all_members = []
     has_json_members = False
@@ -331,6 +341,10 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
         if is_dynamic else None
     )
 
+    # Raw pre-dedup yield is extraction-side evidence for the count gate's
+    # marketing-copy clamp (what the walked pages actually carried).
+    archetype.note_observed(len(all_members))
+
     # Clean and deduplicate all members
     all_members = clean_members(all_members, name_field=name_field,
                                 is_dynamic=is_dynamic, field_roles=field_roles,
@@ -360,7 +374,14 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
                        "records lack contact/identity data — cached selectors purged",
                        data={"members_before_rejection": len(all_members)})
         delete_cached_selectors(domain)
-        return []
+        return [], None
+
+    # Count gate reconciles the CLEANED, pre-intent count against the site's
+    # stated total — intent narrowing drops records deliberately, and the
+    # site total counts all of them.
+    cleaned_total = len(all_members)
+    expected, observed = archetype.run_count_evidence()
+    verdict = count_gate_verdict(cleaned_total, expected, observed)
 
     # --- Intent filter (Agent mode only) ---
     # Trim the validated members to the user's actual target — e.g. deck
@@ -394,12 +415,19 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
     metadata = compute_metadata(all_members, source_url=source_url, intent=intent,
                                 entity_type=entity_type, name_field=name_field,
                                 **({"intent_dropped": intent_dropped} if intent else {}))
+    if verdict:
+        # Additive fields — every existing reader of the metadata block is
+        # untouched when the scrape reconciles.
+        metadata["partial"] = True
+        metadata["expected_count"] = verdict["expected"]
+        print(f"  PARTIAL: extracted {verdict['extracted']} of a stated "
+              f"{verdict['expected']} total")
 
     with open(structured_path, "w") as f:
         json.dump({"metadata": metadata, "members": all_members}, f, indent=4)
     print(f"Saved {total} structured members to {structured_path}")
 
-    return all_members
+    return all_members, verdict
 
 
 def read_members(json_path: str) -> list:
@@ -496,6 +524,75 @@ def compute_metadata(members: list, source_url: str = "", intent: dict | None = 
         ]
     metadata.update(extra)
     return metadata
+
+
+def count_gate_verdict(cleaned_count: int, expected: int | None,
+                       observed: int = 0) -> dict | None:
+    """Count gate (UNIVERSALITY_PLAN Phase 2, R3): decide whether a finished
+    parse is PARTIAL against the site's stated total.
+
+    Returns {"expected": E, "extracted": N} when the cleaned count falls
+    below COUNT_GATE_RATIO x the stated total, else None (gate doesn't
+    apply: flag off, no numeric total ("all"/unknown fall open — never gate
+    sites that show no count), a failed scrape (<3 records — re-driving
+    garbage reproduces garbage), or a stated total the sanity clamp rejects).
+
+    The clamp: read_result_count takes the largest anchored match over full
+    page text, so marketing copy ("one of 5,000 members nationwide") can
+    inflate the expected total. When it exceeds COUNT_GATE_CLAMP_FACTOR x
+    every piece of extraction-side evidence (`observed` = best of live
+    rendered counts and raw parse yields), degrade to unknown instead of
+    flagging partial and re-driving for nothing."""
+    if not PHASE2_RECONCILIATION:
+        return None
+    if not isinstance(expected, int) or expected <= 0:
+        return None
+    if cleaned_count < 3:
+        return None
+    evidence = max(observed, cleaned_count)
+    if expected > COUNT_GATE_CLAMP_FACTOR * evidence:
+        debug.decision("CLEAN", "count gate: stated total rejected",
+                       f"claimed {expected} is >{COUNT_GATE_CLAMP_FACTOR}x the "
+                       f"extraction evidence ({evidence}) — treating as unknown",
+                       data={"expected": expected, "evidence": evidence})
+        return None
+    if cleaned_count >= COUNT_GATE_RATIO * expected:
+        return None
+    return {"expected": expected, "extracted": cleaned_count}
+
+
+def _name_only_ratio(members: list, domain: str) -> float:
+    """Share of records carrying a name but NO contact data — the shape of
+    a link-index roster (contacts live on profile pages). Contact data =
+    phone / email / address (business), the person data fields, or any
+    non-identity, non-url field (dynamic) — website/category alone don't
+    count, since a detail crawl is exactly what fills the rest in (R4)."""
+    if not members:
+        return 0.0
+    sel = get_cached_selectors(domain) or {}
+    entity_type = sel.get("entity_type") or "business"
+    name_field = sel.get("name_field") or (
+        "full_name" if entity_type == "person" else "company_name")
+    url_keys = {f["key"] for f in sel.get("fields") or []
+                if isinstance(f, dict) and f.get("key")
+                and (f.get("role") or "").lower() == "url"}
+
+    def _has_contact_data(m: dict) -> bool:
+        if entity_type == "business":
+            if m.get("phone") or m.get("street_address") or m.get("mailing_address"):
+                return True
+            return any(isinstance(c, dict) and (c.get("email") or c.get("name"))
+                       for c in m.get("contacts") or [])
+        if entity_type == "person":
+            return any(m.get(f) for f in ("phone", "email", "title",
+                                          "department", "office", "pronouns"))
+        return any(v for k, v in m.items()
+                   if k != name_field and k not in url_keys and k != "source_url")
+
+    name_only = sum(1 for m in members
+                    if isinstance(m, dict) and m.get(name_field)
+                    and not _has_contact_data(m))
+    return name_only / len(members)
 
 
 def _detect_login_wall(results: list) -> bool:
@@ -718,22 +815,33 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
             "landing_hint": landing_hint,
         })
 
+    # Run boundary for the profile cache + count evidence (expected totals
+    # and observed counts must not leak between sites in one process).
+    archetype.reset()
+
+    def _run_capture():
+        """One full browser capture pass. Also the count gate's re-drive:
+        re-running the capture re-walks pagination and XHR replay with the
+        selector cache warm and the count evidence already accumulated."""
+        with sync_playwright() as playwright:
+            return capture_responses(
+                playwright, url, mode=mode,
+                priority_fields=priority_fields,
+                login_callback=login_callback or _login_interactive,
+                captcha_callback=captcha_callback,
+                intent=intent,
+                is_aggregator=is_aggregator,
+                landing_hint=landing_hint,
+                live_session_id=live_session_id,
+            )
+
     try:
         # --- Step 1: Browser automation — capture all responses ---
         with debug.span("BROWSER", "browser capture (navigate/search/paginate)"):
-            with sync_playwright() as playwright:
-                results, detail_urls = capture_responses(
-                    playwright, url, mode=mode,
-                    priority_fields=priority_fields,
-                    login_callback=login_callback or _login_interactive,
-                    captcha_callback=captcha_callback,
-                    intent=intent,
-                    is_aggregator=is_aggregator,
-                    landing_hint=landing_hint,
-                    live_session_id=live_session_id,
-                )
+            results, detail_urls = _run_capture()
         return _finish_scrape(url, domain, data_dump_dir, results, detail_urls,
-                              prompt_callback, priority_fields, intent)
+                              prompt_callback, priority_fields, intent,
+                              redrive_fn=_run_capture)
     finally:
         if debug.enabled:
             debug_dump_dir = os.path.join(parent_dir, "Debug-dump")
@@ -742,36 +850,99 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
 
 def _finish_scrape(url: str, domain: str, data_dump_dir: str, results: list,
                    detail_urls: list, prompt_callback, priority_fields: list,
-                   intent: dict | None) -> list:
-    """Steps 2-5 of scrape_directory: save raw, optional detail crawl, parse,
-    warn on empty. Split out so scrape_directory can wrap the whole pipeline
-    in one try/finally that saves the debug trace even on errors."""
+                   intent: dict | None, redrive_fn=None) -> list:
+    """Steps 2-5 of scrape_directory: save raw, parse, reconcile counts,
+    optional detail crawl, warn on empty. Split out so scrape_directory can
+    wrap the whole pipeline in one try/finally that saves the debug trace
+    even on errors.
+
+    Phase 2 reordering: the parse now runs BEFORE the detail-crawl decision
+    — both the count gate (extracted vs stated total) and the completeness
+    gate (name-only records) need per-record evidence that only exists
+    after a parse. When a crawl then runs, the parse re-runs with the
+    detail members merged in (cheap: selectors are cached by then).
+    `redrive_fn() -> (results, detail_urls)` re-runs the browser capture;
+    it is invoked at most ONCE, when the count gate flags a shortfall."""
     # --- Step 2: Save raw responses ---
     raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
     print(f"Saving {len(results)} raw responses to {raw_output_path}")
     with open(raw_output_path, "w") as f:
         json.dump(results, f, indent=4)
 
-    # --- Step 3: (Optional) Crawl nested detail pages ---
+    # --- Step 3: Parse, clean, and save structured data ---
+    with debug.span("PARSE", "parse + clean + save structured data"):
+        members, verdict = parse_and_save_results(results, data_dump_dir, domain,
+                                                  intent=intent,
+                                                  source_url=url)
+
+    # --- Step 3.5: Count gate re-drive (Phase 2, R3) — at most once ---
+    if verdict and redrive_fn is not None:
+        print(f"  Count gate: {verdict['extracted']} extracted vs stated "
+              f"{verdict['expected']} — re-driving pagination/XHR replay once")
+        debug.decision("CLEAN", "count gate: partial extraction — re-driving",
+                       f"{verdict['extracted']} < "
+                       f"{COUNT_GATE_RATIO:.0%} of {verdict['expected']}",
+                       data=dict(verdict))
+        more_results, more_detail_urls = [], []
+        try:
+            with debug.span("BROWSER", "count-gate re-drive capture"):
+                more_results, more_detail_urls = redrive_fn()
+        except Exception as e:
+            print(f"  Re-drive failed (keeping first-pass results): {e}")
+            debug.log("BROWSER", f"re-drive failed: {e}", level="error")
+        if more_results:
+            results = results + more_results
+            detail_urls = list(dict.fromkeys([*detail_urls, *more_detail_urls]))
+            with open(raw_output_path, "w") as f:
+                json.dump(results, f, indent=4)
+            with debug.span("PARSE", "re-parse after re-drive"):
+                members, verdict = parse_and_save_results(
+                    results, data_dump_dir, domain,
+                    intent=intent, source_url=url)
+
+    # --- Step 4: (Optional) Crawl nested detail pages ---
     # Quick-check what fields are available in captured JSON (without full parse)
     found_fields = _check_fields_from_raw(results)
     # Exclude phase2-only fields from detail crawl decisions — detail pages can't provide them
     crawl_relevant = set(priority_fields) - PHASE2_ONLY_FIELDS if priority_fields else set()
     missing_for_crawl = crawl_relevant - found_fields if crawl_relevant else set()
 
+    # Completeness gate (Phase 2, R4): the raw-JSON field check above sees
+    # field PRESENCE anywhere in captured responses, not per-record coverage
+    # — a link-index roster (names only, contacts on profile pages) sails
+    # past it. Per-record evidence from the parse closes that hole.
+    name_only = _name_only_ratio(members, domain) if PHASE2_RECONCILIATION else 0.0
+    completeness_trigger = bool(
+        detail_urls and members and name_only >= NAME_ONLY_CRAWL_RATIO)
+
     detail_members = []
     if detail_urls:
         should_crawl = False
 
-        if priority_fields and not crawl_relevant:
+        if completeness_trigger and intent is not None:
+            # Agent mode: nobody is at a prompt — auto-trigger the crawl.
+            # Playground/CLI fall through to their usual y/n below.
+            print(f"  Completeness gate: {name_only:.0%} of records are "
+                  f"name-only with {len(detail_urls)} detail pages — auto-crawling")
+            debug.decision("DETAIL", "completeness gate: auto detail crawl",
+                           f"{name_only:.0%} of records name-only",
+                           data={"detail_urls": len(detail_urls)})
+            should_crawl = True
+        elif priority_fields and not crawl_relevant and not completeness_trigger:
             # All selected priorities are phase2-only (e.g. social_media) — detail pages can't help
             print(f"  Priority fields ({', '.join(priority_fields)}) require Phase 2 enrichment, skipping detail crawl")
-        elif crawl_relevant and not missing_for_crawl:
+        elif crawl_relevant and not missing_for_crawl and not completeness_trigger:
             # All crawl-relevant priority fields already captured — skip detail crawl
             print(f"  All priority fields already found ({', '.join(found_fields)}), skipping detail crawl")
         elif prompt_callback:
             # Build smart prompt with found/missing info
-            if crawl_relevant and missing_for_crawl:
+            if completeness_trigger:
+                msg = (
+                    f"{name_only:.0%} of extracted records are name-only — "
+                    f"contact info likely lives on the {len(detail_urls)} "
+                    f"member profile pages. Crawl them? (y/n)"
+                )
+            elif crawl_relevant and missing_for_crawl:
                 msg = (
                     f"Found: {', '.join(sorted(found_fields))}. "
                     f"Missing: {', '.join(sorted(missing_for_crawl))}. "
@@ -792,12 +963,14 @@ def _finish_scrape(url: str, domain: str, data_dump_dir: str, results: list,
                     json.dump(detail_members, f, indent=4)
                 print(f"Saved {len(detail_members)} detail members to {detail_path}")
 
-    # --- Step 4: Parse, clean, and save structured data ---
-    with debug.span("PARSE", "parse + clean + save structured data"):
-        members = parse_and_save_results(results, data_dump_dir, domain,
-                                         detail_members=detail_members,
-                                         intent=intent,
-                                         source_url=url)
+    # --- Step 4.5: Re-parse with detail members merged in (only when a
+    # crawl ran; otherwise the Step 3 parse IS the final state) ---
+    if detail_members:
+        with debug.span("PARSE", "final parse (detail merge)"):
+            members, _ = parse_and_save_results(results, data_dump_dir, domain,
+                                                detail_members=detail_members,
+                                                intent=intent,
+                                                source_url=url)
     debug.log("CLEAN", f"Final member count: {len(members)}")
 
     # --- Step 5: If zero results, warn (login gate already handled in browser) ---

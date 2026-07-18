@@ -404,6 +404,31 @@ CONTACT_SIGNALS = [
     "address", "fax", "website", "www.", "http",
 ]
 
+# UNIVERSALITY_PLAN Phase 2: expected-vs-extracted reconciliation, the
+# name-only completeness gate, layout-fingerprinted selector cache, and
+# diverse sample selection + union-schema re-ask. Default ON; set
+# TRAWL_PHASE2_RECONCILIATION=0 to fall back without a code revert.
+PHASE2_RECONCILIATION = os.environ.get(
+    "TRAWL_PHASE2_RECONCILIATION", "1").strip() != "0"
+
+# Count gate (R3): the scrape is flagged partial when the final cleaned
+# count falls below RATIO x the site's stated total. A stated total more
+# than CLAMP_FACTOR x every piece of extraction evidence is treated as
+# marketing copy ("one of 5,000 members nationwide") and degrades to
+# unknown instead of flagging partial and re-driving for nothing.
+COUNT_GATE_RATIO = 0.8
+COUNT_GATE_CLAMP_FACTOR = 10
+
+# Completeness gate (R4): when at least this share of parsed records carry
+# a name but no contact data (phone/email/address) AND detail links exist,
+# the detail crawler is auto-triggered in Agent mode (Playground keeps its
+# y/n prompt).
+NAME_ONLY_CRAWL_RATIO = 0.7
+
+# Selector cache (R5): how many layout schemas to keep per domain
+# (1 primary + MAX_CACHED_LAYOUTS-1 alternates).
+MAX_CACHED_LAYOUTS = 4
+
 # --- EXTRACTION VALIDATION ---
 SCALAR_KEYS = ["company_name", "description", "category", "website", "phone"]
 EXTRACTION_NULL_THRESHOLD = 0.70  # if more than 70% of fields are null, extraction failed

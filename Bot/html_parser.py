@@ -22,10 +22,13 @@ from config import (
     CARD_CANDIDATE_TAGS, LAYOUT_CLASS_EXACT, LAYOUT_CLASS_FRAGMENTS,
     CARD_CLASS_HINTS, CONTACT_SIGNALS,
     SCALAR_KEYS, EXTRACTION_NULL_THRESHOLD, MIN_CARDS_FOR_LEARNING,
-    RELEARN_MIN_CARDS, REPETITION_COUNTING,
+    RELEARN_MIN_CARDS, REPETITION_COUNTING, PHASE2_RECONCILIATION,
     EXTERNAL_SKIP_DOMAINS, MIN_REGEX_RESULTS, FAX_CONTEXT_WINDOW,
 )
-from cache import get_cached_selectors, set_cached_selectors, delete_cached_selectors
+from cache import (
+    get_cached_selectors, set_cached_selectors, delete_cached_selectors,
+    get_cached_layouts, remove_cached_layout,
+)
 from debug import debug
 from llm import ask
 
@@ -630,12 +633,60 @@ def _selector_for_container(el) -> str | None:
     return " > ".join(reversed(parts)) if parts else None
 
 
+def _sample_signature(el) -> frozenset:
+    """Regex-visible field signature of a card: which extractable signals
+    it carries. Class-free, so premium/basic variants of one layout that
+    differ in available data read as different signatures."""
+    sig = set()
+    text = el.get_text(" ", strip=True)
+    if _EMAIL_RE.search(text) or el.find(
+            "a", href=lambda h: bool(h and h.startswith("mailto:"))):
+        sig.add("email")
+    if _PHONE_RE.search(text):
+        sig.add("phone")
+    if el.find("a", href=lambda h: bool(
+            h and not h.startswith(("mailto:", "tel:", "#", "javascript:")))):
+        sig.add("link")
+    if el.find("img"):
+        sig.add("img")
+    return frozenset(sig)
+
+
+def _pick_diverse_samples(group: list, limit: int = 5) -> list:
+    """Pick sample cards by field-signature coverage instead of first-N
+    (UNIVERSALITY_PLAN Phase 2, R6): the first card, the field-richest
+    card, and up to 3 cards whose signature adds a signal not yet
+    represented. A field sparse on the leading cards (email on 30% of
+    members) still reaches the LLM this way; first-4 sampling never
+    learned it a selector, and the lossy schema was then cached forever."""
+    if not PHASE2_RECONCILIATION or len(group) <= 1:
+        return group[:4]
+    sigs = [_sample_signature(el) for el in group]
+    chosen = [0]
+    covered = set(sigs[0])
+    richest = max(range(len(group)), key=lambda i: len(sigs[i]))
+    if richest != 0:
+        chosen.append(richest)
+        covered |= sigs[richest]
+    novel = 0
+    for i in range(1, len(group)):
+        if len(chosen) >= limit or novel >= 3:
+            break
+        if i in chosen:
+            continue
+        if sigs[i] - covered:
+            chosen.append(i)
+            covered |= sigs[i]
+            novel += 1
+    return [group[i] for i in sorted(chosen)]
+
+
 def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
     """Extract a small sample of member cards for selector learning.
 
     Uses scoring to pick the best candidate group instead of first-match.
     Strips junk containers first to reduce noise.
-    Sends 4 sample cards to Haiku (minimal tokens).
+    Sends <=5 signature-diverse sample cards to the LLM (minimal tokens).
 
     Returns: (sample_html, card_selector_or_none)
     """
@@ -668,7 +719,7 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
             "selector": selector,
             "count": len(schema_cards),
             "score": score,
-            "sample": schema_cards[:4],
+            "sample": _pick_diverse_samples(schema_cards),
         })
         print(f"  Sample: found {len(schema_cards)} schema.org elements ({itemtype})")
 
@@ -735,7 +786,7 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
                 "selector": f"{t}.{cls}" if " " not in cls else f"{t}.{'.'.join(cls.split())}",
                 "count": len(structured),
                 "score": score,
-                "sample": structured[:4],
+                "sample": _pick_diverse_samples(structured),
             })
 
     # --- Strategy 2: parent-based sibling grouping (classless tables/lists) ---
@@ -777,7 +828,7 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
                 "selector": selector,
                 "count": len(structured),
                 "score": score,
-                "sample": structured[:4],
+                "sample": _pick_diverse_samples(structured),
             })
         if candidates:
             print(f"  Sample: classless sibling grouping found "
@@ -811,7 +862,7 @@ def extract_sample_html(raw_html: str) -> tuple[str, str | None]:
                 "selector": r_sel,
                 "count": r_count,
                 "score": score,
-                "sample": r_samples[:4],
+                "sample": _pick_diverse_samples(r_samples),
             })
             print(f"  Sample: structural repetition found {r_count} "
                   f"record(s) via '{r_sel}'")
@@ -1047,8 +1098,126 @@ HTML SAMPLE:
         print(f"  Detected entity_type='{entity_type}' for {domain} "
               f"({len(valid_fields)} fields, identity='{selectors['name_field']}')")
 
+    # Phase 2 (R6): audit the learned schema against ALL detected cards and
+    # patch regex-visible fields it missed — at most one extra LLM call.
+    if PHASE2_RECONCILIATION:
+        try:
+            selectors = _augment_sparse_fields(raw_html, selectors, domain)
+        except Exception as e:
+            debug.log("PARSE", f"sparse-field augmentation failed: {e}",
+                      level="warn")
+
     set_cached_selectors(domain, selectors)
     return selectors
+
+
+def _augment_sparse_fields(raw_html: str, selectors: dict, domain: str) -> dict:
+    """Union-schema re-ask (UNIVERSALITY_PLAN Phase 2, R6).
+
+    The LLM learns from <=5 sample cards, so a field that is sparse on the
+    sampled cards never gets a selector — and the lossy schema is then
+    cached forever. After learning, apply the selectors to ALL detected
+    cards; a regex-visible field (email/phone) present on >=20% of cards
+    but captured on fewer than half of those triggers ONE re-ask on a card
+    exhibiting the miss. Returns the (possibly unioned) schema; the caller
+    caches it. Bounded cost: <=1 extra LLM call per new domain."""
+    entity_type = selectors.get("entity_type") or "business"
+    if entity_type not in ("business", "person"):
+        return selectors  # dynamic schemas have free-form keys — skip
+    card_sel = selectors.get("card_selector")
+    if not card_sel:
+        return selectors
+    soup = BeautifulSoup(raw_html, "html.parser")
+    try:
+        cards = soup.select(card_sel)
+    except Exception:
+        return selectors
+    if len(cards) < MIN_CARDS_FOR_LEARNING:
+        return selectors
+    members = apply_selectors(raw_html, selectors)
+    if len(members) != len(cards):
+        return selectors  # records can't be lined up with cards 1:1
+
+    def card_has_email(el):
+        return bool(el.find("a", href=lambda h: bool(h and h.startswith("mailto:")))
+                    or _EMAIL_RE.search(el.get_text(" ", strip=True)))
+
+    def card_has_phone(el):
+        return bool(_PHONE_RE.search(el.get_text(" ", strip=True)))
+
+    def member_has_phone(m):
+        return bool(m.get("phone"))
+
+    if entity_type == "person":
+        email_key = "email"
+
+        def member_has_email(m):
+            return bool(m.get("email"))
+    else:
+        email_key = "contact_email"
+
+        def member_has_email(m):
+            return any(isinstance(c, dict) and c.get("email")
+                       for c in m.get("contacts") or [])
+
+    audits = [("phone", card_has_phone, member_has_phone)]
+    # Business email lives under contact_email; when the schema scopes
+    # contacts to contact_card sub-blocks, a re-asked card-relative selector
+    # would be applied relative to the wrong element — skip that combo.
+    if entity_type == "person" or not selectors.get("contact_card"):
+        audits.append((email_key, card_has_email, member_has_email))
+
+    missing: dict[str, list[int]] = {}
+    for key, card_has, member_has in audits:
+        present = [i for i, el in enumerate(cards) if card_has(el)]
+        if len(present) < max(MIN_CARDS_FOR_LEARNING, 0.2 * len(cards)):
+            continue  # too sparse to be a real field of this directory
+        captured = sum(1 for i in present if member_has(members[i]))
+        if captured * 2 >= len(present):
+            continue  # the learned selector is doing its job
+        missing[key] = [i for i in present if not member_has(members[i])]
+    if not missing:
+        return selectors
+
+    # ONE re-ask, on the card exhibiting the most misses.
+    miss_counts = Counter(i for idxs in missing.values() for i in idxs)
+    exemplar = cards[min(miss_counts, key=lambda i: (-miss_counts[i], i))]
+    keys = sorted(missing)
+    schema_lines = ", ".join(f'"{k}": "<relative CSS selector or null>"'
+                             for k in keys)
+    prompt = f"""CSS selectors learned for a directory card FAILED to capture: {", ".join(keys)}.
+Below is ONE card from the same page that visibly contains the missed data.
+Return ONLY JSON (no markdown): {{{schema_lines}}}
+Rules:
+- Selectors must be RELATIVE to the card element shown
+- Never use :contains() pseudo-selectors — BeautifulSoup does not support them
+- For an email field prefer the mailto: <a> element
+
+CARD HTML:
+{str(exemplar)}"""
+    patch = _parse_llm_json(ask(prompt, max_tokens=300))
+    if not patch:
+        debug.log("PARSE", "sparse-field re-ask returned non-JSON", level="warn")
+        return selectors
+    updated = dict(selectors)
+    fixed = []
+    for k in keys:
+        sel = patch.get(k)
+        if not sel or not isinstance(sel, str):
+            continue
+        try:
+            if exemplar.select_one(sel) is None:
+                continue  # doesn't even match the card it was asked about
+        except Exception:
+            continue
+        updated[k] = sel
+        fixed.append(k)
+    if not fixed:
+        return selectors
+    print(f"  Union schema: re-learned selector(s) for {', '.join(fixed)} "
+          f"({len(cards)} cards audited)")
+    debug.log("PARSE", f"sparse-field re-ask fixed: {fixed}")
+    return updated
 
 
 # --- HEADER-MAPPED TABLE LEARNING (zero AI) ---
@@ -1728,15 +1897,22 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
     """
     debug.log("PARSE", f"parse_member_html called for {domain}, HTML length: {len(raw_html)} chars")
 
-    # Step 1: use cached selectors if available (zero AI cost)
+    # Step 1: use cached selectors if available (zero AI cost). Phase 2
+    # (R5): a domain may carry several cached layouts (card grid + table
+    # view) — try each, primary first; a validating alternate is promoted.
     cached = get_cached_selectors(domain)
     stale_selectors = None
     if cached:
         print(f"  Using cached selectors for {domain}")
-        members = apply_selectors(raw_html, cached)
-        if _selectors_valid(cached, members):
-            debug.log("PARSE", f"Step 1 (cached selectors): extracted {len(members)} members")
-            return members
+        layouts = get_cached_layouts(domain) if PHASE2_RECONCILIATION else [cached]
+        for layout in layouts:
+            members = apply_selectors(raw_html, layout)
+            if _selectors_valid(layout, members):
+                if layout is not layouts[0]:
+                    print(f"  Alternate cached layout matched for {domain} — promoting")
+                    set_cached_selectors(domain, layout)
+                debug.log("PARSE", f"Step 1 (cached selectors): extracted {len(members)} members")
+                return members
         # Before blaming the cache, look at the page. A near-empty page (an
         # alphabet letter with 0-2 staff, a no-results skeleton) yields
         # nothing under perfectly GOOD selectors; deleting the cache and
@@ -1752,8 +1928,14 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
             return []
         print(f"  Cached selectors invalid for {domain}, re-learning...")
         debug.log("PARSE", "Cached selectors failed validation, re-learning", level="warn")
-        delete_cached_selectors(domain)
-        stale_selectors = cached
+        if PHASE2_RECONCILIATION:
+            # Keep the failing layouts (they validated on a real listing
+            # once); the new learn DEMOTES the primary instead of deleting
+            # it, and a failed learn is scrubbed by fingerprint below.
+            stale_selectors = None
+        else:
+            delete_cached_selectors(domain)
+            stale_selectors = cached
 
     # Step 1.5: schema.org JSON-LD — zero AI cost, no CSS dependence.
     # Only trusted when it covers at least as much as the visible card
@@ -1810,15 +1992,23 @@ def parse_member_html(raw_html: str, domain: str = "unknown") -> list:
 
     # Learning failed the yield check — but learn_selectors caches its schema
     # BEFORE that check runs, so scrub it: a schema that can't extract from
-    # the very page it was learned on must never shadow later pages. If we
-    # displaced a previously-good cache in Step 1, restore it — it validated
-    # on a real listing at least once; the new schema never has.
-    delete_cached_selectors(domain)
-    if stale_selectors is not None:
-        set_cached_selectors(domain, stale_selectors)
-        print(f"  Restored previous selectors for {domain} "
-              f"(re-learned schema failed validation)")
-        debug.log("PARSE", "Restored prior cached selectors after failed re-learn")
+    # the very page it was learned on must never shadow later pages.
+    if PHASE2_RECONCILIATION:
+        # Scrub only the just-learned layout by fingerprint;
+        # remove_cached_layout promotes the demoted previous primary back
+        # automatically, so the old save/restore dance isn't needed (R5).
+        if isinstance(selectors, dict) and selectors.get("card_selector"):
+            remove_cached_layout(domain, selectors)
+    else:
+        # Legacy single-slot dance: delete, then restore the schema we
+        # displaced in Step 1 — it validated on a real listing at least
+        # once; the new schema never has.
+        delete_cached_selectors(domain)
+        if stale_selectors is not None:
+            set_cached_selectors(domain, stale_selectors)
+            print(f"  Restored previous selectors for {domain} "
+                  f"(re-learned schema failed validation)")
+            debug.log("PARSE", "Restored prior cached selectors after failed re-learn")
 
     # Step 2.5: header-mapped table fallback. The LLM failed or its selectors
     # didn't validate — a deterministic column mapping (any entity type) is
