@@ -99,13 +99,15 @@ def detect_detail_links(collected_links: list) -> list:
         )
         # Slug-based last segment: /p/company-name-here → /p/{ID}
         # Only applies when no numeric/UUID replacement happened above,
-        # the last segment contains a hyphen (slug-like), and is 4+ chars.
+        # the last segment looks slug-like (contains a hyphen or an
+        # underscore — holisticdental.org uses /dentists/lastname_firstname/),
+        # and is 4+ chars.
         if t == base:
             parsed = urlparse(base)
             path = parsed.path.rstrip("/")
             if "/" in path:
                 parent, slug = path.rsplit("/", 1)
-                if slug and "-" in slug and len(slug) >= 4:
+                if slug and ("-" in slug or "_" in slug) and len(slug) >= 4:
                     t = base.replace(path, parent + "/{ID}")
         return t
 

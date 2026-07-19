@@ -137,7 +137,7 @@ def _has_contact_signal(el: Tag) -> bool:
 
 def _detail_templates(el: Tag) -> set[str]:
     """URL templates of links that plausibly lead to a record's own detail
-    page: numeric id, uuid, or slug-like (hyphenated) trailing path segment
+    page: numeric id, uuid, or slug-like (hyphen/underscore) trailing path segment
     — the same shapes detail_crawler.detect_detail_links templatizes on.
     Returned as templates (varying part replaced) so the run scorer can
     require ONE SHARED template across the run: every real listing links
@@ -158,7 +158,7 @@ def _detail_templates(el: Tag) -> set[str]:
         head, _, last = path.rstrip("/").rpartition("/")
         if re.search(r'\d{3,}', last):
             templates.add(head + "/" + re.sub(r'\d{3,}', "{ID}", last))
-        elif "-" in last and len(last) >= 4:
+        elif ("-" in last or "_" in last) and len(last) >= 4:
             templates.add(head + "/{SLUG}")
     return templates
 

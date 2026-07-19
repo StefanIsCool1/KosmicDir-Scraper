@@ -23,7 +23,7 @@ from browser import capture_responses, sanitize_results_for_dump
 from html_parser import parse_member_html, apply_selectors
 from cleaner import (
     clean_members, is_extraction_garbage, is_extraction_garbage_dynamic,
-    is_extraction_garbage_person,
+    is_extraction_garbage_person, _normalize_name_key,
 )
 from detail_crawler import crawl_detail_pages
 from cache import delete_cached_selectors, get_cached_selectors
@@ -231,6 +231,7 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
     partial=true + expected_count (Phase 2, R3).
     """
     all_members = []
+    html_members = []  # listing-page yield, reconciled against detail crawl below
     has_json_members = False
     zero_yield_htmls = []
 
@@ -285,16 +286,21 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
 
         # --- HTML response — parse with selector strategy ---
         elif isinstance(data, dict) and "raw_html" in data:
-            # Skip HTML parsing if we already got good data from JSON or detail crawl
-            if (has_json_members or detail_members) and len(all_members) >= 10:
-                print(f"Skipping HTML parse (already have {len(all_members)} members)")
+            # Skip HTML parsing once JSON has provided good data. Detail-crawl
+            # members deliberately do NOT suppress the parse: detect_detail_links
+            # can under-detect (e.g. only hyphenated slugs matched the URL
+            # template), so the listing yield is kept and reconciled against
+            # the detail set after the loop.
+            if has_json_members and len(all_members) + len(html_members) >= 10:
+                print(f"Skipping HTML parse (already have "
+                      f"{len(all_members) + len(html_members)} members)")
                 continue
             print(f"Parsing HTML response from {result['url']}...")
             try:
                 members = parse_member_html(data["raw_html"], domain=domain)
                 print(f"  Extracted {len(members)} members")
                 if members:
-                    all_members.extend(members)
+                    html_members.extend(members)
                 else:
                     zero_yield_htmls.append(data["raw_html"])
             except Exception as e:
@@ -318,7 +324,7 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
                 except Exception:
                     continue
                 recovered += len(extra)
-                all_members.extend(extra)
+                html_members.extend(extra)
             if recovered:
                 print(f"  Second pass: recovered {recovered} members from "
                       f"{len(zero_yield_htmls)} zero-yield page(s) using final selectors")
@@ -340,6 +346,48 @@ def parse_and_save_results(results: list, data_dump_dir: str, domain: str,
          for f in _sel.get("fields", []) if isinstance(f, dict) and f.get("key")}
         if is_dynamic else None
     )
+
+    # --- Reconcile listing-page members against the detail crawl ---
+    # Detail records are richer, so when the crawl plausibly covered the whole
+    # directory they replace the listing yield (old behavior). But when the
+    # listing clearly carries more records than the crawl returned — under-
+    # detected detail links, failed fetches — keep the listing members the
+    # crawl missed instead of silently discarding them (holisticdental.org:
+    # 43 detail vs 373 listing records; the old skip saved only the 43).
+    if html_members:
+        if detail_members and not has_json_members:
+            if len(html_members) <= len(detail_members) * 1.5:
+                print(f"Detail crawl covers the listing ({len(detail_members)} "
+                      f"detail vs {len(html_members)} listing records) — "
+                      f"keeping detail records")
+            else:
+                detail_keys = set()
+                for m in detail_members:
+                    key = _normalize_name_key(str(m.get(name_field) or ""))
+                    if key:
+                        detail_keys.add(key)
+
+                def _in_detail(m) -> bool:
+                    key = _normalize_name_key(str(m.get(name_field) or ""))
+                    if not key:
+                        return False
+                    if key in detail_keys:
+                        return True
+                    # Listing names often carry credential suffixes the detail
+                    # page omits ("Bandary, Cyrus - DMD" vs "Bandary, Cyrus"):
+                    # treat a prefix relation between long-enough keys as the
+                    # same member so those don't double up.
+                    return any(len(dk) >= 8 and
+                               (key.startswith(dk) or dk.startswith(key))
+                               for dk in detail_keys)
+
+                missed = [m for m in html_members if not _in_detail(m)]
+                all_members.extend(missed)
+                print(f"Detail crawl is partial ({len(detail_members)} detail vs "
+                      f"{len(html_members)} listing records) — kept "
+                      f"{len(missed)} listing members the crawl missed")
+        else:
+            all_members.extend(html_members)
 
     # Raw pre-dedup yield is extraction-side evidence for the count gate's
     # marketing-copy clamp (what the walked pages actually carried).
