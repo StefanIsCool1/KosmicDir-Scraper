@@ -751,7 +751,8 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                      login_callback=None,
                      captcha_callback=None,
                      landing_hint: str | None = None,
-                     live_session_id: str | None = None) -> list:
+                     live_session_id: str | None = None,
+                     crawl_all: bool = False) -> list:
     """Full pipeline: scrape a directory URL and return structured member data.
 
     Args:
@@ -793,6 +794,11 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                       View stream so the frontend can watch it and take control
                       during a CAPTCHA/login pause. None (Playground batch, CLI)
                       disables live view entirely — a pure no-op.
+        crawl_all: Crawl every detected detail page unconditionally, skipping
+                      the priority-field/shallow-data gates (the y/n prompt is
+                      never shown). /discover sets this when the user selected
+                      no priority fields — an empty selection means "give me
+                      everything", not "nothing is missing".
     """
     if priority_fields is None:
         priority_fields = []
@@ -812,7 +818,7 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
         debug.log("BROWSER", f"Scrape started: {url}", data={
             "mode": mode, "priority_fields": priority_fields,
             "intent": bool(intent), "is_aggregator": is_aggregator,
-            "landing_hint": landing_hint,
+            "landing_hint": landing_hint, "crawl_all": crawl_all,
         })
 
     # Run boundary for the profile cache + count evidence (expected totals
@@ -833,6 +839,7 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
                 is_aggregator=is_aggregator,
                 landing_hint=landing_hint,
                 live_session_id=live_session_id,
+                crawl_all=crawl_all,
             )
 
     try:
@@ -841,7 +848,7 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
             results, detail_urls = _run_capture()
         return _finish_scrape(url, domain, data_dump_dir, results, detail_urls,
                               prompt_callback, priority_fields, intent,
-                              redrive_fn=_run_capture)
+                              redrive_fn=_run_capture, crawl_all=crawl_all)
     finally:
         if debug.enabled:
             debug_dump_dir = os.path.join(parent_dir, "Debug-dump")
@@ -850,7 +857,8 @@ def scrape_directory(url: str, prompt_callback=None, mode: str = "auto",
 
 def _finish_scrape(url: str, domain: str, data_dump_dir: str, results: list,
                    detail_urls: list, prompt_callback, priority_fields: list,
-                   intent: dict | None, redrive_fn=None) -> list:
+                   intent: dict | None, redrive_fn=None,
+                   crawl_all: bool = False) -> list:
     """Steps 2-5 of scrape_directory: save raw, parse, reconcile counts,
     optional detail crawl, warn on empty. Split out so scrape_directory can
     wrap the whole pipeline in one try/finally that saves the debug trace
@@ -919,7 +927,16 @@ def _finish_scrape(url: str, domain: str, data_dump_dir: str, results: list,
     if detail_urls:
         should_crawl = False
 
-        if completeness_trigger and intent is not None:
+        if crawl_all:
+            # No priority fields selected = the user wants everything —
+            # crawl unconditionally, no field-gap gating, no prompt.
+            print(f"  Crawl-all: no priority fields selected — crawling "
+                  f"all {len(detail_urls)} detail pages")
+            debug.decision("DETAIL", "crawl-all: unconditional detail crawl",
+                           "no priority fields selected",
+                           data={"detail_urls": len(detail_urls)})
+            should_crawl = True
+        elif completeness_trigger and intent is not None:
             # Agent mode: nobody is at a prompt — auto-trigger the crawl.
             # Playground/CLI fall through to their usual y/n below.
             print(f"  Completeness gate: {name_only:.0%} of records are "

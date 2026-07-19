@@ -23,7 +23,7 @@ from config import (
     NEXT_BUTTON_SELECTORS, LOAD_MORE_SELECTORS,
     SCROLL_BATCH_SIZE, SCROLL_STALE_THRESHOLD,
     CATEGORY_SKIP_VISIBLE_THRESHOLD,
-    CHILD_HUB_MIN_LINKS,
+    CHILD_HUB_MIN_LINKS, PAGINATION_SLUG_RE,
     INTENT_LOW_RECORDS, INTENT_LOW_VISIBLE,
     INTENT_MAX_SUBPAGES, INTENT_SUBPAGE_DEPTH,
     XHR_MAX_REPLAYS, XHR_MAX_PAGINATION_PAGES,
@@ -919,6 +919,17 @@ def _max_param_value(current_url: str, hrefs: list, param: str) -> int:
     return best
 
 
+def _is_pagination_child(start_path: str, current_path: str) -> bool:
+    """True when current_path is start_path plus a page-numbered child
+    segment — URL-based pagination (e.g. /staff-directory →
+    /staff-directory/-npage-2). Detail children (/staff-directory/{id})
+    carry no page marker and don't match."""
+    if not start_path or not current_path.startswith(start_path + "/"):
+        return False
+    tail = current_path[len(start_path):].strip("/")
+    return bool(PAGINATION_SLUG_RE.search(tail))
+
+
 def handle_pagination(page, done_event, link_collector=None, html_collector=None,
                       keepalive=None):
     """Click through pagination to capture all pages.
@@ -972,6 +983,13 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
             current_path = urlparse(current_url).path.rstrip("/")
             # Exact same path → definitely still on the listing page
             if current_path == start_path:
+                return False
+            # Path-based pagers land on a page-numbered CHILD of the
+            # listing (/staff-directory → /staff-directory/-npage-2),
+            # which the parent-anchored depth check below would treat as
+            # navigating away. Allow it; detail children have no page
+            # marker in their slug and still fall through to go_back().
+            if _is_pagination_child(start_path, current_path):
                 return False
             # Allow paths that share the same parent directory as the start.
             # e.g. start=/member-directory/Find → parent=/member-directory
@@ -1566,7 +1584,8 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                       intent: dict | None = None,
                       is_aggregator: bool = False,
                       landing_hint: str | None = None,
-                      live_session_id: str | None = None) -> tuple[list, list]:
+                      live_session_id: str | None = None,
+                      crawl_all: bool = False) -> tuple[list, list]:
     """Main browser automation entry point.
 
     Launches browser, navigates to directory page, captures all responses.
@@ -2265,10 +2284,14 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                 for r in results
             )
 
-            # If priority fields are set, always pass detail URLs through
-            # and let main.py decide based on what fields are actually missing.
-            # Without priorities, use the original heuristic checks.
-            if priority_fields:
+            # Crawl-all and priority fields both pass detail URLs through
+            # and let main.py decide (crawl-all: unconditionally; priorities:
+            # based on what fields are actually missing). Without either,
+            # use the original heuristic checks.
+            if crawl_all:
+                detail_urls = detected
+                print(f"\n  Found {len(detail_urls)} member detail page links (crawl-all)")
+            elif priority_fields:
                 detail_urls = detected
                 print(f"\n  Found {len(detail_urls)} member detail page links (priority fields requested)")
             elif has_structured_json:

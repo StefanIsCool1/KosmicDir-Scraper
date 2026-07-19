@@ -149,7 +149,7 @@ No DiscoveryBot module imports from Bot modules that pull in Playwright — the 
 | `/scrape/respond` | POST | Interactive y/n response from frontend terminal. |
 | `/scrape/csv` | POST | Batch scrape from uploaded CSV. |
 | `/scraped-sites` | GET | List previously scraped domains. |
-| `/discover` | POST | Phase 0: parse goal → discover → classify → auto-scrape via Phase 1 + Phase 2. Streams SSE. |
+| `/discover` | POST | Phase 0: parse goal → discover → classify → auto-scrape via Phase 1 + Phase 2. Streams SSE. Empty/absent `priority_fields` ⇒ crawl-all: every detected detail page is crawled unconditionally (`crawl_all` threaded through `scrape_directory` → `capture_responses`/`_finish_scrape`); email+phone still stand in as the Phase 2 enrichment default. The Agent UI sends no `priority_fields`. |
 | `/phase2/enrich` | POST | Standalone Phase 2 enrichment on an existing structured JSON file. |
 | `/phase2/files` | GET | List structured JSON files with enrichment potential stats. |
 | `/download/<filename>` | GET | Download results as JSON (?format=json) or CSV (?format=csv); `.xlsx` filenames are served as binary Excel. |

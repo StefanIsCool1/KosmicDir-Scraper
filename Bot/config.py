@@ -4,6 +4,7 @@ All keywords, timeouts, selectors, and API settings live here.
 """
 
 import os
+import re
 from dotenv import load_dotenv
 
 # Load .env file from project root
@@ -24,6 +25,15 @@ PAGE_WAIT_AFTER_ACTION = 1500   # ms to wait after clicking/searching
 DETAIL_CRAWL_DELAY_MIN = 0.5   # min seconds between detail page requests
 DETAIL_CRAWL_DELAY_MAX = 1.5   # max seconds between detail page requests
 DETAIL_SAMPLE_COUNT = 3         # number of sample pages to learn selectors from
+
+# Page-numbered path slug of a path-based pager: "-npage-2", "page-3",
+# "pg2", "page/2", "page-2.html". Shared by browser.py's navigated-away
+# guard (such a child of the listing is pagination, allow it) and
+# detail_crawler's detail-link detection (such a link is never a member
+# detail page, exclude it). Anchored at the end (modulo an extension) so
+# entity slugs that merely contain digits don't match.
+PAGINATION_SLUG_RE = re.compile(
+    r"(?:page|pg|paging)[\W_]*\d+(?:\.[a-z]{2,5})?$", re.I)
 
 # URL keywords that indicate a detail link is directory-related
 # Used to score template groups — templates with these keywords rank higher

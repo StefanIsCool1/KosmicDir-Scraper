@@ -455,7 +455,9 @@ export function AgentProvider({ children }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           goal: text,
-          priority_fields: ['email', 'phone'],
+          // No priority_fields: the Agent page has no field picker, and an
+          // empty selection tells /discover to crawl every detail page
+          // (crawl-all) instead of gating on missing email/phone.
           accurate_enrichment: accurateEnrichment,
         }),
       })

@@ -40,7 +40,7 @@ from Phase2Bot.page_fetcher import fetch_page  # noqa: E402
 from config import (
     DETAIL_CRAWL_DELAY_MIN, DETAIL_CRAWL_DELAY_MAX,
     DETAIL_SAMPLE_COUNT, DETAIL_URL_KEYWORDS,
-    NETWORK_IDLE_TIMEOUT, EXTERNAL_SKIP_DOMAINS,
+    NETWORK_IDLE_TIMEOUT, EXTERNAL_SKIP_DOMAINS, PAGINATION_SLUG_RE,
     block_unnecessary_resources, launch_browser, new_stealth_page,
 )
 from llm import ask
@@ -77,7 +77,15 @@ def detect_detail_links(collected_links: list) -> list:
     def templatize(url: str) -> str:
         """Replace varying parts of URL with {ID} to find repeating patterns.
         Handles numeric IDs, UUIDs, and slug-based paths."""
-        t = url
+        # Strip page-marker view-state params (CivicPlus tags every member
+        # link with the listing page it was rendered on: ?npage=3). They
+        # would split one member group into a per-listing-page group each,
+        # small enough to lose the scoring. `base`, not `url`, is the
+        # did-templatizing-find-anything reference below — stripping alone
+        # is not an ID, so a bare pager href (/dir?page=2) never qualifies.
+        base = re.sub(r'(?<=[?&])(?:n?page|pagenum(?:ber)?|pg|paging)=\d+&?',
+                      '', url, flags=re.IGNORECASE).rstrip('?&')
+        t = base
         # Query param IDs: ?id=12345 → ?id={ID}
         t = re.sub(r'([?&]\w*id\w*=)\d+', r'\1{ID}', t, flags=re.IGNORECASE)
         # Generic numeric query params with 4+ digits: ?foo=12345 → ?foo={ID}
@@ -92,13 +100,13 @@ def detect_detail_links(collected_links: list) -> list:
         # Slug-based last segment: /p/company-name-here → /p/{ID}
         # Only applies when no numeric/UUID replacement happened above,
         # the last segment contains a hyphen (slug-like), and is 4+ chars.
-        if t == url:
-            parsed = urlparse(url)
+        if t == base:
+            parsed = urlparse(base)
             path = parsed.path.rstrip("/")
             if "/" in path:
                 parent, slug = path.rsplit("/", 1)
                 if slug and "-" in slug and len(slug) >= 4:
-                    t = url.replace(path, parent + "/{ID}")
+                    t = base.replace(path, parent + "/{ID}")
         return t
 
     # Group links by their URL template
@@ -115,9 +123,20 @@ def detect_detail_links(collected_links: list) -> list:
         if any(d in href_lower for d in EXTERNAL_SKIP_DOMAINS):
             continue
 
+        # Skip pager/filter/sort chrome — never member detail pages, but
+        # hyphenated slugs like /-npage-2 or /-alpha-A templatize exactly
+        # like member slugs and (repeating on every captured page) can
+        # outscore the real detail group. Leading-hyphen segments are
+        # CivicPlus module params (/-alpha-A, /-sortd-asc); the regex
+        # catches generic page-numbered slugs (/page-2, /pg3).
+        last_seg = urlparse(href).path.rstrip("/").rsplit("/", 1)[-1]
+        if last_seg.startswith("-") or PAGINATION_SLUG_RE.search(last_seg):
+            continue
+
         template = templatize(href)
-        # Only consider links where templatizing changed something (has an ID)
-        if template != href:
+        # Only consider links where templatizing actually found an ID —
+        # page-param stripping alone changing the URL doesn't count.
+        if "{ID}" in template:
             template_groups.setdefault(template, []).append(href)
 
     if not template_groups:
@@ -128,10 +147,14 @@ def detect_detail_links(collected_links: list) -> list:
     best_score = 0
 
     for template, urls in template_groups.items():
-        if len(urls) < 3:
+        # Dedup BEFORE scoring: chrome links (pagers, filters) repeat on
+        # every captured page while a real detail link appears on exactly
+        # one, so raw counts reward exactly the wrong group.
+        unique_count = len(dict.fromkeys(urls))
+        if unique_count < 3:
             continue
 
-        score = len(urls)  # base: more links = better
+        score = unique_count  # base: more distinct links = better
 
         # Bonus if URL contains directory-related keywords
         template_lower = template.lower()

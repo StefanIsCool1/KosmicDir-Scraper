@@ -678,7 +678,13 @@ def discover():
       - Final: complete
     """
     goal = (request.json.get("goal") or "").strip()
-    priority_fields = request.json.get("priority_fields") or ["email", "phone"]
+    # No priority fields selected = "give me everything": every detected
+    # detail page gets crawled unconditionally (crawl_all). The email/phone
+    # default still stands in for the Phase 2 enrichment decisions below —
+    # it no longer gates the detail crawl.
+    requested_fields = request.json.get("priority_fields")
+    crawl_all = not requested_fields
+    priority_fields = requested_fields or ["email", "phone"]
     accurate_enrichment = bool(request.json.get("accurate_enrichment", False))
     if not goal:
         return jsonify({"error": "No goal provided"}), 400
@@ -1116,6 +1122,7 @@ def discover():
                         login_callback=_agent_login,
                         captcha_callback=_agent_captcha,
                         live_session_id=session_id,
+                        crawl_all=crawl_all,
                     )
 
                     from urllib.parse import urlparse as _urlparse
