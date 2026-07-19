@@ -535,6 +535,131 @@ flag, no re-drive).
   passes affordable; don't break the module-level `_RECORD_CACHE` when
   touching that file.
 
+### Phase 3 — landed 2026-07-18
+
+**What shipped** (flag: `config.py:PHASE3_XHR_PAGINATION`, default ON, kill
+via `TRAWL_PHASE3_XHR_PAGINATION=0`; constants `XHR_MAX_RECORDS=300`,
+`XHR_EXPECTED_STRETCH=1.2`):
+
+- **Pagination replay un-gated (universal).** `replay_directory_xhrs` no
+  longer early-returns on `intent is None`; the page/offset walk, POST-body
+  walk, and cursor chain run for every mode incl. Playground. Only
+  Strategies 2 & 3 (intent-term / letter mutation) stay `intent`-gated —
+  `term_values` is empty without intent, so they don't iterate. Call site
+  (`browser.py` Step 2.5) fires replay whenever `PHASE3_XHR_PAGINATION or
+  (intent and low_yield)`; the intent sub-page BFS keeps its `intent and
+  low_yield` gate. Flag-off collapses the whole thing to the Phase 2 shape
+  (intent+low-yield trigger, GET-only, fixed caps).
+- **Expected-aware caps (R7).** When `archetype.run_count_evidence()`
+  reports a stated total, `XHR_MAX_RECORDS`/`XHR_MAX_REPLAYS`/
+  `XHR_MAX_PAGINATION_PAGES` stretch to `total × 1.2` (with a ~10/page
+  request floor), so a 2,000-record aggregator isn't truncated at 300.
+  Natural stops (empty page, repeated-payload hash, no-new-members) still
+  end each walk early, so an inflated total only raises the ceiling.
+- **POST replay.** JSON capture now records the request `method`/
+  `post_data`/`req_content_type` (non-GET only, byte-for-byte GET shape
+  otherwise). POST candidates enumerate the BODY (`_find_enumerable_body_
+  params`, form + JSON via `_body_to_qs`), page fields are mutated in the
+  body (`_mutate_body`, preserving JSON string/number type), and replay
+  re-issues via `req.post(url, data=…, headers=…)` — so cookies/CSRF stay
+  live in-session (`page.context.request`, unchanged).
+- **Cursor / token pagination.** `_find_continuation` (depth-2, catches
+  `paging.next`, GraphQL `endCursor`, Google `nextPageToken`, Slack
+  `next_cursor`, …) drives `_walk_cursor`: a next-page URL is fetched
+  directly, an opaque token is set on the request's cursor param
+  (`_cursor_request_param` maps `nextPageToken`→`pageToken`, prefers an
+  existing cursor-shaped request param). Seen-cursor set breaks loops.
+- **Path-segment fast path.** `_pick_path_pager` + `_PATH_PAGER_RE` detect
+  same-listing `/page/N`, `/-npage-N`, `/pN`, `-page-N.html` links
+  (page-numbered child OR same-dir sibling; anchored so an unrelated
+  sidebar pager is ignored), and `_paginate_by_url` walks the template via
+  `goto()` (Strategy 0b, after the `?page=N` Strategy 0a). The
+  navigated-away guard already allows page-numbered children via
+  `_is_pagination_child` (landed with commit `5268ca4`), so click
+  pagination on those sites isn't aborted either — no `pager_kind` plumbing
+  needed.
+- **Virtualized lists.** `human_scroll(adaptive=True)` takes an optional
+  `results`; a growing member-record count counts as progress, so
+  react-window/react-virtualized lists (DOM count + `scrollHeight` plateau
+  while the XHR stream keeps arriving) don't stop early. Threaded into the
+  three adaptive scroll call sites.
+- **Credential exclusion (non-negotiable).** `_is_auth_request` (auth
+  words in the URL PATH — login/oauth/token/…; credential fragments in the
+  query or body — `password`/`access_token`/… but NOT bare CSRF `token`)
+  gates BOTH capture (`_admit_json_capture`, checked before the directory
+  gate so a member-shaped login response can't slip through) AND the raw
+  dump (`sanitize_results_for_dump`, applied at both `main._finish_scrape`
+  write sites). Pagination/cursor absorb uses a relaxed re-gate (`_absorb
+  strict=False`) that keeps the credential check but skips the
+  URL-substring veto — that veto false-positives on `pageToken`/
+  `continuationToken` and would silently drop every page of a real cursor
+  directory.
+- `tests/test_phase3_xhr.py` — 19 tests (fake `page.context.request` serving
+  a synthetic directory; no network/browser/LLM): Playground pagination,
+  flag-off revert, expected-aware cap >300 + default-cap ≤340, POST
+  (JSON+form), cursor URL + token chains, term-gating both ways, and the
+  credential suite (capture refusal, CSRF NOT refused, dump scrub, and the
+  end-to-end `_finish_scrape` proof a login POST never reaches the raw
+  file). `tests/test_pagination_guard.py` +7 path-pager cases.
+
+**Exit criteria:** POST-paginated fixture replays all pages on the
+Playground path ✓ (`test_post_body_pagination`, intent=None, body-field
+mutation). 2,000-record aggregator exceeds the old 300 cap ✓
+(`test_expected_aware_cap_exceeds_300` walks the full 2,000; default cap
+still holds at ≤340). `/page/N/` fixture walks the template without tripping
+the navigation guard ✓ (`_pick_path_pager` → `_walk_url_template` via
+`goto()`, `_is_pagination_child` allows the child). Credential exclusion ✓
+(login POST refused at capture + scrubbed from dump, with the `_finish_scrape`
+persistence proof). **Live smoke:** members.buildingncw.org CLI (Playground,
+`intent=None`) returned **213** members — unchanged from Phase 1/2 baseline
+(site total 213). This GrowthZone site renders HTML with no member-shaped
+directory XHR, so the now-universal replay found no candidate and no-op'd
+cheaply — confirming the un-gating adds nothing on sites without a paginable
+API.
+
+**Deviations from spec (and why):**
+
+1. The `_navigated_away` "widen the 1-segment allowance when pager_kind is
+   path-segment" ask was already satisfied by `_is_pagination_child`
+   (commit `5268ca4`): it allows ANY page-numbered child through the guard
+   generically, `.search()`-scanning the whole tail so even 2-deep page
+   markers pass. No `pager_kind` field is populated — the generic check is
+   strictly more general, so the plumbing would be dead weight.
+2. Cursor token→request-param mapping is heuristic (`_cursor_request_param`):
+   prefer an existing cursor-shaped param in the request, else strip a
+   leading `next`/`next_` and map the common cases. The clean case
+   (`paging.next` full URL) needs no mapping; the Google `nextPageToken`→
+   `pageToken` case is the one covered by the derive step.
+3. `_absorb strict=False` for pagination/cursor was NOT in the spec but is
+   load-bearing: the pre-existing `_is_directory_json` URL veto (substring
+   `token`/`session`/`auth`) kills legitimate `?pageToken=` cursor
+   endpoints. The relaxed gate keeps the credential exclusion (the security
+   requirement) while dropping only the URL-substring heuristic, which the
+   member-shape check replaces.
+4. `_AUTH_URL_TOKENS` matches the URL PATH only (not the query) and omits
+   `session`/`sessions`: conference-*session* directories are a real scrape
+   target, and public widget feeds carry `?token=` legitimately; a Rails
+   `POST /sessions` login is still caught by its `password` body. The body
+   regex is boundary-guarded so `secretary`/`footpath`/… don't false-match.
+5. Path-segment detection anchors siblings on a non-empty parent dir
+   (`bool(cur_dir)`): a root-level suffix pager (`/products-page-1` at the
+   site root) is left to click pagination rather than risk electing an
+   unrelated root-level `/events-page-N` family. The child case (the exit
+   criterion, and the CivicPlus real shape) works regardless of depth.
+
+**Notes for Phase 4/5:**
+
+- Phase 5's location enumeration should route JSON locators through the
+  now-un-gated replay (mutating zip/lat/lng via `XHR_*_PARAMS`) and reuse
+  `_walk_cursor` / `_walk_pages` — the POST + cursor plumbing is already
+  there. The radius-first shortcut is just one `_mutate`/`_fetch` on the
+  captured locator XHR.
+- `_admit_json_capture` is the single capture-append seam now (on_response,
+  pending-HTML, replay all route through it) — new capture sites should use
+  it, not raw `results.append`, to keep the credential exclusion intact.
+- The re-drive closure note from Phase 2 still stands: a targeted Phase 3
+  replay (instead of a full re-run) can slot into `_run_capture`.
+
 ## Out of scope (explicit)
 
 - **Login walls / CAPTCHA / anti-bot** — the cookie-persistence + Live View layer already

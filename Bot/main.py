@@ -19,7 +19,7 @@ import json
 from urllib.parse import urlparse
 
 from _pw import sync_playwright
-from browser import capture_responses
+from browser import capture_responses, sanitize_results_for_dump
 from html_parser import parse_member_html, apply_selectors
 from cleaner import (
     clean_members, is_extraction_garbage, is_extraction_garbage_dynamic,
@@ -872,10 +872,15 @@ def _finish_scrape(url: str, domain: str, data_dump_dir: str, results: list,
     `redrive_fn() -> (results, detail_urls)` re-runs the browser capture;
     it is invoked at most ONCE, when the count gate flags a shortfall."""
     # --- Step 2: Save raw responses ---
+    # Credential exclusion (Phase 3, non-negotiable): the interactive login
+    # flow runs while capture is live, so a login POST's member-shaped
+    # response must never be persisted. sanitize_results_for_dump drops any
+    # auth-shaped entry before it reaches Data-dump/ — belt-and-braces for
+    # the capture-time gate in browser._admit_json_capture.
     raw_output_path = os.path.join(data_dump_dir, f"{domain}.json")
     print(f"Saving {len(results)} raw responses to {raw_output_path}")
     with open(raw_output_path, "w") as f:
-        json.dump(results, f, indent=4)
+        json.dump(sanitize_results_for_dump(results), f, indent=4)
 
     # --- Step 3: Parse, clean, and save structured data ---
     with debug.span("PARSE", "parse + clean + save structured data"):
@@ -902,7 +907,7 @@ def _finish_scrape(url: str, domain: str, data_dump_dir: str, results: list,
             results = results + more_results
             detail_urls = list(dict.fromkeys([*detail_urls, *more_detail_urls]))
             with open(raw_output_path, "w") as f:
-                json.dump(results, f, indent=4)
+                json.dump(sanitize_results_for_dump(results), f, indent=4)
             with debug.span("PARSE", "re-parse after re-drive"):
                 members, verdict = parse_and_save_results(
                     results, data_dump_dir, domain,

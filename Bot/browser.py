@@ -12,7 +12,7 @@ import threading
 import json
 import os
 from collections import deque
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from config import (
     DEFAULT_IDLE_TIMEOUT, SEARCH_IDLE_TIMEOUT, PAGINATION_IDLE_TIMEOUT,
     NETWORK_IDLE_TIMEOUT, PAGE_WAIT_AFTER_ACTION,
@@ -27,6 +27,7 @@ from config import (
     INTENT_LOW_RECORDS, INTENT_LOW_VISIBLE,
     INTENT_MAX_SUBPAGES, INTENT_SUBPAGE_DEPTH,
     XHR_MAX_REPLAYS, XHR_MAX_PAGINATION_PAGES,
+    XHR_MAX_RECORDS, XHR_EXPECTED_STRETCH, PHASE3_XHR_PAGINATION,
     XHR_PAGE_PARAMS, XHR_TERM_PARAMS, XHR_LETTER_PARAMS,
     block_unnecessary_resources,
     unblock_resources,
@@ -34,6 +35,7 @@ from config import (
     new_stealth_page,
 )
 from _pw import IS_PATCHRIGHT
+import archetype
 from navigator import find_directory_url, trigger_search, count_visible_results, detect_category_links, try_view_all, STOP_THRESHOLD
 from intent_filter import filter_categories_by_intent
 from debug import debug
@@ -272,6 +274,116 @@ def _is_directory_json(data, url: str) -> bool:
     return is_directory_data
 
 
+# --- CREDENTIAL EXCLUSION (Phase 3, non-negotiable) ---
+# The interactive login flow runs while network capture is live, so the
+# login POST's response can look member-shaped (profile JSON with name/
+# email keys) and — now that request bodies are captured for POST replay —
+# would drag the user's credentials into results and Data-dump/. Auth-
+# shaped requests are therefore refused at capture time (_admit_json_
+# capture) AND scrubbed at dump time (sanitize_results_for_dump).
+
+# Whole-word tokens matched against the URL PATH only (via
+# _extract_word_tokens, so /api/authors never matches "auth" but
+# /api/auth/login does). Path-only on purpose: query strings legitimately
+# carry ?token= on public widget APIs (Membee feeds), and "sessions" is
+# deliberately absent — conference-session directories are a real scrape
+# target, while Rails-style POST /sessions logins are still caught by the
+# password in their body.
+_AUTH_URL_TOKENS = {
+    "login", "logon", "signin", "signon", "signup",
+    "auth", "oauth", "authenticate", "authentication",
+    "token", "tokens", "password", "passwords", "passwd",
+    "credential", "credentials", "sso", "saml",
+}
+
+# Credential-shaped fragments in a request body or query string.
+# Deliberately does NOT include bare "token": CSRF/verification tokens
+# (authenticity_token, csrf_token, __RequestVerificationToken) ride along
+# on virtually every legitimate POST search form, and excluding those
+# would kill POST replay on exactly the sites it exists for. Access/
+# refresh/id tokens — actual credentials — are matched explicitly. Short
+# generic fragments are letter/digit-boundary-guarded so real search
+# bodies ("secretary", "footpath") don't get excluded.
+_CREDENTIAL_BODY_RE = re.compile(
+    r"password|passwd|"
+    r"(?<![a-z0-9])pwd(?![a-z0-9])|"
+    r"secret(?!ar)|"
+    r"api_?key|private_?key|"
+    r"access_token|refresh_token|id_token|client_assertion|"
+    r"(?<![a-z0-9])bearer(?![a-z0-9])|"
+    r"(?<![a-z0-9])t?otp(?![a-z0-9])|"
+    r"(?<![a-z0-9])mfa(?![a-z0-9])",
+    re.I)
+
+
+def _is_auth_request(url: str, method: str = "GET",
+                     post_data: str | None = None) -> bool:
+    """True when a request is auth-shaped and must never be captured.
+
+    Three independent signals, any one suffices:
+    - URL path carries an auth word (login/signin/oauth/token/...).
+    - Query string carries a credential-shaped fragment (password=,
+      access_token= — magic-link and OAuth-redirect shapes).
+    - The request body contains a credential-shaped field. Matched on the
+      RAW body string, not parsed keys, so malformed/exotic encodings fail
+      closed (excluded) rather than open.
+    """
+    try:
+        parsed = urlparse(url)
+        if _extract_word_tokens(parsed.path) & _AUTH_URL_TOKENS:
+            return True
+        if parsed.query and _CREDENTIAL_BODY_RE.search(parsed.query):
+            return True
+        if post_data and _CREDENTIAL_BODY_RE.search(post_data):
+            return True
+    except Exception:
+        return True     # can't classify → refuse capture
+    return False
+
+
+def _admit_json_capture(results: list, url: str, data, method: str = "GET",
+                        post_data: str | None = None,
+                        req_content_type: str | None = None) -> bool:
+    """Single gate for adding a captured JSON payload to `results`.
+
+    Auth-shaped requests are refused outright (credential exclusion —
+    checked BEFORE the directory gate so a member-shaped login response
+    can't slip through). Everything else goes through _is_directory_json.
+    GET entries keep the historical two-key {"url", "data"} shape
+    byte-for-byte; non-GET entries additionally carry the request method,
+    body, and content-type so replay_directory_xhrs can re-issue them.
+    """
+    if _is_auth_request(url, method, post_data):
+        debug.log("CAPTURE", f"auth-shaped request excluded: {url[:120]}",
+                  level="warn")
+        return False
+    if not _is_directory_json(data, url):
+        return False
+    entry = {"url": url, "data": data}
+    m = (method or "GET").upper()
+    if m not in ("GET", "HEAD"):
+        entry["method"] = m
+        if post_data:
+            entry["post_data"] = post_data
+        if req_content_type:
+            entry["req_content_type"] = req_content_type
+    results.append(entry)
+    return True
+
+
+def sanitize_results_for_dump(results: list) -> list:
+    """Drop auth-shaped entries before results are persisted to Data-dump/.
+
+    Belt-and-braces for _admit_json_capture: even if an auth request ever
+    slips into `results` through another append site, it must not reach
+    disk. Pure filter — never mutates the entries themselves.
+    """
+    return [r for r in results
+            if not _is_auth_request(r.get("url", ""),
+                                    r.get("method", "GET"),
+                                    r.get("post_data"))]
+
+
 # Name-like keys that mark a JSON list as member records (same set the
 # trigger_search member-data check and main.py's is_member_list use).
 _MEMBER_NAME_KEYS = {
@@ -371,6 +483,153 @@ def _infer_page_size(query_params: dict) -> int:
     return 20
 
 
+# --- POST-body enumeration (Phase 3) ---
+# POST-paginated directories carry their page/offset field in the request
+# BODY, not the URL. These helpers give the same page/term/letter view of a
+# body that _find_enumerable_params gives of a query string, and rewrite one
+# field in place — handling both form-encoded and JSON bodies.
+
+def _body_to_qs(post_data: str | None, content_type: str | None) -> dict:
+    """Parse a request body into a parse_qs-shaped dict-of-lists.
+
+    Form bodies go through parse_qs; JSON objects become {key: [str(value)]}
+    for their scalar top-level fields (nested structures are ignored — the
+    page/offset field is always a top-level scalar). Returns {} on anything
+    it can't read, so callers degrade to 'no enumerable params'."""
+    if not post_data:
+        return {}
+    s = post_data.strip()
+    ct = (content_type or "").lower()
+    if "json" in ct or s[:1] in "{[":
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        if not isinstance(obj, dict):
+            return {}
+        return {k: [str(v)] for k, v in obj.items()
+                if isinstance(v, (str, int, float, bool))}
+    try:
+        return parse_qs(post_data, keep_blank_values=True)
+    except Exception:
+        return {}
+
+
+def _find_enumerable_body_params(post_data: str | None,
+                                 content_type: str | None) -> dict:
+    """page/term/letter classification of a POST body's fields (mirrors
+    _find_enumerable_params for query strings)."""
+    out: dict[str, list] = {"page": [], "term": [], "letter": []}
+    for name, values in _body_to_qs(post_data, content_type).items():
+        lname = name.lower()
+        val = (values[0] if values else "").strip()
+        if lname in XHR_LETTER_PARAMS or (
+                lname in XHR_TERM_PARAMS and len(val) == 1 and val.isalnum()):
+            out["letter"].append(name)
+        elif lname in XHR_PAGE_PARAMS:
+            out["page"].append(name)
+        elif lname in XHR_TERM_PARAMS:
+            out["term"].append(name)
+    return out
+
+
+def _mutate_body(post_data: str | None, content_type: str | None,
+                 name: str, value) -> str:
+    """Return `post_data` with field `name` set to `value`.
+
+    JSON bodies preserve the original field's string/number type (an API
+    that emitted "page":"1" is re-sent "page":"2", not 2). Form bodies set
+    the field as a string. Unreadable bodies are returned unchanged."""
+    s = (post_data or "").strip()
+    ct = (content_type or "").lower()
+    if "json" in ct or s[:1] in "{[":
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                if isinstance(obj.get(name), str):
+                    value = str(value)
+                obj[name] = value
+                return json.dumps(obj)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return post_data or ""
+    try:
+        d = parse_qs(post_data or "", keep_blank_values=True)
+        d[name] = [str(value)]
+        return urlencode(d, doseq=True)
+    except Exception:
+        return post_data or ""
+
+
+# --- Cursor / continuation-token pagination (Phase 3) ---
+# Modern SPA directories increasingly page by an opaque cursor the previous
+# response hands back, not by an incrementable number. Param mutation can't
+# walk those; following the continuation chain can.
+
+# Response keys (normalized: lowercased, '-' → '_') whose string value is a
+# continuation handle. Boolean has-next flags carry no handle and are
+# excluded by the str-value check in _find_continuation.
+_CURSOR_KEYS = {
+    "next", "nextpage", "next_page", "nextpagetoken", "next_page_token",
+    "nextpageurl", "next_page_url", "cursor", "nextcursor", "next_cursor",
+    "after", "endcursor", "continuation", "continuationtoken",
+}
+
+
+def _find_continuation(data, depth: int = 2) -> tuple[str, str] | None:
+    """Find a continuation handle in a directory JSON payload.
+
+    Returns (response_key, value) for the first cursor-shaped key whose
+    value is a non-empty string (a next-page URL or an opaque token), else
+    None. Bounded recursion catches nested envelopes (Facebook's
+    paging.next, GraphQL pageInfo.endCursor). A '0'/'false'/'null' string
+    value is treated as end-of-list."""
+    if depth < 0 or not isinstance(data, (dict, list)):
+        return None
+    if isinstance(data, dict):
+        for k, v in data.items():
+            norm = str(k).lower().replace("-", "_")
+            if norm in _CURSOR_KEYS and isinstance(v, str):
+                val = v.strip()
+                if val and val.lower() not in ("0", "false", "null", "none"):
+                    return (str(k), val)
+        for v in list(data.values())[:25]:
+            r = _find_continuation(v, depth - 1)
+            if r:
+                return r
+    elif isinstance(data, list):
+        for item in data[:5]:
+            r = _find_continuation(item, depth - 1)
+            if r:
+                return r
+    return None
+
+
+def _cursor_request_param(resp_key: str, url: str, post_data: str | None,
+                          content_type: str | None) -> str:
+    """Pick the REQUEST param name to carry an opaque cursor token.
+
+    Response and request names often differ (Google returns nextPageToken,
+    accepts pageToken). Prefer a cursor-shaped param already present in the
+    request; otherwise derive from the response key by stripping a leading
+    'next'/'next_' and mapping the common cases."""
+    present = set()
+    try:
+        present |= set(parse_qs(urlparse(url).query))
+    except Exception:
+        pass
+    present |= set(_body_to_qs(post_data, content_type))
+    for existing in present:
+        if existing.lower() in ("cursor", "pagetoken", "page_token",
+                                "after", "continuation", "continuationtoken"):
+            return existing
+    stripped = re.sub(r"^next_?", "", str(resp_key).lower().replace("-", "_"))
+    return {
+        "pagetoken": "pageToken", "page_token": "pageToken",
+        "cursor": "cursor", "endcursor": "cursor", "page": "cursor",
+    }.get(stripped, resp_key)
+
+
 def replay_directory_xhrs(page, results, intent) -> int:
     """Re-fetch captured directory-API endpoints with mutated params.
 
@@ -378,62 +637,113 @@ def replay_directory_xhrs(page, results, intent) -> int:
     params we can walk directly — cheaper and more complete than driving the
     UI. Replays go through page.context.request so the browser's cookies and
     anti-bot clearance ride along (curl_cffi carries neither and would 403 on
-    exactly these sites). New responses are gated through the SAME
-    _is_directory_json used by on_response and appended in the same shape, so
-    all downstream counting/dedup/detail logic works unchanged.
+    exactly these sites). New responses re-enter through the shared credential
+    gate (_admit_json_capture / _absorb) and are appended in the same shape,
+    so all downstream counting/dedup/detail logic works unchanged.
 
-    Agent mode only (intent gate lives at the call site AND here). Fail-open:
-    any error just returns the records added so far. Returns NEW record count.
+    Pagination is UNIVERSAL (Phase 3): incrementing a page/offset param,
+    walking a POST body's page field, and following a cursor chain all run
+    for every mode including Playground (`intent is None`) — you can page a
+    captured endpoint without knowing a search term. Term/letter mutation
+    (Strategies 2 & 3) stays intent-gated: those need the user's industry.
+    Fail-open: any error just returns the records added so far. Returns NEW
+    record count.
     """
-    if not intent:
-        return 0
     try:
         req = page.context.request
     except Exception:
         return 0
 
-    # Candidate endpoints: URLs already gated by _is_directory_json, GET-shaped
-    # with a mutable query string. Dedup, preserve capture order.
-    candidates: list[tuple[str, dict]] = []
-    seen: set[str] = set()
+    # Whether the mechanism-only strategies (page/offset/POST/cursor) may
+    # run without an intent. Under flag-off this is False, so the function
+    # collapses to its Phase 2 shape (intent-gated, GET-only, fixed caps).
+    universal = PHASE3_XHR_PAGINATION
+    if not intent and not universal:
+        return 0
+
+    # Candidate endpoints: entries already gated by _admit_json_capture.
+    # GET candidates expose enumerable query params; POST candidates expose
+    # them in the captured body; either may carry a continuation cursor.
+    # Dedup by (url, method), preserve capture order.
+    candidates: list[dict] = []
+    seen: set[tuple] = set()
     for r in results:
         url = r.get("url", "")
         data = r.get("data")
-        if not url or url in seen:
+        if not url:
             continue
         if not isinstance(data, (list, dict)):
             continue
         if isinstance(data, dict) and "raw_html" in data:
             continue
-        params = _find_enumerable_params(url)
-        if params["page"] or params["term"] or params["letter"]:
-            seen.add(url)
-            candidates.append((url, params))
+        method = (r.get("method") or "GET").upper()
+        post_data = r.get("post_data")
+        req_ct = r.get("req_content_type")
+        key = (url, method)
+        if key in seen:
+            continue
+        url_params = _find_enumerable_params(url)
+        body_params = (_find_enumerable_body_params(post_data, req_ct)
+                       if method == "POST" else {"page": [], "term": [], "letter": []})
+        cursor = _find_continuation(data)
+        if (url_params["page"] or url_params["term"] or url_params["letter"]
+                or body_params["page"] or body_params["term"]
+                or body_params["letter"] or cursor):
+            seen.add(key)
+            candidates.append({
+                "url": url, "method": method, "post_data": post_data,
+                "req_ct": req_ct, "url_params": url_params,
+                "body_params": body_params, "cursor": cursor,
+            })
 
     if not candidates:
         return 0
 
-    # Intent term queries (canonical + up to 3 aliases), deduped.
-    canonical = (intent.get("industry_canonical") or "").strip()
-    aliases = [(a or "").strip()
-               for a in (intent.get("industry_aliases") or []) if (a or "").strip()]
+    # Intent term queries (canonical + up to 3 aliases), deduped. Empty when
+    # intent is None — Strategies 2 & 3 then simply don't iterate.
     term_values: list[str] = []
-    seen_terms: set[str] = set()
-    for t in [canonical] + aliases[:3]:
-        if t and t.lower() not in seen_terms:
-            term_values.append(t)
-            seen_terms.add(t.lower())
+    if intent:
+        canonical = (intent.get("industry_canonical") or "").strip()
+        aliases = [(a or "").strip()
+                   for a in (intent.get("industry_aliases") or []) if (a or "").strip()]
+        seen_terms: set[str] = set()
+        for t in [canonical] + aliases[:3]:
+            if t and t.lower() not in seen_terms:
+                term_values.append(t)
+                seen_terms.add(t.lower())
+
+    # Expected-aware caps (R7): a stated site total stretches the fixed
+    # record/replay/page ceilings so a 2,000-record aggregator isn't
+    # truncated at 300. Natural stops (empty page, repeated payload) still
+    # end each walk early, so an inflated total only raises the ceiling.
+    expected_total, _obs = archetype.run_count_evidence()
+    if universal and isinstance(expected_total, int) and expected_total > 0:
+        target = int(expected_total * XHR_EXPECTED_STRETCH)
+        max_records = max(XHR_MAX_RECORDS, target)
+        # Enough requests/pages to actually reach `target` (assume a small
+        # page of ~10 as the conservative floor).
+        max_replays = max(XHR_MAX_REPLAYS, target // 10 + 10)
+        max_pages_cap = max(XHR_MAX_PAGINATION_PAGES, target // 10 + 5)
+    else:
+        max_records = XHR_MAX_RECORDS
+        max_replays = XHR_MAX_REPLAYS
+        max_pages_cap = XHR_MAX_PAGINATION_PAGES
 
     start_records = _count_json_member_records(results)
     counters = {"replays": 0, "consec_fail": 0}
 
-    def _fetch(u: str):
-        """GET u through the browser context; return parsed JSON or None."""
-        if counters["replays"] >= XHR_MAX_REPLAYS or counters["consec_fail"] >= 3:
+    def _fetch(method: str, u: str, body: str | None, ct: str | None):
+        """Issue u through the browser context; return parsed JSON or None.
+        GET and POST share the counters, caps, and pacing."""
+        if counters["replays"] >= max_replays or counters["consec_fail"] >= 3:
             return None
         counters["replays"] += 1
         try:
-            resp = req.get(u, timeout=15000)
+            if method == "POST":
+                headers = {"content-type": ct} if ct else None
+                resp = req.post(u, data=(body or ""), headers=headers, timeout=15000)
+            else:
+                resp = req.get(u, timeout=15000)
             if not resp.ok:
                 counters["consec_fail"] += 1
                 return None
@@ -446,74 +756,167 @@ def replay_directory_xhrs(page, results, intent) -> int:
         finally:
             time.sleep(random.uniform(0.1, 0.25))
 
-    def _absorb(u: str, data) -> bool:
-        """Gate + append exactly like on_response. True if member data."""
-        if data is not None and _is_directory_json(data, u):
-            results.append({"url": u, "data": data})
-            return True
-        return False
+    def _absorb(u: str, data, method: str = "GET", body: str | None = None,
+                ct: str | None = None, strict: bool = True) -> bool:
+        """Gate + append a replayed response.
+
+        strict=True (term/letter mutation, which explores new query values):
+        the full capture gate, including the URL-substring veto.
+        strict=False (pagination/cursor of an ALREADY-admitted directory
+        endpoint): keep the credential exclusion but skip that URL veto —
+        it false-positives on cursor params (pageToken/continuationToken
+        both contain 'token'), which would silently drop every page of a
+        Google/GraphQL-style cursor directory. Member-shape is still
+        required so a stray non-member payload isn't absorbed."""
+        if data is None:
+            return False
+        if strict:
+            return _admit_json_capture(results, u, data, method=method,
+                                       post_data=body, req_content_type=ct)
+        if _is_auth_request(u, method, body):
+            return False
+        if _count_json_member_records([{"url": u, "data": data}]) == 0:
+            return False
+        entry = {"url": u, "data": data}
+        m = (method or "GET").upper()
+        if m not in ("GET", "HEAD"):
+            entry["method"] = m
+            if body:
+                entry["post_data"] = body
+            if ct:
+                entry["req_content_type"] = ct
+        results.append(entry)
+        return True
 
     def _stop() -> bool:
-        return (counters["replays"] >= XHR_MAX_REPLAYS
+        return (counters["replays"] >= max_replays
                 or counters["consec_fail"] >= 3
-                or _count_json_member_records(results) >= 300)
+                or _count_json_member_records(results) >= max_records)
 
-    for base_url, params in candidates:
-        if _stop():
-            break
-
-        # --- Strategy 1: pagination (increment page/offset until dry) ---
-        for pname in params["page"]:
+    def _walk_pages(c: dict) -> None:
+        """Strategy 1: increment each page/offset param until the list runs
+        dry. Works on the URL query (GET) or the request body (POST)."""
+        method, base_url = c["method"], c["url"]
+        post_data, ct = c["post_data"], c["req_ct"]
+        if method == "POST":
+            page_params = c["body_params"]["page"]
+            src = _body_to_qs(post_data, ct)
+        else:
+            page_params = c["url_params"]["page"]
+            src = parse_qs(urlparse(base_url).query, keep_blank_values=True)
+        for pname in page_params:
             if _stop():
                 break
-            qp = parse_qs(urlparse(base_url).query, keep_blank_values=True)
             try:
-                cur = int((qp.get(pname, ["0"])[0] or "0").strip())
-            except ValueError:
+                cur = int((src.get(pname, ["0"])[0] or "0").strip())
+            except (ValueError, AttributeError):
                 continue
             is_offset = pname.lower() in {"offset", "start", "skip"}
-            step = _infer_page_size(qp) if is_offset else 1
+            step = _infer_page_size(src) if is_offset else 1
             prev_hash = None
             nxt = cur
-            for _ in range(XHR_MAX_PAGINATION_PAGES):
+            for _ in range(max_pages_cap):
                 if _stop():
                     break
                 nxt += step
-                u = _replace_query_param(base_url, pname, nxt)
+                if method == "POST":
+                    u, body = base_url, _mutate_body(post_data, ct, pname, nxt)
+                else:
+                    u, body = _replace_query_param(base_url, pname, nxt), None
                 before = _count_json_member_records(results)
-                data = _fetch(u)
+                data = _fetch(method, u, body, ct)
                 if data is None:
                     break
                 h = hash(json.dumps(data, sort_keys=True, default=str))
                 if h == prev_hash:
                     break              # same payload — endpoint clamps, stop
                 prev_hash = h
-                _absorb(u, data)
+                _absorb(u, data, method, body, ct, strict=False)
                 if _count_json_member_records(results) == before:
                     break              # no new members — end of the list
 
-        # --- Strategy 2: intent terms (does the intent live in this API?) ---
-        for pname in params["term"]:
+    def _walk_cursor(c: dict) -> None:
+        """Strategy 1b: follow a continuation chain. A next-page URL is
+        fetched directly; an opaque token is set on the request's cursor
+        param (query for GET, body for POST)."""
+        method, base_url = c["method"], c["url"]
+        post_data, ct = c["post_data"], c["req_ct"]
+        resp_key, value = c["cursor"]
+        param = _cursor_request_param(resp_key, base_url, post_data, ct)
+        seen_cursors: set[str] = set()
+        for _ in range(max_pages_cap):
+            if _stop() or not value or value in seen_cursors:
+                break
+            seen_cursors.add(value)
+            if value.startswith(("http://", "https://", "/")):
+                u = urljoin(base_url, value)
+                body = post_data if method == "POST" else None
+                absorb_url, absorb_method, absorb_body = u, method, body
+            elif method == "POST":
+                u = base_url
+                body = _mutate_body(post_data, ct, param, value)
+                absorb_url, absorb_method, absorb_body = base_url, "POST", body
+            else:
+                u = _replace_query_param(base_url, param, value)
+                body = None
+                absorb_url, absorb_method, absorb_body = u, "GET", None
+            before = _count_json_member_records(results)
+            data = _fetch(method, u, body, ct)
+            if data is None:
+                break
+            _absorb(absorb_url, data, absorb_method, absorb_body, ct, strict=False)
+            if _count_json_member_records(results) == before:
+                break
+            nxt = _find_continuation(data)
+            value = nxt[1] if nxt else None
+
+    for c in candidates:
+        if _stop():
+            break
+
+        # --- Strategy 1: numeric pagination (GET query or POST body) ---
+        _walk_pages(c)
+
+        # --- Strategy 1b: cursor / continuation-token chain ---
+        if c["cursor"] and not _stop():
+            _walk_cursor(c)
+
+        # --- Strategies 2 & 3 (intent-gated): term + letter mutation ---
+        if not intent:
+            continue
+        method, base_url = c["method"], c["url"]
+        post_data, ct = c["post_data"], c["req_ct"]
+
+        def _mutate(name: str, val: str):
+            if method == "POST":
+                return base_url, _mutate_body(post_data, ct, name, val)
+            return _replace_query_param(base_url, name, val), None
+
+        term_params = (c["body_params"]["term"] if method == "POST"
+                       else c["url_params"]["term"])
+        for pname in term_params:
             for tv in term_values:
                 if _stop():
                     break
-                u = _replace_query_param(base_url, pname, tv)
-                _absorb(u, _fetch(u))
+                u, body = _mutate(pname, tv)
+                _absorb(u, _fetch(method, u, body, ct), method, body, ct)
 
-        # --- Strategy 3: letters (starts-with API mirror of search_all_letters) ---
-        for pname in params["letter"]:
+        letter_params = (c["body_params"]["letter"] if method == "POST"
+                         else c["url_params"]["letter"])
+        for pname in letter_params:
             for ch in "abcdefghijklmnopqrstuvwxyz0123456789":
                 if _stop():
                     break
-                u = _replace_query_param(base_url, pname, ch)
-                _absorb(u, _fetch(u))
+                u, body = _mutate(pname, ch)
+                _absorb(u, _fetch(method, u, body, ct), method, body, ct)
 
     added = _count_json_member_records(results) - start_records
     if counters["replays"] > 0:
         print(f"  XHR replay: {counters['replays']} requests, {added} new member records")
         debug.decision("CAPTURE", "xhr replay",
                        f"{counters['replays']} requests, {added} new records",
-                       data={"candidates": len(candidates)})
+                       data={"candidates": len(candidates),
+                             "universal": universal, "cap": max_records})
     return added
 
 
@@ -749,13 +1152,20 @@ def find_content_frame(page):
     return None
 
 
-def human_scroll(page, done_event, scroll_target="body", times=20, adaptive=False):
+def human_scroll(page, done_event, scroll_target="body", times=20,
+                 adaptive=False, results=None):
     """Simulate human-like scrolling to trigger lazy-loaded content.
     Stops early if done_event is set (e.g. idle timer fired).
 
     When adaptive=True, scrolls in batches and checks if new content loaded
     after each batch. Stops when page height and visible result count stop
     growing (handles infinite scroll pages).
+
+    Virtualized lists (Phase 3): react-window / react-virtualized recycle
+    DOM nodes, so `count_visible_results` and `scrollHeight` both plateau
+    while the directory XHR stream keeps delivering records. When `results`
+    is passed, a growing member-record count also counts as progress, so the
+    scroll doesn't stop early on exactly those lists.
     """
     if adaptive:
         stale_batches = 0
@@ -773,6 +1183,7 @@ def human_scroll(page, done_event, scroll_target="body", times=20, adaptive=Fals
             except Exception:
                 prev_height = 0
             prev_count = count_visible_results(page)
+            prev_json = _count_json_member_records(results) if results is not None else 0
 
             # Scroll a batch
             for _ in range(SCROLL_BATCH_SIZE):
@@ -796,8 +1207,10 @@ def human_scroll(page, done_event, scroll_target="body", times=20, adaptive=Fals
             except Exception:
                 new_height = prev_height
             new_count = count_visible_results(page)
+            new_json = _count_json_member_records(results) if results is not None else 0
 
-            if new_height <= prev_height and new_count <= prev_count:
+            if (new_height <= prev_height and new_count <= prev_count
+                    and new_json <= prev_json):
                 stale_batches += 1
                 if stale_batches >= SCROLL_STALE_THRESHOLD:
                     print(f"  Scroll: no new content after {batch + 1} batches "
@@ -807,6 +1220,9 @@ def human_scroll(page, done_event, scroll_target="body", times=20, adaptive=Fals
                 stale_batches = 0
                 if new_count > prev_count:
                     print(f"  Scroll: {new_count} results (+{new_count - prev_count})")
+                elif new_json > prev_json:
+                    print(f"  Scroll: {new_json} XHR records "
+                          f"(+{new_json - prev_json}, virtualized list)")
     else:
         # Original fixed-count scrolling
         for _ in range(times):
@@ -917,6 +1333,86 @@ def _max_param_value(current_url: str, hrefs: list, param: str) -> int:
         if len(vals) == 1 and vals[0].isdigit():
             best = max(best, int(vals[0]))
     return best
+
+
+# Page-marker + number inside a URL PATH, for path-segment pagers
+# (/page/2, /-npage-3, /pg2, -page-4.html). Group 2 is the page number.
+# Bare "p" only qualifies as its own segment boundary (?<! letter/digit),
+# so "step-3" / "profile-2" don't read as pagers.
+_PATH_PAGER_RE = re.compile(
+    r"(?:(?:page|pg|paging)[\W_]*|(?<![a-z0-9])p)(\d+)", re.I)
+
+
+def _pick_path_pager(current_url: str, hrefs: list) -> tuple | None:
+    """Detect a PATH-based pager (Phase 3): same-listing links that differ
+    only by a trailing page number in the PATH — /dir/page/2, /dir/-npage-3,
+    /section/p2, products-page-4.html — as opposed to a ?page=N query param.
+
+    Anchored to the current listing: a link qualifies only if it's a
+    page-numbered CHILD of the current path (/dir → /dir/-npage-2) or a
+    page-numbered SIBLING (/blog/page/1 → /blog/page/2), so an unrelated
+    `/news/page/2` in a sidebar is ignored. Groups links by their template
+    (prefix + {number} + suffix); a template needs page 2 and ≥2 distinct
+    numbers, mirroring _pick_pagination_param.
+
+    Returns (prefix, suffix, last_page) — page N's URL is
+    `prefix + str(N) + suffix` — or None. `hrefs` items are href strings or
+    (href, text) pairs."""
+    try:
+        cur = urlparse(current_url)
+        cur_path = cur.path.rstrip("/")
+    except Exception:
+        return None
+    cur_dir = cur_path.rsplit("/", 1)[0] if "/" in cur_path else ""
+    groups: dict[tuple, dict] = {}
+    for item in hrefs:
+        h = item if isinstance(item, str) else (item[0] if item else None)
+        if not h:
+            continue
+        h = h.strip()
+        if not h or h.startswith(("javascript:", "#", "mailto:", "tel:")):
+            continue
+        try:
+            u = urlparse(urljoin(current_url, h))
+        except Exception:
+            continue
+        if u.netloc != cur.netloc:
+            continue
+        lpath = u.path.rstrip("/")
+        is_child = _is_pagination_child(cur_path, lpath)
+        link_dir = lpath.rsplit("/", 1)[0] if "/" in lpath else ""
+        is_sibling = (not is_child) and bool(cur_dir) and link_dir == cur_dir
+        if not (is_child or is_sibling):
+            continue
+        last = None
+        for last in _PATH_PAGER_RE.finditer(lpath):
+            pass
+        if last is None:
+            continue
+        try:
+            num = int(last.group(1))
+        except ValueError:
+            continue
+        if num < 1 or num > 10000:
+            continue
+        s, e = last.start(1), last.end(1)
+        prefix = f"{u.scheme}://{u.netloc}{lpath[:s]}"
+        suffix = lpath[e:]
+        if u.query:
+            suffix += "?" + u.query
+        key = (prefix, suffix)
+        g = groups.setdefault(key, set())
+        g.add(num)
+    best = None
+    for (prefix, suffix), nums in groups.items():
+        if 2 not in nums or len(nums) < 2:
+            continue
+        if best is None or len(nums) > best[0]:
+            best = (len(nums), prefix, suffix, max(nums))
+    if best is None:
+        return None
+    _, prefix, suffix, last_page = best
+    return prefix, suffix, last_page
 
 
 def _is_pagination_child(start_path: str, current_path: str) -> bool:
@@ -1108,33 +1604,17 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
         except Exception:
             return []
 
-    def _paginate_by_url() -> int:
-        """Strategy 0: walk a ?page=N URL template via goto().
-
-        Server-rendered pagers (Finalsite's ?const_page=2..42) are plain GET
-        links — navigating the template directly is far more reliable than
-        locating and clicking a button per page: no shifting number windows,
-        no wrong-element clicks, and one page.goto() per page instead of
-        several locator scans over a heavy DOM."""
-        picked = _pick_pagination_param(page.url, _get_hrefs())
-        if not picked:
-            return 0
-        param, page2_href, last_page = picked
-        from urllib.parse import urlparse, urljoin, parse_qs, urlencode
-        try:
-            base = urlparse(urljoin(page.url, page2_href))
-        except Exception:
-            return 0
-        print(f"  Pagination: URL template ?{param}=N detected "
-              f"(highest page link: {last_page})")
+    def _walk_url_template(url_for_page, last_page, label, on_page=None) -> int:
+        """Walk pages 2..last_page of a URL template via goto(), capturing
+        each. `url_for_page(n)` returns page n's absolute URL; `on_page(n)`
+        (optional) runs after each successful load to widen last_page as the
+        pager window shifts. Shared by the ?page=N and /page/N/ strategies."""
         loaded = 0
         n = 2
         prev_hash = _content_snapshot()
         while (not done_event.is_set() and loaded < max_pages
                and n <= last_page):
-            qs = parse_qs(base.query, keep_blank_values=True)
-            qs[param] = [str(n)]
-            target = base._replace(query=urlencode(qs, doseq=True)).geturl()
+            target = url_for_page(n)
             try:
                 page.goto(target, wait_until="domcontentloaded",
                           timeout=NETWORK_IDLE_TIMEOUT)
@@ -1149,17 +1629,64 @@ def handle_pagination(page, done_event, link_collector=None, html_collector=None
                 break
             prev_hash = cur_hash
             loaded += 1
-            print(f"  Pagination: page {n} (URL)")
+            print(f"  Pagination: page {n} ({label})")
             _collect_links()
             _capture_html()
             _keepalive()
-            # Pager windows shift as we advance — later pages expose higher
-            # page links than page 1 did (e.g. "1 2 3 … next set").
-            seen_max = _max_param_value(page.url, _get_hrefs(), param)
-            if seen_max > last_page:
-                last_page = seen_max
+            if on_page:
+                new_last = on_page(n)
+                if new_last and new_last > last_page:
+                    last_page = new_last
             n += 1
         return loaded
+
+    def _paginate_by_url() -> int:
+        """Strategy 0: walk a URL-template pager via goto() — far more
+        reliable than clicking a button per page (no shifting number
+        windows, no wrong-element clicks, one goto() per page over a heavy
+        DOM). Two template shapes:
+          0a. ?page=N query param  (Finalsite's ?const_page=2..42)
+          0b. /page/N/ path segment (CivicPlus /-npage-2, Phase 3)."""
+        hrefs = _get_hrefs()
+        from urllib.parse import urlparse, urljoin, parse_qs, urlencode
+
+        # --- Strategy 0a: ?page=N query-param template ---
+        picked = _pick_pagination_param(page.url, hrefs)
+        if picked:
+            param, page2_href, last_page = picked
+            try:
+                base = urlparse(urljoin(page.url, page2_href))
+            except Exception:
+                base = None
+            if base is not None:
+                print(f"  Pagination: URL template ?{param}=N detected "
+                      f"(highest page link: {last_page})")
+
+                def _url_for_page(n):
+                    qs = parse_qs(base.query, keep_blank_values=True)
+                    qs[param] = [str(n)]
+                    return base._replace(query=urlencode(qs, doseq=True)).geturl()
+
+                return _walk_url_template(
+                    _url_for_page, last_page, "URL",
+                    on_page=lambda n: _max_param_value(page.url, _get_hrefs(), param))
+
+        # --- Strategy 0b: /page/N/ path-segment template (Phase 3) ---
+        if PHASE3_XHR_PAGINATION:
+            path_pick = _pick_path_pager(page.url, hrefs)
+            if path_pick:
+                prefix, suffix, last_page = path_pick
+                print(f"  Pagination: path template {prefix}N{suffix} detected "
+                      f"(highest page link: {last_page})")
+
+                def _pick_last(_n):
+                    got = _pick_path_pager(page.url, _get_hrefs())
+                    return got[2] if got else 0
+
+                return _walk_url_template(
+                    lambda n: f"{prefix}{n}{suffix}", last_page, "path-URL",
+                    on_page=_pick_last)
+        return 0
 
     url_pages = _paginate_by_url()
     if url_pages:
@@ -1702,12 +2229,21 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         if "application/json" in content_type:
             try:
                 data = response.json()
-                if _is_directory_json(data, response.url):
+                # Capture the originating request's method/body so POST
+                # endpoints can be replayed later — and so the credential
+                # gate can inspect the login POST's body. Bodies are only
+                # kept for non-GET, non-auth requests (see _admit_json_capture).
+                try:
+                    req = response.request
+                    method = req.method
+                    post_data = req.post_data
+                    req_ct = req.headers.get("content-type")
+                except Exception:
+                    method, post_data, req_ct = "GET", None, None
+                if _admit_json_capture(results, response.url, data,
+                                       method=method, post_data=post_data,
+                                       req_content_type=req_ct):
                     print("Likely directory data at:", response.url)
-                    results.append({
-                        "url": response.url,
-                        "data": data
-                    })
                     reset_idle_timer()
             except Exception:
                 pass
@@ -1918,34 +2454,39 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
             print("  Page already fully rendered — light scroll only (skipping adaptive)")
             human_scroll(page, done, scroll_target="body", times=5)
         else:
-            human_scroll(page, done, scroll_target="body", adaptive=True)
+            human_scroll(page, done, scroll_target="body", adaptive=True, results=results)
 
-    # --- Step 2.5: Intent-driven deep capture (Agent mode, targeted only) ---
-    # The search flow above (or a hub) may have left the user's TARGETED intent
-    # unfulfilled: a weak search, a complicated engine, or data that lives
-    # behind category/city sub-pages. When yield is low, first replay any
-    # captured directory-API XHRs with mutated params (cheapest, best-targeted
-    # source), then BFS-crawl intent-matched sub-pages. Both are pure no-ops
-    # when intent is None, so Playground / "scrape everything" runs are
-    # untouched — including Playground's direct mode. Agent-mode direct
-    # scrapes (Phase 0 confirmed the listing on this page) DO get the rescue:
-    # if the confirmed page under-delivers, the crawler expands from it along
-    # intent-matched sub-pages rather than leaving a thin result. Skipped for
-    # hubs (their own iterator owns partitions) and aggregators (they keep
-    # intent-first search; their trees explode).
+    # --- Step 2.5: XHR replay + intent-driven deep capture ---
+    # Two behaviors share this block:
+    #   * Pagination replay (Phase 3, UNIVERSAL) — a captured directory XHR
+    #     can be paged (page/offset param, POST body field, or cursor chain)
+    #     without knowing a search term, so replay_directory_xhrs runs for
+    #     every mode INCLUDING Playground (intent=None). It no-ops cheaply
+    #     when nothing paginable was captured. Term/letter mutation inside
+    #     the function stays intent-gated.
+    #   * Intent sub-page BFS (Agent only) — the search flow may have left a
+    #     TARGETED intent unfulfilled (weak search, data behind category/city
+    #     sub-pages); when yield is still low it crawls intent-matched
+    #     sub-pages. LLM-backed, so it stays gated on a targeted intent.
+    # Skipped for hubs (their own iterator owns partitions) and aggregators
+    # (intent-first search; their trees explode). Fail-open: new code on the
+    # critical path must never sink an otherwise-working scrape.
     intent_expanded = False
-    if intent and not hub_categories and not is_aggregator:
-        # Fail-open: this is new code on the critical path — a failure here
-        # must never sink an otherwise-working scrape.
+    if not hub_categories and not is_aggregator:
         try:
-            if (_count_json_member_records(results) < INTENT_LOW_RECORDS
-                    and count_visible_results(page) < INTENT_LOW_VISIBLE):
+            low_yield = (_count_json_member_records(results) < INTENT_LOW_RECORDS
+                         and count_visible_results(page) < INTENT_LOW_VISIBLE)
+            # Phase 3 universal path fires regardless of yield (a fully
+            # rendered page may still hide 40 more pages behind its XHR);
+            # the flag-off legacy path keeps the intent+low-yield trigger.
+            if PHASE3_XHR_PAGINATION or (intent and low_yield):
                 replay_directory_xhrs(page, results, intent)
-                if _count_json_member_records(results) < INTENT_LOW_RECORDS:
-                    intent_expanded = discover_intent_subpages(
-                        page, intent, results,
-                        link_collector=all_page_links,
-                        html_collector=all_page_htmls)
+            if (intent and low_yield
+                    and _count_json_member_records(results) < INTENT_LOW_RECORDS):
+                intent_expanded = discover_intent_subpages(
+                    page, intent, results,
+                    link_collector=all_page_links,
+                    html_collector=all_page_htmls)
         except Exception as e:
             print(f"  Intent deep capture error (non-fatal): {e}")
             debug.log("EXPAND", f"intent deep capture failed: {e}", level="error")
@@ -2045,7 +2586,8 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                 human_scroll(page, done, scroll_target="body", times=5)
             else:
                 # Nothing found yet — adaptive scroll for infinite scroll pages
-                human_scroll(page, scroll_target="body", done_event=done, adaptive=True)
+                human_scroll(page, scroll_target="body", done_event=done,
+                             adaptive=True, results=results)
 
     # Direct mode: scroll to trigger lazy content. With data already captured
     # a light scroll catches stragglers; with NOTHING captured yet, scroll
@@ -2064,7 +2606,7 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
             human_scroll(page, done, scroll_target="body", times=5)
         else:
             print(f"  Direct mode: adaptive scroll (no data captured yet)")
-            human_scroll(page, done, scroll_target="body", adaptive=True)
+            human_scroll(page, done, scroll_target="body", adaptive=True, results=results)
 
     # --- Step 3.5: Detect if results are inside an iframe ---
     # Some platforms (YourMembership, etc.) load search results in an iframe.
@@ -2235,8 +2777,9 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
         try:
             r_url = r["url"]
             text = r.get("text")
+            resp_obj = r.get("response")
             if text is None:
-                body = r["response"].body()
+                body = resp_obj.body()
                 text = body.decode("utf-8", errors="ignore")
             if not text:
                 continue
@@ -2252,10 +2795,19 @@ def capture_responses(playwright: Playwright, link: str, mode: str = "auto",
                     data = json.loads(stripped)
                 except (json.JSONDecodeError, ValueError):
                     data = None
-                if data is not None and _is_directory_json(data, r_url):
-                    print(f"JSON-as-text/html detected at: {r_url}")
-                    results.append({"url": r_url, "data": data})
-                    continue  # already routed — don't also try UpdatePanel parse
+                if data is not None:
+                    try:
+                        req = resp_obj.request if resp_obj else None
+                        method = req.method if req else "GET"
+                        post_data = req.post_data if req else None
+                        req_ct = req.headers.get("content-type") if req else None
+                    except Exception:
+                        method, post_data, req_ct = "GET", None, None
+                    if _admit_json_capture(results, r_url, data,
+                                           method=method, post_data=post_data,
+                                           req_content_type=req_ct):
+                        print(f"JSON-as-text/html detected at: {r_url}")
+                        continue  # already routed — don't also try UpdatePanel parse
 
             # Detect ASP.NET UpdatePanel response
             if "updatepanel" in text.lower() and any(

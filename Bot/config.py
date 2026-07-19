@@ -513,6 +513,21 @@ INTENT_SUBPAGE_DEPTH = 2
 # mutated page/term/letter params through the browser's own cookie jar.
 XHR_MAX_REPLAYS = 60             # total replayed requests per run
 XHR_MAX_PAGINATION_PAGES = 30    # pages walked per paginated endpoint
+XHR_MAX_RECORDS = 300            # member records after which replay stops
+
+# UNIVERSALITY_PLAN Phase 3: XHR replay universality + pagination shapes.
+# Pagination replay (page/offset mutation, POST bodies, cursor chains) runs
+# for ALL modes including Playground's intent=None; term/letter mutation
+# stays intent-gated. Also gates the path-segment URL pager and the
+# virtualized-list scroll fix. Default ON; set TRAWL_PHASE3_XHR_PAGINATION=0
+# to fall back without a code revert.
+PHASE3_XHR_PAGINATION = os.environ.get(
+    "TRAWL_PHASE3_XHR_PAGINATION", "1").strip() != "0"
+
+# When the site stated a total (archetype.run_count_evidence), the replay
+# caps stretch to total x this factor instead of the fixed constants above
+# (R7: fixed caps are a quiet truncation bug on large aggregators).
+XHR_EXPECTED_STRETCH = 1.2
 
 # Query-param names recognized by _find_enumerable_params. Matched on the
 # lowercased param name; page-like params get incremented, term-like params
